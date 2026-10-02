@@ -2,6 +2,7 @@ name: Unpack football manager project
 
 on:
   workflow_dispatch:
+
 permissions:
   contents: write
 
@@ -55,7 +56,7 @@ jobs:
         run: |
           pytest -q
 
-          - name: Save unpacked project to GitHub
+      - name: Save unpacked project to GitHub
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
