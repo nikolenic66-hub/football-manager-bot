@@ -772,11 +772,11 @@ async def text_router(m:Message):
 def create_bot():
     bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(router)
     live_task=None
-    async def on_startup(_bot):
+    async def on_startup():
         nonlocal live_task
         from .live_worker import live_worker
         live_task=asyncio.create_task(live_worker(_bot),name='football-manager-live-worker')
-    async def on_shutdown(_bot):
+    async def on_shutdown():
         nonlocal live_task
         if live_task:
             live_task.cancel()
