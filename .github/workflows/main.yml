@@ -1,0 +1,54 @@
+name: Unpack football manager project
+
+on:
+  workflow_dispatch:
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Rebuild ZIP
+        run: |
+          cat project.zip.part-* > project.zip
+          sha256sum project.zip
+
+      - name: Verify archive
+        run: |
+          test "$(sha256sum project.zip | awk '{print $1}')" = "1b5750505cf105e55425bafa4044b2203d9701c5c1516d3d29260f2e3d11c7f2"
+
+      - name: Unpack project
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          unzip -q project.zip -d extracted
+          cp -a extracted/. .
+          rm -rf extracted project.zip project.zip.part-*
+
+      - name: Check project
+        run: |
+          test -d app
+          test -d tests
+          test -f requirements.txt
+          test -f Dockerfile
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile
+        run: |
+          python -m compileall -q app tests
+
+      - name: Run tests
+        run: |
+          pytest -q
