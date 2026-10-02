@@ -789,7 +789,7 @@ async def deliver_due_notifications(bot, s, limit=50):
                 ELSE FALSE
               END
         ORDER BY COALESCE(n.next_attempt_at,n.deliver_at),n.id
-        LIMIT :n FOR UPDATE SKIP LOCKED"""), {'n':limit})).mappings().all()
+        LIMIT :n FOR UPDATE OF n SKIP LOCKED"""), {'n':limit})).mappings().all()
     if not rows:
         return 0
     ids=[r['id'] for r in rows]
