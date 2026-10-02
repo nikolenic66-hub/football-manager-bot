@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: football_manager
+      POSTGRES_USER: football
+      POSTGRES_PASSWORD: football
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U football -d football_manager"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  bot:
+    build: .
+    env_file: .env
+    depends_on:
+      db: {condition: service_healthy}
+    restart: unless-stopped
+volumes:
+  postgres_data:

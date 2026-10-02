@@ -1,0 +1,30 @@
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS prestart_notified_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS notification_settings(
+ user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ match BOOLEAN NOT NULL DEFAULT TRUE,
+ injury BOOLEAN NOT NULL DEFAULT TRUE,
+ transfer BOOLEAN NOT NULL DEFAULT TRUE,
+ finance BOOLEAN NOT NULL DEFAULT TRUE,
+ development BOOLEAN NOT NULL DEFAULT TRUE,
+ discipline BOOLEAN NOT NULL DEFAULT TRUE,
+ morale BOOLEAN NOT NULL DEFAULT TRUE,
+ tournament BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS notifications(
+ id BIGSERIAL PRIMARY KEY,
+ user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ category TEXT NOT NULL CHECK(category IN ('MATCH','INJURY','TRANSFER','FINANCE','DEVELOPMENT','DISCIPLINE','MORALE','TOURNAMENT')),
+ title TEXT NOT NULL,
+ body TEXT NOT NULL,
+ dedupe_key TEXT,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ deliver_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ sent_at TIMESTAMPTZ,
+ read_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_dedupe ON notifications(user_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notifications_delivery ON notifications(sent_at,deliver_at,id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,read_at,created_at DESC);

@@ -1,0 +1,13 @@
+ALTER TABLE players ADD COLUMN IF NOT EXISTS talents JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS tactical_archetype TEXT NOT NULL DEFAULT 'BALANCED';
+ALTER TABLE players ADD COLUMN IF NOT EXISTS portrait_source TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS current_minute INT NOT NULL DEFAULT 0;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS home_halftime_score INT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS away_halftime_score INT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS halftime_data JSONB NOT NULL DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_players_archetype ON players(tactical_archetype);
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS halftime_locked BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS home_second_tactics JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS away_second_tactics JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS portrait_license TEXT;
+ALTER TABLE players ADD COLUMN IF NOT EXISTS portrait_author TEXT;
