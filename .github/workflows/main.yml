@@ -14,15 +14,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check archive files
+      - name: Find project archives
         run: |
           set -e
 
-          test -f football-manager-bot-memory-optimized-fixed-part-1.zip
-          test -f football-manager-bot-memory-optimized-fixed-part-2.zip
-          test -f football-manager-bot-memory-optimized-fixed-part-3.zip
+          echo "ZIP files in repository:"
+          find . -maxdepth 1 -type f -name "*.zip" -print
 
-          echo "All project archives found."
+          mapfile -t ZIPS < <(find . -maxdepth 1 -type f -name "*.zip" | sort)
+
+          if [ "${#ZIPS[@]}" -ne 3 ]; then
+            echo "ERROR: Expected exactly 3 ZIP archives."
+            echo "Found: ${#ZIPS[@]}"
+            exit 1
+          fi
+
+          echo "Found 3 archives:"
+          printf '%s\n' "${ZIPS[@]}"
+
+          echo "ZIP1=${ZIPS[0]}" >> "$GITHUB_ENV"
+          echo "ZIP2=${ZIPS[1]}" >> "$GITHUB_ENV"
+          echo "ZIP3=${ZIPS[2]}" >> "$GITHUB_ENV"
 
       - name: Extract project archives
         run: |
@@ -31,11 +43,16 @@ jobs:
           rm -rf extracted
           mkdir extracted
 
-          unzip -q football-manager-bot-memory-optimized-fixed-part-1.zip -d extracted
-          unzip -q football-manager-bot-memory-optimized-fixed-part-2.zip -d extracted
-          unzip -q football-manager-bot-memory-optimized-fixed-part-3.zip -d extracted
+          echo "Extracting:"
+          echo "$ZIP1"
+          echo "$ZIP2"
+          echo "$ZIP3"
 
-          echo "Archives extracted."
+          unzip -q "$ZIP1" -d extracted
+          unzip -q "$ZIP2" -d extracted
+          unzip -q "$ZIP3" -d extracted
+
+          echo "Archives extracted successfully."
 
       - name: Validate project structure
         run: |
@@ -58,15 +75,14 @@ jobs:
             ! -name ".git" \
             ! -name ".github" \
             ! -name "extracted" \
+            ! -name "*.zip" \
             -exec rm -rf {} +
 
           cp -a extracted/. .
 
           rm -rf extracted
 
-          rm -f football-manager-bot-memory-optimized-fixed-part-1.zip
-          rm -f football-manager-bot-memory-optimized-fixed-part-2.zip
-          rm -f football-manager-bot-memory-optimized-fixed-part-3.zip
+          rm -f "$ZIP1" "$ZIP2" "$ZIP3"
 
           echo "Project files replaced."
 
@@ -106,7 +122,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Deploy memory-optimized fixed build"
+            git commit -m "Deploy rebuilt project"
           fi
 
       - name: Push changes
