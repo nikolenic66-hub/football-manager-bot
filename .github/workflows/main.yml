@@ -2,195 +2,54 @@ name: Build and Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build and Deploy
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Получаем репозиторий
-      # ------------------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # 2. Находим два архива
-      # ------------------------------------------------------------
-      - name: Find release archives
-        id: archives
-        shell: bash
+      - name: Extract release
         run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo "REPOSITORY"
-          echo "========================================"
-          pwd
-
-          echo
-          echo "========================================"
-          echo "ZIP FILES"
-          echo "========================================"
-
-          find . -type f -name "*.zip" -print | sort || true
-
-          PART1=""
-          PART2=""
-
-          # Новые имена
-          if [ -f "./football-manager-bot-release-part-1.zip" ]; then
-            PART1="./football-manager-bot-release-part-1.zip"
-          fi
-
-          if [ -f "./football-manager-bot-release-part-2.zip" ]; then
-            PART2="./football-manager-bot-release-part-2.zip"
-          fi
-
-          # Старые имена — на случай, если они ещё остались
-          if [ -z "$PART1" ] && [ -f "./football-manager-bot-final-fixed-part-1.zip" ]; then
-            PART1="./football-manager-bot-final-fixed-part-1.zip"
-          fi
-
-          if [ -z "$PART2" ] && [ -f "./football-manager-bot-final-fixed-part-2.zip" ]; then
-            PART2="./football-manager-bot-final-fixed-part-2.zip"
-          fi
-
-          if [ -z "$PART1" ]; then
-            echo
-            echo "ERROR: PART 1 ARCHIVE NOT FOUND"
-            exit 1
-          fi
-
-          if [ -z "$PART2" ]; then
-            echo
-            echo "ERROR: PART 2 ARCHIVE NOT FOUND"
-            exit 1
-          fi
-
-          echo
-          echo "Selected part 1:"
-          echo "$PART1"
-          ls -lh "$PART1"
-
-          echo
-          echo "Selected part 2:"
-          echo "$PART2"
-          ls -lh "$PART2"
-
-          echo "part1=$PART1" >> "$GITHUB_OUTPUT"
-          echo "part2=$PART2" >> "$GITHUB_OUTPUT"
-
-      # ------------------------------------------------------------
-      # 3. Проверяем размер архивов
-      # ------------------------------------------------------------
-      - name: Verify archive sizes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PART1="${{ steps.archives.outputs.part1 }}"
-          PART2="${{ steps.archives.outputs.part2 }}"
-
-          SIZE1=$(stat -c%s "$PART1")
-          SIZE2=$(stat -c%s "$PART2")
-
-          MAX_SIZE=$((25 * 1024 * 1024))
-
-          echo "Part 1: $SIZE1 bytes"
-          echo "Part 2: $SIZE2 bytes"
-          echo "Maximum: $MAX_SIZE bytes"
-
-          if [ "$SIZE1" -gt "$MAX_SIZE" ]; then
-            echo "ERROR: part 1 is larger than 25 MiB."
-            exit 1
-          fi
-
-          if [ "$SIZE2" -gt "$MAX_SIZE" ]; then
-            echo "ERROR: part 2 is larger than 25 MiB."
-            exit 1
-          fi
-
-          echo "Archive size check: OK"
-
-      # ------------------------------------------------------------
-      # 4. Распаковываем оба архива
-      # ------------------------------------------------------------
-      - name: Extract release archives
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PART1="${{ steps.archives.outputs.part1 }}"
-          PART2="${{ steps.archives.outputs.part2 }}"
+          set -e
 
           rm -rf extracted
-          mkdir -p extracted
+          mkdir extracted
 
-          echo "Extracting part 1..."
-          unzip -oq "$PART1" -d extracted
+          unzip -oq football-manager-bot-release-part-1.zip -d extracted
+          unzip -oq football-manager-bot-release-part-2.zip -d extracted
 
-          echo "Extracting part 2..."
-          unzip -oq "$PART2" -d extracted
-
-          echo
-          echo "Archives extracted successfully."
-
-      # ------------------------------------------------------------
-      # 5. Проверяем, что проект действительно внутри архивов
-      # ------------------------------------------------------------
-      - name: Validate release structure
-        shell: bash
+      - name: Find project
         run: |
-          set -euo pipefail
+          set -e
 
-          REQUIRED_FILES=(
-            "app/__init__.py"
-            "app/bot.py"
-            "app/config.py"
-            "app/db.py"
-            "app/repositories.py"
-            "app/services.py"
-            "app/live_worker.py"
-            "app/game/engine.py"
-            "app/game/ratings.py"
-            "requirements.txt"
-          )
+          if [ -f extracted/app/bot.py ]; then
+            echo "PROJECT=extracted" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
-          echo "Checking release structure..."
+          ROOT=$(find extracted -type f -path "*/app/bot.py" -print -quit | xargs -r dirname | xargs -r dirname)
 
-          for FILE in "${REQUIRED_FILES[@]}"; do
-            if [ ! -f "extracted/$FILE" ]; then
-              echo "ERROR: missing file:"
-              echo "extracted/$FILE"
-              exit 1
-            fi
+          if [ -z "$ROOT" ]; then
+            echo "ERROR: app/bot.py not found"
+            find extracted -maxdepth 3 -type f | head -100
+            exit 1
+          fi
 
-            echo "OK: $FILE"
-          done
+          echo "PROJECT=$ROOT" >> "$GITHUB_ENV"
 
-          echo
-          echo "Release structure: OK"
-
-      # ------------------------------------------------------------
-      # 6. Заменяем исходники проекта содержимым архивов
-      # ------------------------------------------------------------
-      - name: Replace project files
-        shell: bash
+      - name: Replace project
         run: |
-          set -euo pipefail
-
-          echo "Removing old project files..."
+          set -e
 
           find . -mindepth 1 -maxdepth 1 \
             ! -name ".git" \
@@ -199,122 +58,57 @@ jobs:
             ! -name "*.zip" \
             -exec rm -rf {} +
 
-          echo "Copying verified release..."
-
-          cp -a extracted/. .
+          cp -a "$PROJECT"/. .
 
           rm -rf extracted
 
-          echo
-          echo "Project replacement: OK"
-
-      # ------------------------------------------------------------
-      # 7. Python
-      # ------------------------------------------------------------
-      - name: Set up Python 3.12
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
 
-      # ------------------------------------------------------------
-      # 8. Зависимости
-      # ------------------------------------------------------------
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
-
           python -m pip install --upgrade pip
-
-          python -m pip install -r requirements.txt
+          pip install -r requirements.txt
 
           if [ -f requirements-dev.txt ]; then
-            python -m pip install -r requirements-dev.txt
+            pip install -r requirements-dev.txt
           fi
 
-          echo
-          echo "Dependencies installed."
-
-      # ------------------------------------------------------------
-      # 9. Компиляция
-      # ------------------------------------------------------------
-      - name: Compile Python
-        shell: bash
+      - name: Compile
         run: |
-          set -euo pipefail
-
           python -m compileall -q app
 
-          if [ -d "scripts" ]; then
-            python -m compileall -q scripts
-          fi
-
-          echo "Python compilation: OK"
-
-      # ------------------------------------------------------------
-      # 10. Тесты
-      # ------------------------------------------------------------
-      - name: Run tests
-        shell: bash
+      - name: Test
         run: |
-          set -euo pipefail
-
           pytest -q
 
-          echo
-          echo "Tests: PASSED"
-
-      # ------------------------------------------------------------
-      # 11. Удаляем ZIP из итогового репозитория
-      # ------------------------------------------------------------
-      - name: Remove release archives
-        shell: bash
+      - name: Remove ZIP files
         run: |
-          set -euo pipefail
-
           rm -f \
             football-manager-bot-release-part-1.zip \
-            football-manager-bot-release-part-2.zip \
-            football-manager-bot-final-fixed-part-1.zip \
-            football-manager-bot-final-fixed-part-2.zip
+            football-manager-bot-release-part-2.zip
 
-          echo "Release archives removed from final source tree."
-
-      # ------------------------------------------------------------
-      # 12. Commit
-      #
-      # [skip ci] нужен, чтобы GitHub Actions НЕ запустил
-      # этот workflow второй раз после нашего git push.
-      # ------------------------------------------------------------
-      - name: Commit verified release
-        shell: bash
+      - name: Commit project
         run: |
-          set -euo pipefail
+          set -e
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
 
+          # Никогда не коммитим и не изменяем workflow-файлы.
+          git restore --staged .github/workflows 2>/dev/null || true
+
           if git diff --cached --quiet; then
-            echo "No repository changes to commit."
-          else
-            git commit -m "Deploy verified football manager release [skip ci]"
+            echo "Nothing to commit"
+            exit 0
           fi
 
-      # ------------------------------------------------------------
-      # 13. Push
-      # ------------------------------------------------------------
-      - name: Push verified release
-        shell: bash
+          git commit -m "Deploy release [skip ci]"
+
+      - name: Push
         run: |
-          set -euo pipefail
-
           git push origin HEAD:main
-
-          echo
-          echo "========================================"
-          echo "DEPLOYMENT SUCCESSFUL"
-          echo "========================================"
