@@ -805,7 +805,7 @@ def create_bot():
     async def on_startup(_bot=None):
         nonlocal live_task
         from .live_worker import live_worker
-        live_task=asyncio.create_task(live_worker(_bot or bot),name='football-manager-live-worker')
+        live_task=asyncio.create_task(live_worker(bot),name='football-manager-live-worker')
     async def on_shutdown(_bot=None):
         nonlocal live_task
         if live_task:
