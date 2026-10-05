@@ -1,81 +1,110 @@
-name: Restore Football Manager Project
+name: Build and Deploy
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  restore:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
-      - name: Check archive parts
+      - name: Check archive files
         run: |
-          test -f football-manager-bot-fixed-part-1.zip
-          test -f football-manager-bot-fixed-part-2.zip
-          test -f football-manager-bot-fixed-part-3.zip
+          set -e
 
-          echo "All three archive parts found."
+          test -f football-manager-bot-memory-optimized-fixed-part-1.zip
+          test -f football-manager-bot-memory-optimized-fixed-part-2.zip
+          test -f football-manager-bot-memory-optimized-fixed-part-3.zip
 
-      - name: Prepare extraction directory
+          echo "All project archives found."
+
+      - name: Extract project archives
         run: |
-          mkdir -p restored-project
+          set -e
 
-      - name: Extract part 1
+          rm -rf extracted
+          mkdir extracted
+
+          unzip -oq football-manager-bot-memory-optimized-fixed-part-1.zip -d extracted
+          unzip -oq football-manager-bot-memory-optimized-fixed-part-2.zip -d extracted
+          unzip -oq football-manager-bot-memory-optimized-fixed-part-3.zip -d extracted
+
+          echo "Archives extracted successfully."
+
+      - name: Validate project structure
         run: |
-          unzip -q football-manager-bot-fixed-part-1.zip -d restored-project
+          set -e
 
-      - name: Extract part 2
+          test -f extracted/app/__init__.py
+          test -f extracted/app/bot.py
+          test -f extracted/app/services.py
+          test -f extracted/app/live_worker.py
+          test -f extracted/app/game/engine.py
+          test -f extracted/requirements.txt
+
+          echo "Project structure OK."
+
+      - name: Replace repository files
         run: |
-          unzip -q football-manager-bot-fixed-part-2.zip -d restored-project
+          set -e
 
-      - name: Extract part 3
-        run: |
-          unzip -q football-manager-bot-fixed-part-3.zip -d restored-project
-
-      - name: Verify project
-        run: |
-          test -f restored-project/app/bot.py
-          test -f restored-project/app/config.py
-          test -f restored-project/docker-compose.yml
-
-          echo "Project structure verified."
-
-          echo "Files:"
-          find restored-project -type f | wc -l
-
-          echo "Assets:"
-          find restored-project/assets -type f | wc -l
-
-      - name: Replace repository contents
-        run: |
           find . -mindepth 1 -maxdepth 1 \
-            ! -name '.git' \
-            ! -name 'football-manager-bot-fixed-part-1.zip' \
-            ! -name 'football-manager-bot-fixed-part-2.zip' \
-            ! -name 'football-manager-bot-fixed-part-3.zip' \
-            ! -name 'restored-project' \
+            ! -name ".git" \
+            ! -name ".github" \
+            ! -name "extracted" \
+            ! -name "*.zip" \
             -exec rm -rf {} +
 
-          cp -a restored-project/. .
+          cp -a extracted/. .
 
-      - name: Remove archive parts
+          rm -rf extracted
+
+          rm -f \
+            football-manager-bot-memory-optimized-fixed-part-1.zip \
+            football-manager-bot-memory-optimized-fixed-part-2.zip \
+            football-manager-bot-memory-optimized-fixed-part-3.zip
+
+          echo "Project files replaced."
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
-          rm -f football-manager-bot-fixed-part-1.zip
-          rm -f football-manager-bot-fixed-part-2.zip
-          rm -f football-manager-bot-fixed-part-3.zip
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Show final structure
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+
+      - name: Compile Python
         run: |
-          echo "Final project:"
-          find . -maxdepth 2 -type f | sort | head -200
+          python -m compileall -q app scripts
 
-      - name: Commit restored project
+      - name: Run tests
+        run: |
+          pytest -q
+
+      - name: Check git status
+        run: |
+          git status --short
+
+      - name: Commit rebuilt project
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -84,8 +113,10 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
-            exit 0
+          else
+            git commit -m "Deploy rebuilt project"
           fi
 
-          git commit -m "Restore football manager project from archive parts"
-          git push
+      - name: Push changes
+        run: |
+          git push origin HEAD:main
