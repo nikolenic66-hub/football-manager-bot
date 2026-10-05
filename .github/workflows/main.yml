@@ -20,52 +20,125 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Check release archives
+      - name: Find release archives
+        id: find_archives
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -f football-manager-bot-release-part-1.zip
-          test -f football-manager-bot-release-part-2.zip
+          echo "=== Repository root ==="
+          pwd
 
-          echo "Release archives found:"
-          ls -lh football-manager-bot-release-part-*.zip
+          echo
+          echo "=== ZIP files in repository ==="
+          find . -type f -name "*.zip" -print | sort || true
+
+          PART1="$(find . -type f -name 'football-manager-bot-release-part-1.zip' -print -quit)"
+          PART2="$(find . -type f -name 'football-manager-bot-release-part-2.zip' -print -quit)"
+
+          if [ -z "$PART1" ]; then
+            echo
+            echo "ERROR: football-manager-bot-release-part-1.zip was not found."
+            echo "Upload/commit this file into the GitHub repository."
+            exit 1
+          fi
+
+          if [ -z "$PART2" ]; then
+            echo
+            echo "ERROR: football-manager-bot-release-part-2.zip was not found."
+            echo "Upload/commit this file into the GitHub repository."
+            exit 1
+          fi
+
+          echo
+          echo "Found release part 1:"
+          ls -lh "$PART1"
+
+          echo
+          echo "Found release part 2:"
+          ls -lh "$PART2"
+
+          echo "part1=$PART1" >> "$GITHUB_OUTPUT"
+          echo "part2=$PART2" >> "$GITHUB_OUTPUT"
+
+      - name: Verify archive sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PART1="${{ steps.find_archives.outputs.part1 }}"
+          PART2="${{ steps.find_archives.outputs.part2 }}"
+
+          SIZE1=$(stat -c%s "$PART1")
+          SIZE2=$(stat -c%s "$PART2")
+
+          echo "Part 1: $SIZE1 bytes"
+          echo "Part 2: $SIZE2 bytes"
+
+          if [ "$SIZE1" -gt 26214400 ]; then
+            echo "ERROR: part 1 is larger than 25 MiB."
+            exit 1
+          fi
+
+          if [ "$SIZE2" -gt 26214400 ]; then
+            echo "ERROR: part 2 is larger than 25 MiB."
+            exit 1
+          fi
+
+          echo "Archive size check OK."
 
       - name: Extract release archives
+        shell: bash
         run: |
           set -euo pipefail
+
+          PART1="${{ steps.find_archives.outputs.part1 }}"
+          PART2="${{ steps.find_archives.outputs.part2 }}"
 
           rm -rf extracted
           mkdir -p extracted
 
-          unzip -oq football-manager-bot-release-part-1.zip -d extracted
-          unzip -oq football-manager-bot-release-part-2.zip -d extracted
+          unzip -oq "$PART1" -d extracted
+          unzip -oq "$PART2" -d extracted
 
+          echo
           echo "Archives extracted successfully."
 
       - name: Validate release structure
+        shell: bash
         run: |
           set -euo pipefail
 
-          test -f extracted/app/__init__.py
-          test -f extracted/app/bot.py
-          test -f extracted/app/services.py
-          test -f extracted/app/live_worker.py
-          test -f extracted/app/repositories.py
-          test -f extracted/app/game/engine.py
-          test -f extracted/app/game/ratings.py
+          required_files=(
+            "app/__init__.py"
+            "app/__main__.py"
+            "app/bot.py"
+            "app/config.py"
+            "app/db.py"
+            "app/models.py"
+            "app/repositories.py"
+            "app/services.py"
+            "app/live_worker.py"
+            "app/game/engine.py"
+            "app/game/ratings.py"
+            "requirements.txt"
+            "pytest.ini"
+            "migrations/001_initial.sql"
+            "migrations/012_concurrency_and_indexes.sql"
+            "migrations/013_match_player_stats.sql"
+          )
 
-          test -f extracted/app/db.py
-          test -f extracted/app/config.py
-
-          test -f extracted/migrations/001_initial.sql
-          test -f extracted/migrations/012_concurrency_and_indexes.sql
-          test -f extracted/migrations/013_match_player_stats.sql
-
-          test -f extracted/requirements.txt
+          for file in "${required_files[@]}"; do
+            if [ ! -f "extracted/$file" ]; then
+              echo "ERROR: missing required file: $file"
+              exit 1
+            fi
+          done
 
           echo "Release structure OK."
 
-      - name: Replace repository project files
+      - name: Replace project files
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -81,30 +154,25 @@ jobs:
 
           rm -rf extracted
 
-          echo "Repository project files replaced."
+          echo "Project files replaced with verified release."
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
 
           python -m pip install --upgrade pip
-
-          pip install -r requirements.txt
-
-          if [ -f requirements-dev.txt ]; then
-            pip install -r requirements-dev.txt
-          fi
+          python -m pip install -r requirements.txt
 
       - name: Compile Python
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -113,21 +181,24 @@ jobs:
           echo "Python compilation OK."
 
       - name: Run tests
+        shell: bash
         run: |
           set -euo pipefail
 
           pytest -q
 
-      - name: Remove release archives from repository
+      - name: Remove release archives
+        shell: bash
         run: |
           set -euo pipefail
 
           rm -f football-manager-bot-release-part-1.zip
           rm -f football-manager-bot-release-part-2.zip
 
-          echo "Release archives removed from deployed source tree."
+          echo "Release archives removed from final repository tree."
 
-      - name: Commit rebuilt project
+      - name: Commit verified release
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -137,15 +208,18 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No repository changes detected."
+            echo "No changes to commit."
           else
-            git commit -m "Deploy verified release"
+            git commit -m "Deploy verified football manager release"
           fi
 
-      - name: Push rebuilt project
+      - name: Push verified release
+        shell: bash
         run: |
           set -euo pipefail
 
           git push origin HEAD:main
 
-          echo "Project successfully pushed to main."
+          echo "========================================"
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "========================================"
