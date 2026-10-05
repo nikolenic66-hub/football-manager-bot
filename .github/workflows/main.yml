@@ -1,8 +1,9 @@
-name: Build and Deploy
+name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -17,50 +18,79 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
+
+      - name: Check release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Current directory:"
+          pwd
+
+          echo "Files:"
+          find . -maxdepth 2 -type f -printf '%p\n' | sort
+
+          test -f "./football-manager-bot-release-part-1.zip"
+          test -f "./football-manager-bot-release-part-2.zip"
+
+      - name: Copy release archives to temp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/football-release
+          mkdir -p /tmp/football-release
+
+          cp "./football-manager-bot-release-part-1.zip" \
+             /tmp/football-release/part-1.zip
+
+          cp "./football-manager-bot-release-part-2.zip" \
+             /tmp/football-release/part-2.zip
+
+          ls -lh /tmp/football-release/
 
       - name: Extract release
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf extracted
-          mkdir extracted
+          rm -rf /tmp/football-extracted
+          mkdir -p /tmp/football-extracted
 
-          unzip -oq football-manager-bot-release-part-1.zip -d extracted
-          unzip -oq football-manager-bot-release-part-2.zip -d extracted
+          unzip -oq \
+            /tmp/football-release/part-1.zip \
+            -d /tmp/football-extracted
+
+          unzip -oq \
+            /tmp/football-release/part-2.zip \
+            -d /tmp/football-extracted
+
+          echo "Extracted:"
+          find /tmp/football-extracted -maxdepth 3 -type f | sort | head -200
 
       - name: Find project
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          if [ -f extracted/app/bot.py ]; then
-            echo "PROJECT=extracted" >> "$GITHUB_ENV"
-            exit 0
-          fi
+          PROJECT="$(find /tmp/football-extracted \
+            -type f \
+            -path '*/app/bot.py' \
+            -print -quit | xargs -r dirname | xargs -r dirname)"
 
-          ROOT=$(find extracted -type f -path "*/app/bot.py" -print -quit | xargs -r dirname | xargs -r dirname)
+          test -n "$PROJECT"
 
-          if [ -z "$ROOT" ]; then
-            echo "ERROR: app/bot.py not found"
-            find extracted -maxdepth 3 -type f | head -100
-            exit 1
-          fi
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "Found project: $PROJECT"
 
-          echo "PROJECT=$ROOT" >> "$GITHUB_ENV"
-
-      - name: Replace project
-        run: |
-          set -e
-
-          find . -mindepth 1 -maxdepth 1 \
-            ! -name ".git" \
-            ! -name ".github" \
-            ! -name "extracted" \
-            ! -name "*.zip" \
-            -exec rm -rf {} +
-
-          cp -a "$PROJECT"/. .
-
-          rm -rf extracted
+          test -f "$PROJECT/app/bot.py"
+          test -f "$PROJECT/app/config.py"
+          test -f "$PROJECT/app/db.py"
+          test -f "$PROJECT/app/repositories.py"
+          test -f "$PROJECT/app/services.py"
+          test -f "$PROJECT/app/live_worker.py"
+          test -f "$PROJECT/requirements.txt"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -68,47 +98,67 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        working-directory: ${{ env.PROJECT }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-          if [ -f requirements-dev.txt ]; then
-            pip install -r requirements-dev.txt
-          fi
+          pip install pytest
 
       - name: Compile
+        working-directory: ${{ env.PROJECT }}
         run: |
           python -m compileall -q app
 
-      - name: Test
+      - name: Tests
+        working-directory: ${{ env.PROJECT }}
         run: |
           pytest -q
 
-      - name: Remove ZIP files
+      - name: Deploy project
+        shell: bash
         run: |
+          set -euo pipefail
+
+          TMP_PROJECT="/tmp/final-football-project"
+
+          rm -rf "$TMP_PROJECT"
+          mkdir -p "$TMP_PROJECT"
+
+          cp -a "$PROJECT"/. "$TMP_PROJECT"/
+
+          # Удаляем старый проект, но сохраняем git и workflow.
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            ! -name 'football-manager-bot-release-part-1.zip' \
+            ! -name 'football-manager-bot-release-part-2.zip' \
+            -exec rm -rf {} +
+
+          # Копируем новый проект.
+          cp -a "$TMP_PROJECT"/. .
+
+          # Архивы не должны попадать в итоговый проект.
           rm -f \
             football-manager-bot-release-part-1.zip \
             football-manager-bot-release-part-2.zip
 
-      - name: Commit project
+      - name: Commit and push
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
 
-          # Никогда не коммитим и не изменяем workflow-файлы.
+          # Workflow нельзя менять через GITHUB_TOKEN.
           git restore --staged .github/workflows 2>/dev/null || true
 
           if git diff --cached --quiet; then
-            echo "Nothing to commit"
+            echo "Nothing to commit."
             exit 0
           fi
 
-          git commit -m "Deploy release [skip ci]"
-
-      - name: Push
-        run: |
+          git commit -m "Deploy rebuilt project [skip ci]"
           git push origin HEAD:main
