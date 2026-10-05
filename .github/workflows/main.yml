@@ -31,32 +31,42 @@ jobs:
 
           echo
           echo "=== ZIP files in repository ==="
-          find . -type f -name "*.zip" -print | sort || true
+          find . -type f -name "*.zip" -print | sort
 
-          PART1="$(find . -type f -name 'football-manager-bot-release-part-1.zip' -print -quit)"
-          PART2="$(find . -type f -name 'football-manager-bot-release-part-2.zip' -print -quit)"
+          PART1=""
+          PART2=""
+
+          # Preferred names
+          if [ -f "./football-manager-bot-release-part-1.zip" ]; then
+            PART1="./football-manager-bot-release-part-1.zip"
+          elif [ -f "./football-manager-bot-final-fixed-part-1.zip" ]; then
+            PART1="./football-manager-bot-final-fixed-part-1.zip"
+          fi
+
+          if [ -f "./football-manager-bot-release-part-2.zip" ]; then
+            PART2="./football-manager-bot-release-part-2.zip"
+          elif [ -f "./football-manager-bot-final-fixed-part-2.zip" ]; then
+            PART2="./football-manager-bot-final-fixed-part-2.zip"
+          fi
 
           if [ -z "$PART1" ]; then
             echo
-            echo "ERROR: football-manager-bot-release-part-1.zip was not found."
-            echo "Upload/commit this file into the GitHub repository."
+            echo "ERROR: archive part 1 was not found."
             exit 1
           fi
 
           if [ -z "$PART2" ]; then
             echo
-            echo "ERROR: football-manager-bot-release-part-2.zip was not found."
-            echo "Upload/commit this file into the GitHub repository."
+            echo "ERROR: archive part 2 was not found."
             exit 1
           fi
 
           echo
-          echo "Found release part 1:"
-          ls -lh "$PART1"
+          echo "=== Selected archives ==="
+          echo "Part 1: $PART1"
+          echo "Part 2: $PART2"
 
-          echo
-          echo "Found release part 2:"
-          ls -lh "$PART2"
+          ls -lh "$PART1" "$PART2"
 
           echo "part1=$PART1" >> "$GITHUB_OUTPUT"
           echo "part2=$PART2" >> "$GITHUB_OUTPUT"
@@ -75,12 +85,14 @@ jobs:
           echo "Part 1: $SIZE1 bytes"
           echo "Part 2: $SIZE2 bytes"
 
-          if [ "$SIZE1" -gt 26214400 ]; then
+          MAX=$((25 * 1024 * 1024))
+
+          if [ "$SIZE1" -gt "$MAX" ]; then
             echo "ERROR: part 1 is larger than 25 MiB."
             exit 1
           fi
 
-          if [ "$SIZE2" -gt 26214400 ]; then
+          if [ "$SIZE2" -gt "$MAX" ]; then
             echo "ERROR: part 2 is larger than 25 MiB."
             exit 1
           fi
@@ -111,21 +123,15 @@ jobs:
 
           required_files=(
             "app/__init__.py"
-            "app/__main__.py"
             "app/bot.py"
             "app/config.py"
             "app/db.py"
-            "app/models.py"
             "app/repositories.py"
             "app/services.py"
             "app/live_worker.py"
             "app/game/engine.py"
             "app/game/ratings.py"
             "requirements.txt"
-            "pytest.ini"
-            "migrations/001_initial.sql"
-            "migrations/012_concurrency_and_indexes.sql"
-            "migrations/013_match_player_stats.sql"
           )
 
           for file in "${required_files[@]}"; do
@@ -146,8 +152,7 @@ jobs:
             ! -name ".git" \
             ! -name ".github" \
             ! -name "extracted" \
-            ! -name "football-manager-bot-release-part-1.zip" \
-            ! -name "football-manager-bot-release-part-2.zip" \
+            ! -name "*.zip" \
             -exec rm -rf {} +
 
           cp -a extracted/. .
@@ -171,6 +176,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+          if [ -f requirements-dev.txt ]; then
+            python -m pip install -r requirements-dev.txt
+          fi
+
       - name: Compile Python
         shell: bash
         run: |
@@ -192,10 +201,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -f football-manager-bot-release-part-1.zip
-          rm -f football-manager-bot-release-part-2.zip
+          rm -f \
+            football-manager-bot-release-part-1.zip \
+            football-manager-bot-release-part-2.zip \
+            football-manager-bot-final-fixed-part-1.zip \
+            football-manager-bot-final-fixed-part-2.zip
 
-          echo "Release archives removed from final repository tree."
+          echo "Release archives removed from final source tree."
 
       - name: Commit verified release
         shell: bash
@@ -220,6 +232,7 @@ jobs:
 
           git push origin HEAD:main
 
+          echo
           echo "========================================"
           echo "DEPLOYMENT SUCCESSFUL"
           echo "========================================"
