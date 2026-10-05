@@ -1,91 +1,76 @@
-name: Unpack football manager project
+name: Build and Deploy
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  unpack:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check archive parts
+      - name: Check archive files
         run: |
-          test -f football-manager-bot-memory-optimized-part-1.zip
-          test -f football-manager-bot-memory-optimized-part-2.zip
-          test -f football-manager-bot-memory-optimized-part-3.zip
+          set -e
 
-          echo "All three archive parts found."
+          test -f football-manager-bot-memory-optimized-fixed-part-1.zip
+          test -f football-manager-bot-memory-optimized-fixed-part-2.zip
+          test -f football-manager-bot-memory-optimized-fixed-part-3.zip
 
-      - name: Unpack project parts
+          echo "All project archives found."
+
+      - name: Extract project archives
         run: |
+          set -e
+
           rm -rf extracted
           mkdir extracted
 
-          unzip -q football-manager-bot-memory-optimized-part-1.zip -d extracted
-          unzip -q football-manager-bot-memory-optimized-part-2.zip -d extracted
-          unzip -q football-manager-bot-memory-optimized-part-3.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-fixed-part-1.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-fixed-part-2.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-fixed-part-3.zip -d extracted
 
-          echo "All archive parts unpacked."
+          echo "Archives extracted."
 
-      - name: Check restored project
+      - name: Validate project structure
         run: |
-          test -d extracted/app
-          test -d extracted/tests
-          test -d extracted/assets
-          test -d extracted/migrations
+          set -e
+
+          test -f extracted/app/__init__.py
+          test -f extracted/app/bot.py
+          test -f extracted/app/services.py
+          test -f extracted/app/live_worker.py
+          test -f extracted/app/game/engine.py
           test -f extracted/requirements.txt
-          test -f extracted/Dockerfile
-          test -f extracted/docker-compose.yml
 
-          echo "Project structure verified."
+          echo "Project structure OK."
 
-          echo "Total files:"
-          find extracted -type f | wc -l
-
-          echo "Asset files:"
-          find extracted/assets -type f | wc -l
-
-      - name: Replace old project files
+      - name: Replace repository files
         run: |
+          set -e
+
           find . -mindepth 1 -maxdepth 1 \
-            ! -name '.git' \
-            ! -name '.github' \
-            ! -name 'football-manager-bot-memory-optimized-part-1.zip' \
-            ! -name 'football-manager-bot-memory-optimized-part-2.zip' \
-            ! -name 'football-manager-bot-memory-optimized-part-3.zip' \
-            ! -name 'extracted' \
+            ! -name ".git" \
+            ! -name ".github" \
+            ! -name "extracted" \
             -exec rm -rf {} +
 
           cp -a extracted/. .
 
-      - name: Remove archive parts
-        run: |
-          rm -f football-manager-bot-memory-optimized-part-1.zip
-          rm -f football-manager-bot-memory-optimized-part-2.zip
-          rm -f football-manager-bot-memory-optimized-part-3.zip
-
           rm -rf extracted
 
-      - name: Final project check
-        run: |
-          test -d app
-          test -d tests
-          test -d assets
-          test -d migrations
-          test -f requirements.txt
-          test -f Dockerfile
-          test -f docker-compose.yml
+          rm -f football-manager-bot-memory-optimized-fixed-part-1.zip
+          rm -f football-manager-bot-memory-optimized-fixed-part-2.zip
+          rm -f football-manager-bot-memory-optimized-fixed-part-3.zip
 
-          echo "Final project structure:"
-          find . -maxdepth 2 -type f | sort | head -200
+          echo "Project files replaced."
 
-      - name: Setup Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -95,15 +80,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compile
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+
+      - name: Compile Python
         run: |
-          python -m compileall -q app tests scripts
+          python -m compileall -q app scripts
 
       - name: Run tests
         run: |
           pytest -q
 
-      - name: Save unpacked project to GitHub
+      - name: Check git status
+        run: |
+          git status --short
+
+      - name: Commit rebuilt project
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -111,9 +104,11 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "Nothing to commit"
-            exit 0
+            echo "No changes to commit."
+          else
+            git commit -m "Deploy memory-optimized fixed build"
           fi
 
-          git commit -m "Optimize football manager memory usage"
+      - name: Push changes
+        run: |
           git push
