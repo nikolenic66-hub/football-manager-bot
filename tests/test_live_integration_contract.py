@@ -35,7 +35,7 @@ def test_notification_delivery_has_retry_state_and_no_long_db_lock():
     assert 'processing_at' in migration
     assert 'next_attempt_at' in migration
     block=source[source.index('async def deliver_due_notifications'):source.index('# --- Notifications', source.index('async def deliver_due_notifications'))]
-    assert 'FOR UPDATE SKIP LOCKED' in block
+    assert 'FOR UPDATE OF n SKIP LOCKED' in block
     assert 'processing_at=now()' in block
     assert 'await s.commit()' in block
     assert 'next_attempt_at=now()+make_interval' in block
