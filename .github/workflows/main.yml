@@ -11,117 +11,150 @@ permissions:
 
 jobs:
   build:
+    name: Build and Deploy
     runs-on: ubuntu-latest
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Получаем репозиторий
+      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
           fetch-depth: 0
 
+      # ------------------------------------------------------------
+      # 2. Находим два архива
+      # ------------------------------------------------------------
       - name: Find release archives
-        id: find_archives
+        id: archives
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== Repository root ==="
+          echo "========================================"
+          echo "REPOSITORY"
+          echo "========================================"
           pwd
 
           echo
-          echo "=== ZIP files in repository ==="
-          find . -type f -name "*.zip" -print | sort
+          echo "========================================"
+          echo "ZIP FILES"
+          echo "========================================"
+
+          find . -type f -name "*.zip" -print | sort || true
 
           PART1=""
           PART2=""
 
-          # Preferred names
+          # Новые имена
           if [ -f "./football-manager-bot-release-part-1.zip" ]; then
             PART1="./football-manager-bot-release-part-1.zip"
-          elif [ -f "./football-manager-bot-final-fixed-part-1.zip" ]; then
-            PART1="./football-manager-bot-final-fixed-part-1.zip"
           fi
 
           if [ -f "./football-manager-bot-release-part-2.zip" ]; then
             PART2="./football-manager-bot-release-part-2.zip"
-          elif [ -f "./football-manager-bot-final-fixed-part-2.zip" ]; then
+          fi
+
+          # Старые имена — на случай, если они ещё остались
+          if [ -z "$PART1" ] && [ -f "./football-manager-bot-final-fixed-part-1.zip" ]; then
+            PART1="./football-manager-bot-final-fixed-part-1.zip"
+          fi
+
+          if [ -z "$PART2" ] && [ -f "./football-manager-bot-final-fixed-part-2.zip" ]; then
             PART2="./football-manager-bot-final-fixed-part-2.zip"
           fi
 
           if [ -z "$PART1" ]; then
             echo
-            echo "ERROR: archive part 1 was not found."
+            echo "ERROR: PART 1 ARCHIVE NOT FOUND"
             exit 1
           fi
 
           if [ -z "$PART2" ]; then
             echo
-            echo "ERROR: archive part 2 was not found."
+            echo "ERROR: PART 2 ARCHIVE NOT FOUND"
             exit 1
           fi
 
           echo
-          echo "=== Selected archives ==="
-          echo "Part 1: $PART1"
-          echo "Part 2: $PART2"
+          echo "Selected part 1:"
+          echo "$PART1"
+          ls -lh "$PART1"
 
-          ls -lh "$PART1" "$PART2"
+          echo
+          echo "Selected part 2:"
+          echo "$PART2"
+          ls -lh "$PART2"
 
           echo "part1=$PART1" >> "$GITHUB_OUTPUT"
           echo "part2=$PART2" >> "$GITHUB_OUTPUT"
 
+      # ------------------------------------------------------------
+      # 3. Проверяем размер архивов
+      # ------------------------------------------------------------
       - name: Verify archive sizes
         shell: bash
         run: |
           set -euo pipefail
 
-          PART1="${{ steps.find_archives.outputs.part1 }}"
-          PART2="${{ steps.find_archives.outputs.part2 }}"
+          PART1="${{ steps.archives.outputs.part1 }}"
+          PART2="${{ steps.archives.outputs.part2 }}"
 
           SIZE1=$(stat -c%s "$PART1")
           SIZE2=$(stat -c%s "$PART2")
 
+          MAX_SIZE=$((25 * 1024 * 1024))
+
           echo "Part 1: $SIZE1 bytes"
           echo "Part 2: $SIZE2 bytes"
+          echo "Maximum: $MAX_SIZE bytes"
 
-          MAX=$((25 * 1024 * 1024))
-
-          if [ "$SIZE1" -gt "$MAX" ]; then
+          if [ "$SIZE1" -gt "$MAX_SIZE" ]; then
             echo "ERROR: part 1 is larger than 25 MiB."
             exit 1
           fi
 
-          if [ "$SIZE2" -gt "$MAX" ]; then
+          if [ "$SIZE2" -gt "$MAX_SIZE" ]; then
             echo "ERROR: part 2 is larger than 25 MiB."
             exit 1
           fi
 
-          echo "Archive size check OK."
+          echo "Archive size check: OK"
 
+      # ------------------------------------------------------------
+      # 4. Распаковываем оба архива
+      # ------------------------------------------------------------
       - name: Extract release archives
         shell: bash
         run: |
           set -euo pipefail
 
-          PART1="${{ steps.find_archives.outputs.part1 }}"
-          PART2="${{ steps.find_archives.outputs.part2 }}"
+          PART1="${{ steps.archives.outputs.part1 }}"
+          PART2="${{ steps.archives.outputs.part2 }}"
 
           rm -rf extracted
           mkdir -p extracted
 
+          echo "Extracting part 1..."
           unzip -oq "$PART1" -d extracted
+
+          echo "Extracting part 2..."
           unzip -oq "$PART2" -d extracted
 
           echo
           echo "Archives extracted successfully."
 
+      # ------------------------------------------------------------
+      # 5. Проверяем, что проект действительно внутри архивов
+      # ------------------------------------------------------------
       - name: Validate release structure
         shell: bash
         run: |
           set -euo pipefail
 
-          required_files=(
+          REQUIRED_FILES=(
             "app/__init__.py"
             "app/bot.py"
             "app/config.py"
@@ -134,19 +167,30 @@ jobs:
             "requirements.txt"
           )
 
-          for file in "${required_files[@]}"; do
-            if [ ! -f "extracted/$file" ]; then
-              echo "ERROR: missing required file: $file"
+          echo "Checking release structure..."
+
+          for FILE in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "extracted/$FILE" ]; then
+              echo "ERROR: missing file:"
+              echo "extracted/$FILE"
               exit 1
             fi
+
+            echo "OK: $FILE"
           done
 
-          echo "Release structure OK."
+          echo
+          echo "Release structure: OK"
 
+      # ------------------------------------------------------------
+      # 6. Заменяем исходники проекта содержимым архивов
+      # ------------------------------------------------------------
       - name: Replace project files
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "Removing old project files..."
 
           find . -mindepth 1 -maxdepth 1 \
             ! -name ".git" \
@@ -155,12 +199,18 @@ jobs:
             ! -name "*.zip" \
             -exec rm -rf {} +
 
+          echo "Copying verified release..."
+
           cp -a extracted/. .
 
           rm -rf extracted
 
-          echo "Project files replaced with verified release."
+          echo
+          echo "Project replacement: OK"
 
+      # ------------------------------------------------------------
+      # 7. Python
+      # ------------------------------------------------------------
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -168,27 +218,44 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements.txt
 
+      # ------------------------------------------------------------
+      # 8. Зависимости
+      # ------------------------------------------------------------
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
 
           python -m pip install --upgrade pip
+
           python -m pip install -r requirements.txt
 
           if [ -f requirements-dev.txt ]; then
             python -m pip install -r requirements-dev.txt
           fi
 
+          echo
+          echo "Dependencies installed."
+
+      # ------------------------------------------------------------
+      # 9. Компиляция
+      # ------------------------------------------------------------
       - name: Compile Python
         shell: bash
         run: |
           set -euo pipefail
 
-          python -m compileall -q app scripts
+          python -m compileall -q app
 
-          echo "Python compilation OK."
+          if [ -d "scripts" ]; then
+            python -m compileall -q scripts
+          fi
 
+          echo "Python compilation: OK"
+
+      # ------------------------------------------------------------
+      # 10. Тесты
+      # ------------------------------------------------------------
       - name: Run tests
         shell: bash
         run: |
@@ -196,6 +263,12 @@ jobs:
 
           pytest -q
 
+          echo
+          echo "Tests: PASSED"
+
+      # ------------------------------------------------------------
+      # 11. Удаляем ZIP из итогового репозитория
+      # ------------------------------------------------------------
       - name: Remove release archives
         shell: bash
         run: |
@@ -209,6 +282,12 @@ jobs:
 
           echo "Release archives removed from final source tree."
 
+      # ------------------------------------------------------------
+      # 12. Commit
+      #
+      # [skip ci] нужен, чтобы GitHub Actions НЕ запустил
+      # этот workflow второй раз после нашего git push.
+      # ------------------------------------------------------------
       - name: Commit verified release
         shell: bash
         run: |
@@ -220,11 +299,14 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No repository changes to commit."
           else
-            git commit -m "Deploy verified football manager release"
+            git commit -m "Deploy verified football manager release [skip ci]"
           fi
 
+      # ------------------------------------------------------------
+      # 13. Push
+      # ------------------------------------------------------------
       - name: Push verified release
         shell: bash
         run: |
