@@ -14,29 +14,76 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Rebuild ZIP
+      - name: Check archive parts
         run: |
-          cat project.zip.part-* > project.zip
-          sha256sum project.zip
+          test -f football-manager-bot-fixed-part-1.zip
+          test -f football-manager-bot-fixed-part-2.zip
+          test -f football-manager-bot-fixed-part-3.zip
 
-      - name: Verify archive
-        run: |
-          test "$(sha256sum project.zip | awk '{print $1}')" = "1b5750505cf105e55425bafa4044b2203d9701c5c1516d3d29260f2e3d11c7f2"
+          echo "All three archive parts found."
 
-      - name: Unpack project
+      - name: Unpack project parts
         run: |
           rm -rf extracted
           mkdir extracted
-          unzip -q project.zip -d extracted
-          cp -a extracted/. .
-          rm -rf extracted project.zip project.zip.part-*
 
-      - name: Check project
+          unzip -q football-manager-bot-fixed-part-1.zip -d extracted
+          unzip -q football-manager-bot-fixed-part-2.zip -d extracted
+          unzip -q football-manager-bot-fixed-part-3.zip -d extracted
+
+          echo "All archive parts unpacked."
+
+      - name: Check restored project
+        run: |
+          test -d extracted/app
+          test -d extracted/tests
+          test -d extracted/assets
+          test -d extracted/migrations
+          test -f extracted/requirements.txt
+          test -f extracted/Dockerfile
+          test -f extracted/docker-compose.yml
+
+          echo "Project structure verified."
+
+          echo "Total files:"
+          find extracted -type f | wc -l
+
+          echo "Asset files:"
+          find extracted/assets -type f | wc -l
+
+      - name: Replace old project files
+        run: |
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            ! -name 'football-manager-bot-fixed-part-1.zip' \
+            ! -name 'football-manager-bot-fixed-part-2.zip' \
+            ! -name 'football-manager-bot-fixed-part-3.zip' \
+            ! -name 'extracted' \
+            -exec rm -rf {} +
+
+          cp -a extracted/. .
+
+      - name: Remove archive parts
+        run: |
+          rm -f football-manager-bot-fixed-part-1.zip
+          rm -f football-manager-bot-fixed-part-2.zip
+          rm -f football-manager-bot-fixed-part-3.zip
+
+          rm -rf extracted
+
+      - name: Final project check
         run: |
           test -d app
           test -d tests
+          test -d assets
+          test -d migrations
           test -f requirements.txt
           test -f Dockerfile
+          test -f docker-compose.yml
+
+          echo "Final project structure:"
+          find . -maxdepth 2 -type f | sort | head -200
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -50,7 +97,7 @@ jobs:
 
       - name: Compile
         run: |
-          python -m compileall -q app tests
+          python -m compileall -q app tests scripts
 
       - name: Run tests
         run: |
@@ -60,6 +107,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
-          git commit -m "Unpack football manager project" || echo "Nothing to commit"
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Restore fixed football manager project"
           git push
