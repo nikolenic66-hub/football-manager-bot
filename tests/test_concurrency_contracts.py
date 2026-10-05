@@ -39,3 +39,23 @@ def test_live_restart_uses_persisted_phase_timestamp():
     block=source[source.index('async def advance_live_matches'):]
     assert "match.get('phase_started_at') or match.get('started_at') or now" in block
     assert 'elapsed=(now-phase_start).total_seconds()' in block
+
+
+def test_notification_claim_locks_only_notification_rows_before_join():
+    source = (ROOT / 'app' / 'services.py').read_text()
+    block = source[source.index('async def deliver_due_notifications'):source.index('async def ', source.index('async def deliver_due_notifications') + 10) if 'async def ' in source[source.index('async def deliver_due_notifications') + 10:] else len(source)]
+    assert 'SELECT n.id' in block
+    assert 'FROM notifications n' in block
+    assert 'LIMIT :n\n        FOR UPDATE SKIP LOCKED' in block
+    assert 'FOR UPDATE OF n' not in block
+
+
+def test_club_creation_does_not_mask_unrelated_integrity_errors_as_name_taken():
+    source = (ROOT / 'app' / 'repositories.py').read_text()
+    block = source[source.index('async def create_club'): ]
+    assert 'constraint_name' in block
+    assert "clubs_name_key" in block
+    assert "uq_clubs_owner_user" in block
+    assert 'await s.rollback()' not in block
+    assert "WHERE lower(name)=lower(:n)" not in block
+    assert 'raise\n' in block

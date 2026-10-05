@@ -836,16 +836,26 @@ async def finalize_live_round(s, league_id, finished):
 
 
 async def deliver_due_notifications(bot, s, limit=50):
-    """Claim due notifications, send them without holding row locks, and retry failures with backoff."""
-    rows=(await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,u.telegram_id
-        FROM notifications n JOIN users u ON u.id=n.user_id
-        LEFT JOIN notification_settings ns ON ns.user_id=n.user_id
+    """Claim due notifications without row-locking the nullable side of an outer join."""
+    ids = (await s.execute(text("""SELECT n.id
+        FROM notifications n
         WHERE n.sent_at IS NULL
           AND n.cancelled_at IS NULL
           AND n.failed_at IS NULL
           AND n.deliver_at<=now()
           AND (n.next_attempt_at IS NULL OR n.next_attempt_at<=now())
           AND (n.processing_at IS NULL OR n.processing_at < now()-interval '2 minutes')
+        ORDER BY COALESCE(n.next_attempt_at,n.deliver_at),n.id
+        LIMIT :n
+        FOR UPDATE SKIP LOCKED"""), {'n': limit})).scalars().all()
+    if not ids:
+        return 0
+
+    rows = (await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,u.telegram_id
+        FROM notifications n JOIN users u ON u.id=n.user_id
+        LEFT JOIN notification_settings ns ON ns.user_id=n.user_id
+        WHERE n.id=ANY(:ids)
+          AND n.sent_at IS NULL AND n.cancelled_at IS NULL AND n.failed_at IS NULL
           AND CASE n.category
                 WHEN 'MATCH' THEN COALESCE(ns.match,TRUE)
                 WHEN 'INJURY' THEN COALESCE(ns.injury,TRUE)
@@ -857,15 +867,19 @@ async def deliver_due_notifications(bot, s, limit=50):
                 WHEN 'TOURNAMENT' THEN COALESCE(ns.tournament,TRUE)
                 ELSE FALSE
               END
-        ORDER BY COALESCE(n.next_attempt_at,n.deliver_at),n.id
-        LIMIT :n FOR UPDATE OF n SKIP LOCKED"""), {'n':limit})).mappings().all()
-    if not rows:
-        return 0
-    ids=[r['id'] for r in rows]
-    await s.execute(text("""UPDATE notifications
-        SET processing_at=now(),delivery_attempts=delivery_attempts+1
-        WHERE id=ANY(:ids) AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'ids':ids})
+        ORDER BY COALESCE(n.next_attempt_at,n.deliver_at),n.id"""), {'ids': ids})).mappings().all()
+
+    row_ids={r['id'] for r in rows}
+    if row_ids:
+        await s.execute(text("""UPDATE notifications
+            SET processing_at=now(),delivery_attempts=delivery_attempts+1
+            WHERE id=ANY(:ids) AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'ids': list(row_ids)})
+    disabled_ids=[i for i in ids if i not in row_ids]
+    if disabled_ids:
+        await s.execute(text("""UPDATE notifications SET processing_at=NULL
+            WHERE id=ANY(:ids) AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'ids': disabled_ids})
     await s.commit()
+
     delivered=0
     for row in rows:
         try:

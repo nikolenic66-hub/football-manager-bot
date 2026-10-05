@@ -795,8 +795,21 @@ async def text_router(m:Message):
     async with SessionLocal() as s:
         uid=await current_user(s,m); exists=await current_club(s,uid)
         if exists:return
-        try: await create_club(s,uid,name); await s.commit()
-        except Exception: await s.rollback(); return await m.answer('Не удалось создать клуб. Возможно, такое название уже занято.')
+        try:
+            await create_club(s,uid,name)
+            await s.commit()
+        except ValueError as exc:
+            await s.rollback()
+            msg=str(exc)
+            if msg=='User already owns a club.':
+                return await m.answer('У вас уже есть клуб.')
+            if msg=='Club name is already taken.':
+                return await m.answer('Такое название клуба уже занято. Выберите другое.')
+            return await m.answer('Название клуба должно содержать от 3 до 30 символов.')
+        except Exception:
+            logger.exception('Club creation failed for user_id=%s name=%r', uid, name)
+            await s.rollback()
+            return await m.answer('Не удалось создать клуб из-за внутренней ошибки. Ошибка записана в журнал.')
     await m.answer(f'🏟 <b>{name}</b> создан! Вы получили стартовый состав.',reply_markup=menu())
 
 def create_bot():
