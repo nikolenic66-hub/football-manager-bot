@@ -1,46 +1,151 @@
-- name: Commit and rebase
-  shell: bash
-  run: |
-    set -euo pipefail
+name: Deploy from release archives
 
-    git config user.name "github-actions[bot]"
-    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'football-manager-bot-release-part-*.zip'
+      - '.github/workflows/main.yml'
 
-    git add -A
-    git restore --staged .github/workflows 2>/dev/null || true
+permissions:
+  contents: write
 
-    if git diff --cached --quiet; then
-      echo "Nothing to commit."
-      echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
-      exit 0
-    fi
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
 
-    git commit -m "Deploy from release archives [skip ci]"
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
 
-    git fetch origin main
-    git rebase origin/main
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-- name: Push
-  if: env.SKIP_COMMIT != '1'
-  shell: bash
-  run: |
-    set -euo pipefail
+      - name: Check release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "./football-manager-bot-release-part-1.zip"
+          test -f "./football-manager-bot-release-part-2.zip"
+          ls -lh \
+            "./football-manager-bot-release-part-1.zip" \
+            "./football-manager-bot-release-part-2.zip"
 
-    for i in 1 2 3; do
-      if git push origin HEAD:main; then
-        echo "Push succeeded."
-        exit 0
-      fi
+      - name: Extract release
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/football-extracted
+          mkdir -p /tmp/football-extracted
+          unzip -oq "./football-manager-bot-release-part-1.zip" -d "/tmp/football-extracted"
+          unzip -oq "./football-manager-bot-release-part-2.zip" -d "/tmp/football-extracted"
 
-      echo "Push failed (attempt $i), syncing and retrying..."
+      - name: Find project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT=""
+          while IFS= read -r bot; do
+            PROJECT="$(dirname "$(dirname "$bot")")"
+            break
+          done < <(find /tmp/football-extracted -type f -path '*/app/bot.py')
+          test -n "$PROJECT"
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          test -f "$PROJECT/app/bot.py"
+          test -f "$PROJECT/app/config.py"
+          test -f "$PROJECT/app/db.py"
+          test -f "$PROJECT/requirements.txt"
+          echo "Project: $PROJECT"
 
-      git fetch origin main
-      git rebase origin/main || {
-        echo "Rebase conflict, aborting."
-        exit 1
-      }
-      sleep 5
-    done
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    echo "Push failed after 3 attempts."
-    exit 1
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Compile
+        working-directory: ${{ env.PROJECT }}
+        run: python -m compileall -q app
+
+      - name: Tests
+        working-directory: ${{ env.PROJECT }}
+        run: pytest -q
+
+      - name: Prepare project in temp
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/final-football-project
+          mkdir -p /tmp/final-football-project
+          cp -a "$PROJECT"/. /tmp/final-football-project/
+
+      - name: Replace repo contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name '.github' \
+            -exec rm -rf {} +
+          cp -a /tmp/final-football-project/. .
+          rm -f football-manager-bot-release-part-1.zip
+          rm -f football-manager-bot-release-part-2.zip
+
+      - name: Commit and rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git restore --staged .github/workflows 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          git commit -m "Deploy from release archives [skip ci]"
+
+          git fetch origin main
+          git rebase origin/main
+
+      - name: Push
+        if: env.SKIP_COMMIT != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Push succeeded."
+              exit 0
+            fi
+
+            echo "Push failed (attempt $i), syncing and retrying..."
+
+            git fetch origin main
+            git rebase origin/main || {
+              echo "Rebase conflict, aborting."
+              exit 1
+            }
+            sleep 5
+          done
+
+          echo "Push failed after 3 attempts."
+          exit 1
