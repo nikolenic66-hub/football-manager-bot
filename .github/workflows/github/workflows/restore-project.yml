@@ -1,0 +1,91 @@
+name: Restore Football Manager Project
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check archive parts
+        run: |
+          test -f football-manager-bot-fixed-part-1.zip
+          test -f football-manager-bot-fixed-part-2.zip
+          test -f football-manager-bot-fixed-part-3.zip
+
+          echo "All three archive parts found."
+
+      - name: Prepare extraction directory
+        run: |
+          mkdir -p restored-project
+
+      - name: Extract part 1
+        run: |
+          unzip -q football-manager-bot-fixed-part-1.zip -d restored-project
+
+      - name: Extract part 2
+        run: |
+          unzip -q football-manager-bot-fixed-part-2.zip -d restored-project
+
+      - name: Extract part 3
+        run: |
+          unzip -q football-manager-bot-fixed-part-3.zip -d restored-project
+
+      - name: Verify project
+        run: |
+          test -f restored-project/app/bot.py
+          test -f restored-project/app/config.py
+          test -f restored-project/docker-compose.yml
+
+          echo "Project structure verified."
+
+          echo "Files:"
+          find restored-project -type f | wc -l
+
+          echo "Assets:"
+          find restored-project/assets -type f | wc -l
+
+      - name: Replace repository contents
+        run: |
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name 'football-manager-bot-fixed-part-1.zip' \
+            ! -name 'football-manager-bot-fixed-part-2.zip' \
+            ! -name 'football-manager-bot-fixed-part-3.zip' \
+            ! -name 'restored-project' \
+            -exec rm -rf {} +
+
+          cp -a restored-project/. .
+
+      - name: Remove archive parts
+        run: |
+          rm -f football-manager-bot-fixed-part-1.zip
+          rm -f football-manager-bot-fixed-part-2.zip
+          rm -f football-manager-bot-fixed-part-3.zip
+
+      - name: Show final structure
+        run: |
+          echo "Final project:"
+          find . -maxdepth 2 -type f | sort | head -200
+
+      - name: Commit restored project
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Restore football manager project from archive parts"
+          git push
