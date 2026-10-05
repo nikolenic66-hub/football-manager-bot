@@ -52,7 +52,7 @@ async def create_league(s, creator_user_id, name, max_teams=8):
 async def join_league(s,user_id,code):
     club=(await s.execute(text('SELECT id FROM clubs WHERE owner_user_id=:u'),{'u':user_id})).scalar_one_or_none()
     if not club: raise ValueError('Create a club first.')
-    league=(await s.execute(text("SELECT id,max_teams,status FROM leagues WHERE invite_code=:code"),{'code':code.upper()})).mappings().first()
+    league=(await s.execute(text("SELECT id,max_teams,status FROM leagues WHERE invite_code=:code FOR UPDATE"),{'code':code.upper()})).mappings().first()
     if not league: raise ValueError('League not found.')
     if league['status']!='WAITING': raise ValueError('League has already started.')
     n=(await s.execute(text('SELECT count(*) FROM league_teams WHERE league_id=:l'),{'l':league['id']})).scalar_one()
@@ -64,7 +64,7 @@ async def join_league(s,user_id,code):
     return league['id']
 
 async def start_league(s, user_id):
-    league=(await s.execute(text("SELECT id,max_teams FROM leagues WHERE creator_user_id=:u AND status='WAITING' ORDER BY id DESC LIMIT 1"),{'u':user_id})).mappings().first()
+    league=(await s.execute(text("SELECT id,max_teams FROM leagues WHERE creator_user_id=:u AND status='WAITING' ORDER BY id DESC LIMIT 1 FOR UPDATE"),{'u':user_id})).mappings().first()
     if not league: raise ValueError('No waiting league found.')
     clubs=[r[0] for r in (await s.execute(text('SELECT club_id FROM league_teams WHERE league_id=:l ORDER BY club_id'),{'l':league['id']})).all()]
     if len(clubs)<4 or len(clubs)%2: raise ValueError('Need an even number of clubs: 4, 6, 8, 10 or 12.')
@@ -132,8 +132,11 @@ async def set_starting_lineup(s, club_id, player_ids):
 async def plan_substitution(s, club_id, minute, player_off_id, player_on_id):
     if not 46<=minute<=90: raise ValueError('Substitution minute must be 46..90.')
     rows=(await s.execute(text('SELECT player_id,is_injured FROM club_players WHERE club_id=:c AND player_id=ANY(:ids)'),{'c':club_id,'ids':[player_off_id,player_on_id]})).mappings().all()
-    if len(rows)!=2: raise ValueError('Both players must belong to your club.')
+    if player_off_id == player_on_id or len(rows)!=2: raise ValueError('Both substitution players must be different and belong to your club.')
     if any(r['is_injured'] for r in rows): raise ValueError('Injured players cannot be part of a substitution plan.')
+    lineup=(await s.execute(text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),{'c':club_id})).scalar_one_or_none() or []
+    if player_off_id not in lineup: raise ValueError('The player coming off must be in the starting XI.')
+    if player_on_id in lineup: raise ValueError('The player coming on must be a bench player.')
     await s.execute(text('INSERT INTO club_substitution_plans(club_id,minute,player_off_id,player_on_id) VALUES(:c,:m,:off,:on) ON CONFLICT(club_id,minute,player_off_id) DO UPDATE SET player_on_id=EXCLUDED.player_on_id,enabled=true'),{'c':club_id,'m':minute,'off':player_off_id,'on':player_on_id})
 
 async def _substitution_plans(s, club_id):
@@ -187,11 +190,25 @@ async def get_tactical_board(s, club_id):
         WHERE cp.club_id=:c ORDER BY cp.shirt_number NULLS LAST,p.id"""),{"c":club_id})).mappings().all()
 
 
+async def _ensure_same_league(s, club_id, opponent_club_id):
+    if club_id == opponent_club_id:
+        raise ValueError('Opponent must be another club.')
+    ok=(await s.execute(text('''SELECT 1
+        FROM league_teams mine
+        JOIN league_teams opp ON opp.league_id=mine.league_id
+        WHERE mine.club_id=:c AND opp.club_id=:o
+        LIMIT 1'''), {'c':club_id,'o':opponent_club_id})).first()
+    if not ok:
+        raise ValueError('Opponent is not in one of your leagues.')
+
+
 async def get_counterplan(s, club_id, opponent_club_id):
+    await _ensure_same_league(s, club_id, opponent_club_id)
     row=(await s.execute(text("SELECT target_player_id,focus,intensity FROM club_counterplans WHERE club_id=:c AND opponent_club_id=:o"),{'c':club_id,'o':opponent_club_id})).mappings().first()
     return dict(row) if row else {'target_player_id':None,'focus':'BALANCED','intensity':50}
 
 async def set_counterplan(s, club_id, opponent_club_id, focus='BALANCED', intensity=50, target_player_id=None):
+    await _ensure_same_league(s, club_id, opponent_club_id)
     valid={'BALANCED','PRESS_PLAYMAKER','ATTACK_FLANKS','HIGH_LINE_TRAP','TARGET_SLOW_CB','LOW_BLOCK'}
     focus=focus.upper()
     if focus not in valid: raise ValueError('Unknown counter-plan.')
@@ -205,6 +222,7 @@ async def set_counterplan(s, club_id, opponent_club_id, focus='BALANCED', intens
     return {'target_player_id':target_player_id,'focus':focus,'intensity':intensity}
 
 async def scout_opponent(s, club_id, opponent_club_id, limit=5):
+    await _ensure_same_league(s, club_id, opponent_club_id)
     from app.game.scouting import build_scout_report
     opponent=(await s.execute(text('SELECT id,name FROM clubs WHERE id=:c'),{'c':opponent_club_id})).mappings().first()
     if not opponent: raise ValueError('Opponent club not found.')
@@ -240,12 +258,21 @@ async def ensure_club_economy(s, club_id):
     await s.execute(text("UPDATE clubs SET ticket_price=COALESCE(ticket_price,20), sponsor_level=COALESCE(sponsor_level,1) WHERE id=:c"), {'c':club_id})
 
 
-async def record_financial_transaction(s, club_id, category, amount, description, league_id=None, match_id=None):
-    club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'), {'c':club_id})).mappings().first()
+async def record_financial_transaction(s, club_id, category, amount, description, league_id=None, match_id=None, allow_debt=False):
+    if match_id is not None:
+        existing=(await s.execute(text('SELECT balance_after FROM club_financial_transactions WHERE match_id=:m AND club_id=:c AND category=:cat LIMIT 1'), {'m':match_id,'c':club_id,'cat':category})).scalar_one_or_none()
+        if existing is not None:
+            return int(existing)
+    club=(await s.execute(text('SELECT budget,COALESCE(debt,0) debt FROM clubs WHERE id=:c FOR UPDATE'), {'c':club_id})).mappings().first()
     if not club: raise ValueError('Club not found.')
     new_balance=int(club['budget'])+int(amount)
-    if new_balance<0: raise ValueError('Transaction would make the club budget negative.')
-    await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:c'), {'b':new_balance,'c':club_id})
+    new_debt=int(club['debt'])
+    if new_balance<0:
+        if not allow_debt:
+            raise ValueError('Transaction would make the club budget negative.')
+        new_debt += -new_balance
+        new_balance = 0
+    await s.execute(text('UPDATE clubs SET budget=:b,debt=:d WHERE id=:c'), {'b':new_balance,'d':new_debt,'c':club_id})
     await s.execute(text("""INSERT INTO club_financial_transactions(club_id,league_id,match_id,category,amount,balance_after,description)
         VALUES(:c,:l,:m,:cat,:a,:b,:d)"""), {'c':club_id,'l':league_id,'m':match_id,'cat':category,'a':int(amount),'b':new_balance,'d':description})
     if league_id:
@@ -257,6 +284,9 @@ async def record_financial_transaction(s, club_id, category, amount, description
 
 
 async def settle_match_economy(s, league_id, match_id, home_club_id, away_club_id):
+    existing=(await s.execute(text('SELECT 1 FROM club_financial_transactions WHERE match_id=:m LIMIT 1 FOR UPDATE'), {'m':match_id})).first()
+    if existing:
+        return {'already_settled': True}
     rows=(await s.execute(text('SELECT * FROM clubs WHERE id=ANY(:ids)'), {'ids':[home_club_id,away_club_id]})).mappings().all()
     clubs={r['id']:r for r in rows}
     if len(clubs)!=2: raise ValueError('Both clubs must exist for financial settlement.')
@@ -264,18 +294,18 @@ async def settle_match_economy(s, league_id, match_id, home_club_id, away_club_i
     await record_financial_transaction(s,home_club_id,'TICKETS',home.ticket_revenue,
         f'Dомашний матч: {home.attendance:,} зрителей × €{home.ticket_price}',league_id,match_id)
     await record_financial_transaction(s,home_club_id,'STADIUM',-home.stadium_cost,
-        f'Содержание стадиона и матчдэй: {home.attendance:,} зрителей',league_id,match_id)
+        f'Содержание стадиона и матчдэй: {home.attendance:,} зрителей',league_id,match_id,True)
     for cid in (home_club_id,away_club_id):
         c=clubs[cid]
         sponsor=sponsor_income(c['sponsor_level'],c['reputation'])
         await record_financial_transaction(s,cid,'SPONSOR',sponsor,'Спонсорский доход за тур',league_id,match_id)
         salaries=(await s.execute(text('SELECT COALESCE(cp.contract_salary,p.salary) FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c'),{'c':cid})).scalars().all()
         wages=wage_bill(salaries)
-        await record_financial_transaction(s,cid,'WAGES',-wages,f'Зарплатная ведомость: €{wages:,}',league_id,match_id)
-        balance=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c'),{'c':cid})).scalar_one()
-        if int(balance)<1_000_000:
+        await record_financial_transaction(s,cid,'WAGES',-wages,f'Зарплатная ведомость: €{wages:,}',league_id,match_id,True)
+        balance=(await s.execute(text('SELECT budget,debt FROM clubs WHERE id=:c'),{'c':cid})).mappings().first()
+        if int(balance['budget'])<1_000_000 or int(balance['debt'])>0:
             await queue_club_notification(s,cid,'FINANCE','⚠️ Критический баланс',
-                f'В казне осталось €{int(balance):,}. Проверьте финансы клуба.',
+                f'В казне осталось €{int(balance["budget"]):,}. Долг: €{int(balance["debt"]):,}. Проверьте финансы клуба.',
                 f'low-budget:{league_id}:{match_id}:{cid}')
     return {'home':home,'away':calculate_match_economy(clubs[away_club_id],clubs[home_club_id],home=False)}
 
@@ -311,6 +341,8 @@ async def financial_report(s, club_id, league_id=None, limit=12):
 
 
 async def settle_season_prizes(s, league_id):
+    if (await s.execute(text("SELECT 1 FROM club_financial_transactions WHERE league_id=:l AND category='PRIZE' LIMIT 1"), {'l':league_id})).first():
+        return []
     rows=(await s.execute(text('''SELECT club_id,ROW_NUMBER() OVER (ORDER BY points DESC,(goals_for-goals_against) DESC,goals_for DESC,club_id) position,
         COUNT(*) OVER () teams FROM league_teams WHERE league_id=:l'''),{'l':league_id})).mappings().all()
     out=[]
@@ -430,7 +462,7 @@ async def _live_match_rows(s, league_id=None):
     params={}
     if league_id is not None:
         q += " AND league_id=:l"; params['l']=league_id
-    q += " ORDER BY id FOR UPDATE"
+    q += " ORDER BY id LIMIT 25 FOR UPDATE SKIP LOCKED"
     return (await s.execute(text(q), params)).mappings().all()
 
 async def _prepare_second_half_live(s, match, phase_start_at=None):
@@ -529,7 +561,41 @@ async def _finish_live_match(s, match):
         elif e['event_type']=='RED':
             await s.execute(text('UPDATE club_players SET suspension_matches=GREATEST(suspension_matches,1) WHERE club_id=:c AND player_id=:p'),{'c':e['club_id'],'p':e['player_id']})
             await queue_club_notification(s,e['club_id'],'DISCIPLINE','🟥 Удаление',f'{pname} получил красную карточку и пропустит следующий матч.',f'red:{match["id"]}:{e["player_id"]}')
-    await s.execute(text("UPDATE matches SET home_score=:h,away_score=:a,current_minute=90,status='FINISHED',live_phase='FINISHED',halftime_locked=FALSE,finished_at=now() WHERE id=:m"),{'h':final_h,'a':final_a,'m':match['id']})
+    # Persist live player ratings/MOTM inputs before the match becomes FINISHED.
+    events=(await s.execute(text('SELECT minute,player_id,secondary_player_id,event_type FROM match_events WHERE match_id=:m ORDER BY id'), {'m':match['id']})).mappings().all()
+    home_ids=set(data.get('home_players',[])); away_ids=set(data.get('away_players',[]))
+    for minute,off_id,on_id,team in data.get('substitutions',[]):
+        (home_ids if team=='HOME' else away_ids).add(int(on_id))
+    player_ids=home_ids | away_ids
+    motm_player_id=None
+    motm_rating=-1.0
+    if player_ids:
+        prs=(await s.execute(text(f"SELECT {PLAYER_FIELDS} FROM players WHERE id=ANY(:ids)"), {'ids':list(player_ids)})).mappings().all()
+        for pr in prs:
+            p_obj=row_player(pr)
+            goals=sum(1 for e in events if e['player_id']==p_obj.id and e['event_type']=='GOAL')
+            assists=sum(1 for e in events if e['player_id']==p_obj.id and e['event_type']=='ASSIST')
+            rating=round(max(5,min(10,6.2+(player_rating(p_obj)-65)*.055+goals*.85+assists*.45)),1)
+            if rating > motm_rating:
+                motm_rating=rating; motm_player_id=p_obj.id
+            cid=match['home_club_id'] if p_obj.id in home_ids else match['away_club_id']
+            minutes=90
+            for exit_minute,exit_player_id,_,_team in data.get('first_half_exits',[]):
+                if int(exit_player_id)==p_obj.id:
+                    minutes=min(minutes,max(0,int(exit_minute)))
+            for sub_minute,off_id,on_id,_team in data.get('substitutions',[]):
+                if int(on_id)==p_obj.id:
+                    minutes=min(minutes,max(0,90-int(sub_minute)))
+                elif int(off_id)==p_obj.id:
+                    minutes=min(minutes,max(0,int(sub_minute)))
+            for e in events:
+                if e['player_id']==p_obj.id and e['event_type'] in {'RED','INJURY'}:
+                    minutes=min(minutes,int(e['minute']))
+            await s.execute(text('''INSERT INTO match_player_stats(match_id,club_id,player_id,rating,minutes,goals,assists)
+                VALUES(:m,:c,:p,:r,:min,:g,:a)
+                ON CONFLICT(match_id,player_id) DO UPDATE SET rating=EXCLUDED.rating,minutes=EXCLUDED.minutes,goals=EXCLUDED.goals,assists=EXCLUDED.assists'''),
+                {'m':match['id'],'c':cid,'p':p_obj.id,'r':rating,'min':minutes,'g':goals,'a':assists})
+    await s.execute(text("UPDATE matches SET home_score=:h,away_score=:a,current_minute=90,motm_player_id=:motm,status='FINISHED',live_phase='FINISHED',halftime_locked=FALSE,finished_at=now() WHERE id=:m"),{'h':final_h,'a':final_a,'motm':motm_player_id,'m':match['id']})
     result_text=f"{data.get('home_name','Home')} <b>{final_h}:{final_a}</b> {data.get('away_name','Away')}"
     await queue_club_notification(s,match['home_club_id'],'MATCH','🏁 Матч завершён',result_text,f'match-finished:{match["id"]}')
     await queue_club_notification(s,match['away_club_id'],'MATCH','🏁 Матч завершён',result_text,f'match-finished:{match["id"]}')
@@ -638,9 +704,12 @@ async def accept_transfer_offer(s, seller_club_id, offer_id):
     if not offer or offer['seller_club_id']!=seller_club_id or offer['listing_status']!='LISTED': raise ValueError('You cannot accept this offer.')
     if offer['amount']<offer['minimum_price']: raise ValueError('Offer is below the minimum price.')
     buyer=offer['buyer_club_id']; seller=seller_club_id
+    if buyer == seller: raise ValueError('Buyer and seller clubs must differ.')
+    locked=(await s.execute(text('SELECT id,budget FROM clubs WHERE id=ANY(:ids) ORDER BY id FOR UPDATE'), {'ids':[buyer,seller]})).mappings().all()
+    if len(locked)!=2: raise ValueError('Buyer or seller club not found.')
     count=(await s.execute(text('SELECT count(*) FROM club_players WHERE club_id=:c'),{'c':buyer})).scalar_one()
     if count>=30: raise ValueError('Buyer squad is full.')
-    budget=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'),{'c':buyer})).scalar_one()
+    budget=next(int(r['budget']) for r in locked if r['id']==buyer)
     if budget<offer['amount']: raise ValueError('Buyer no longer has enough budget.')
     await record_financial_transaction(s,buyer,'TRANSFER_OUT',-offer['amount'],f'Трансфер: {offer["first_name"]} {offer["last_name"]}')
     await record_financial_transaction(s,seller,'TRANSFER_IN',offer['amount'],f'Продажа: {offer["first_name"]} {offer["last_name"]}')
@@ -789,7 +858,7 @@ async def deliver_due_notifications(bot, s, limit=50):
                 ELSE FALSE
               END
         ORDER BY COALESCE(n.next_attempt_at,n.deliver_at),n.id
-        LIMIT :n FOR UPDATE OF n SKIP LOCKED"""), {'n':limit})).mappings().all()
+        LIMIT :n FOR UPDATE SKIP LOCKED"""), {'n':limit})).mappings().all()
     if not rows:
         return 0
     ids=[r['id'] for r in rows]

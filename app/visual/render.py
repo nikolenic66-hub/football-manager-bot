@@ -25,6 +25,24 @@ def silhouette(draw,cx,cy,scale,accent):
 
 def player_card(player,out=None,size=(620,860)):
     rarity=player.get('rarity','BASE'); bg,accent=RARITY.get(rarity,RARITY['BASE'])
+    if out is None: out=CARD_DIR/f"player_{player.get('id','x')}.png"
+    out=Path(out)
+    portrait = player.get('portrait_path') or player.get('portrait_url')
+    portrait_path = None
+    if portrait:
+        pp=Path(str(portrait))
+        portrait_path = pp if pp.is_absolute() else ROOT/pp
+    fingerprint=hashlib.sha256(repr((
+        player.get('id'), player.get('first_name'), player.get('last_name'), player.get('position'),
+        player.get('nationality'), rarity, player.get('overall'), player.get('pace'), player.get('shooting'),
+        player.get('passing'), player.get('dribbling'), player.get('defending'), player.get('physical'),
+        tuple(player.get('talents') or ()), str(portrait_path),
+        (portrait_path.stat().st_mtime_ns, portrait_path.stat().st_size) if portrait_path and portrait_path.exists() else None,
+        size,
+    )).encode()).hexdigest()
+    cache_meta=out.with_suffix(out.suffix+'.sha256')
+    if out.exists() and cache_meta.exists() and cache_meta.read_text(encoding='ascii')==fingerprint:
+        return out
     im=Image.new('RGB',size,(5,12,24)); d=ImageDraw.Draw(im)
     # Fast deterministic background: a solid rarity tone plus two depth bands.
     d.rectangle((0,0,size[0],size[1]),fill=bg)
@@ -33,11 +51,6 @@ def player_card(player,out=None,size=(620,860)):
     rounded(d,(18,18,size[0]-18,size[1]-18),32,fill=None,outline=accent,w=8)
     rounded(d,(42,42,size[0]-42,530),26,fill=(9,20,34),outline=accent,w=3)
     # Prefer an approved local portrait when available; otherwise keep the deterministic silhouette.
-    portrait = player.get('portrait_path') or player.get('portrait_url')
-    portrait_path = None
-    if portrait:
-        pp=Path(str(portrait))
-        portrait_path = pp if pp.is_absolute() else ROOT/pp
     if portrait_path and portrait_path.exists():
         try:
             src=Image.open(portrait_path).convert('RGB')
@@ -67,8 +80,8 @@ def player_card(player,out=None,size=(620,860)):
     talents=player.get('talents') or []
     if isinstance(talents,str): talents=[talents]
     d.text((55,815),(' • '.join(talents[:3]))[:45],font=font(18,True),fill=accent)
-    if out is None: out=CARD_DIR/f"player_{player.get('id','x')}.png"
     im.save(out)
+    cache_meta.write_text(fingerprint,encoding='ascii')
     return out
 
 def formation_positions(formation):

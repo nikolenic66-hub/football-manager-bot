@@ -1,4 +1,8 @@
 import asyncio
+import time
+import logging
+from collections import defaultdict
+from aiogram import BaseMiddleware
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto
@@ -13,6 +17,27 @@ from .game.ratings import player_rating
 from .visual import player_card, formation_board, match_center, club_crest, tactical_board_screen, squad_screen, league_table_screen, club_dashboard, market_screen, fixtures_screen, scouting_screen, match_phase_screen, dynamic_match_screen, event_replay_screen, finance_screen
 
 router=Router()
+logger=logging.getLogger(__name__)
+
+
+class RateLimitMiddleware(BaseMiddleware):
+    def __init__(self, cooldown=0.75):
+        self.cooldown=cooldown
+        self._last=defaultdict(float)
+
+    async def __call__(self, handler, event, data):
+        user=getattr(getattr(event, 'from_user', None), 'id', None)
+        if user is not None:
+            command=(getattr(event, 'text', None) or '').split(maxsplit=1)[0].lower()
+            key=(user, command)
+            now=time.monotonic()
+            if now-self._last[key] < self.cooldown:
+                return None
+            self._last[key]=now
+        return await handler(event,data)
+
+
+router.message.middleware(RateLimitMiddleware())
 
 
 def menu():
@@ -70,7 +95,10 @@ async def cmd_createleague(m:Message):
         uid=await current_user(s,m); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         try: league_id,code=await create_league(s,uid,parts[2],n); await s.commit()
-        except Exception as e: await s.rollback(); return await m.answer(f'Не удалось создать лигу: {e}')
+        except ValueError as e: await s.rollback(); return await m.answer(str(e))
+        except Exception:
+            await s.rollback(); logger.exception('Failed to create league')
+            return await m.answer('Не удалось создать лигу. Попробуйте ещё раз.')
     await m.answer(f'🏆 Лига <b>{parts[2]}</b> создана.\nКод приглашения: <code>{code}</code>\n\nДрузья могут: /join {code}')
 
 @router.message(Command('join'))
@@ -78,6 +106,8 @@ async def cmd_join(m:Message):
     parts=(m.text or '').split(maxsplit=1)
     if len(parts)<2:return await m.answer('Использование: /join КОД')
     code=parts[1].strip().upper()
+    if not code.isalnum() or not 4 <= len(code) <= 8:
+        return await m.answer('Некорректный код лиги.')
     async with SessionLocal() as s:
         uid=await current_user(s,m); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
@@ -772,11 +802,11 @@ async def text_router(m:Message):
 def create_bot():
     bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(router)
     live_task=None
-    async def on_startup():
+    async def on_startup(_bot):
         nonlocal live_task
         from .live_worker import live_worker
-        live_task=asyncio.create_task(live_worker(bot),name='football-manager-live-worker')
-    async def on_shutdown():
+        live_task=asyncio.create_task(live_worker(_bot),name='football-manager-live-worker')
+    async def on_shutdown(_bot):
         nonlocal live_task
         if live_task:
             live_task.cancel()

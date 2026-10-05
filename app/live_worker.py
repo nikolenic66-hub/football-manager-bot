@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from sqlalchemy import text
-from .db import SessionLocal
+from .db import SessionLocal, engine
 from .services import advance_live_matches, finalize_live_round, start_round_halftime, queue_notification, deliver_due_notifications
 
 logger=logging.getLogger(__name__)
@@ -54,6 +54,8 @@ async def queue_live_event_notifications(s, match_id):
         if e_goal['club_id']==row['home_club_id']: gh+=1
         elif e_goal['club_id']==row['away_club_id']: ga+=1
         goal_prefix[e_goal['id']]=(gh,ga)
+    owner_rows=(await s.execute(text('SELECT id,owner_user_id FROM clubs WHERE id=ANY(:ids)'), {'ids':[row['home_club_id'],row['away_club_id']]})).mappings().all()
+    owner_cache={r['id']:r['owner_user_id'] for r in owner_rows}
     for e in events:
         typ=e['event_type']
         if typ not in IMPORTANT_LIVE_EVENTS:
@@ -74,7 +76,7 @@ async def queue_live_event_notifications(s, match_id):
             body=f"{e['minute']}′ {e['description']}\\n{score}"
             if assist: body += f"\\n🅰️ Ассист: {assist}"
             for cid in (row['home_club_id'],row['away_club_id']):
-                await _queue_for_club(s,cid,'MATCH','⚽ ГОЛ',body,f"live-event:{e['id']}")
+                await _queue_for_club(s,cid,'MATCH',owner_cache,'⚽ ГОЛ',body,f"live-event:{e['id']}")
         elif typ=='ASSIST':
             # Assist is folded into the goal notification to avoid duplicate Telegram messages.
             continue
@@ -85,38 +87,57 @@ async def queue_live_event_notifications(s, match_id):
                 except Exception: meta={}
             if meta.get('result') not in DANGEROUS_SHOT_RESULTS:
                 continue
-            await _queue_for_club(s,e['club_id'],'MATCH','🔥 Опасный момент',f"{e['minute']}′ {e['description']}\\n{score}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔥 Опасный момент',f"{e['minute']}′ {e['description']}\\n{score}",f"live-event:{e['id']}")
         elif typ=='YELLOW':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE','🟨 Жёлтая карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟨 Жёлтая карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
         elif typ=='INJURY':
-            await _queue_for_club(s,e['club_id'],'INJURY','🩹 Травма',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'INJURY',owner_cache,'🩹 Травма',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
         elif typ=='RED':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE','🟥 Красная карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟥 Красная карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
         elif typ=='SUBSTITUTION':
-            await _queue_for_club(s,e['club_id'],'MATCH','🔄 Замена',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔄 Замена',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
     await s.execute(text('UPDATE matches SET live_event_cursor=:id WHERE id=:m'),{'id':max(e['id'] for e in events),'m':match_id})
 
-async def _queue_for_club(s, club_id, category, title, body, dedupe_key):
-    uid=(await s.execute(text('SELECT owner_user_id FROM clubs WHERE id=:c'),{'c':club_id})).scalar_one_or_none()
+async def _queue_for_club(s, club_id, category, owner_cache, title, body, dedupe_key):
+    uid=owner_cache.get(club_id) if owner_cache is not None else (await s.execute(text('SELECT owner_user_id FROM clubs WHERE id=:c'),{'c':club_id})).scalar_one_or_none()
     if uid is not None:
         await queue_notification(s,uid,category,title,body,dedupe_key)
 
 async def live_worker(bot):
-    while True:
+    # One process owns the live scheduler. Row locks remain the second line of
+    # defence for individual state transitions. The advisory lock is session
+    # scoped, so keep the connection open for the lifetime of this worker.
+    lock_conn = await engine.connect()
+    try:
+        acquired = bool((await lock_conn.execute(text("SELECT pg_try_advisory_lock(hashtext('football-manager-live-worker'))"))).scalar_one())
+        if not acquired:
+            logger.warning('Another live worker is already active; this worker will stay idle.')
+            await lock_conn.close()
+            return
+        while True:
+            try:
+                async with SessionLocal() as s:
+                    await start_due_rounds(s)
+                    transitions,finished=await advance_live_matches(s)
+                    live_ids=(await s.execute(text("SELECT id FROM matches WHERE status='LIVE' ORDER BY id LIMIT 25"))).scalars().all()
+                    for mid in live_ids:
+                        await queue_live_event_notifications(s,mid)
+                    if finished:
+                        leagues=(await s.execute(text('SELECT DISTINCT league_id FROM matches WHERE id=ANY(:ids)'),{'ids':[r['match_id'] for r in finished]})).scalars().all()
+                        for lid in leagues:
+                            await finalize_live_round(s,lid,finished)
+                    await s.commit()
+                async with SessionLocal() as delivery_session:
+                    await deliver_due_notifications(bot,delivery_session)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Live worker iteration failed')
+            await asyncio.sleep(1)
+    finally:
         try:
-            async with SessionLocal() as s:
-                await start_due_rounds(s)
-                transitions,finished=await advance_live_matches(s)
-                live_ids=(await s.execute(text("SELECT id FROM matches WHERE status='LIVE' ORDER BY id"))).scalars().all()
-                for mid in live_ids:
-                    await queue_live_event_notifications(s,mid)
-                if finished:
-                    leagues=(await s.execute(text('SELECT DISTINCT league_id FROM matches WHERE id=ANY(:ids)'),{'ids':[r['match_id'] for r in finished]})).scalars().all()
-                    for lid in leagues:
-                        await finalize_live_round(s,lid,finished)
-                await s.commit()
-            async with SessionLocal() as delivery_session:
-                await deliver_due_notifications(bot,delivery_session)
+            await lock_conn.execute(text("SELECT pg_advisory_unlock(hashtext('football-manager-live-worker'))"))
         except Exception:
-            logger.exception('Live worker iteration failed')
-        await asyncio.sleep(1)
+            pass
+        await lock_conn.close()
+

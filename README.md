@@ -207,3 +207,10 @@ The visual tactical board uses the exact same formation slot source as the engin
 - `5-3-2` = 5 defenders / 3 midfielders / 2 strikers
 
 `scripts/audit_visuals.py` verifies all 1,248 card files, the formation asset count, the exact formation semantics, the real-player card ID coverage and the card manifest.
+
+## Production-safety notes (fixed release)
+
+- `POSTGRES_PASSWORD` is required by Docker Compose; the database port is internal by default.
+- `DATABASE_URL` must use the same PostgreSQL credentials.
+- Migrations are versioned in `schema_migrations`; legacy installations are not replayed destructively.
+- Only one live worker is active at a time via PostgreSQL advisory lock.

@@ -105,10 +105,14 @@ def _add_non_goal_shots(events, home, away, ht, at, home_board, away_board, seed
         events.append(MatchEvent(minute,'SHOT',side,shooter.name,None,f'🎯 {shooter.name} наносит удар',_visual_meta('SHOT',start,end,result,zone='FINISH')))
 
 def poisson(rng,lam):
-    lam=max(.05,min(lam,4.5)); L=exp(-lam); k=0;p=1
+    if lam <= 0:
+        return 0
+    lam=min(lam,4.5); L=exp(-lam); k=0;p=1
     while p>L: k+=1;p*=rng.random()
     return k-1
 def expected_goals(home,away,ht,at,home_board=None,away_board=None,home_counter=None,away_counter=None):
+    if not home or not away:
+        return 0.0, 0.0
     hs,as_=team_strength(home,ht.formation),team_strength(away,at.formation); ha,hd=tactical_modifiers(ht); aa,ad=tactical_modifiers(at)
     he=board_effect(home_board or TacticalBoard(ht.formation),ht.style,ht.pressing,ht.width,ht.defensive_line); ae=board_effect(away_board or TacticalBoard(at.formation),at.style,at.pressing,at.width,at.defensive_line)
     hb=home_board or TacticalBoard(ht.formation); ab=away_board or TacticalBoard(at.formation)
@@ -147,7 +151,7 @@ def expected_goals(home,away,ht,at,home_board=None,away_board=None,home_counter=
         if focus=='PRESS_PLAYMAKER' and target and target.position in {'AM','CM','DM'}:
             if own is home: hx*=1+.035*intensity; ax*=1-.045*intensity
             else: ax*=1+.035*intensity; hx*=1-.045*intensity
-        elif focus=='ATTACK_FLANKS':
+        elif focus=='ATTACK_FLANKS' and ((opp is away and at.width < 45) or (opp is home and ht.width < 45)):
             if own is home: hx*=1+.035*intensity
             else: ax*=1+.035*intensity
         elif focus=='HIGH_LINE_TRAP' and opp is away and at.defensive_line>60:
@@ -157,12 +161,15 @@ def expected_goals(home,away,ht,at,home_board=None,away_board=None,home_counter=
         elif focus=='TARGET_SLOW_CB' and target and target.position=='CB' and target.pace<70:
             if own is home: hx*=1+.045*intensity
             else: ax*=1+.045*intensity
-        elif focus=='LOW_BLOCK':
+        elif focus=='LOW_BLOCK' and ((opp is away and at.style in {Style.ATTACK,Style.POSSESSION}) or (opp is home and ht.style in {Style.ATTACK,Style.POSSESSION})):
             if own is home: ax*=1-.04*intensity
             else: hx*=1-.04*intensity
     return round(max(.15,min(hx,4)),2),round(max(.15,min(ax,4)),2)
 def pick_scorer(rng,players):
-    xs=[p for p in players if p.position!='GK' and not p.suspended]; return rng.choices(xs,weights=[max(1,player_rating(p))*(1.25 if p.position=='ST' else 1) for p in xs],k=1)[0]
+    xs=[p for p in players if p.position!='GK' and not p.suspended]
+    if not xs:
+        return None
+    return rng.choices(xs,weights=[max(1,player_rating(p))*(1.25 if p.position=='ST' else 1) for p in xs],k=1)[0]
 def pick_assist(rng,players,scorer):
     xs=[p for p in players if p.id!=scorer.id and p.position!='GK' and not p.suspended]; return rng.choice(xs) if xs else None
 def simulate_match(home_name,away_name,home,away,home_tactics,away_tactics,seed,home_board=None,away_board=None,home_counter=None,away_counter=None):
@@ -173,7 +180,9 @@ def simulate_match(home_name,away_name,home,away,home_tactics,away_tactics,seed,
     away_pos=_player_map(away,away_board or TacticalBoard(away_tactics.formation),'AWAY')
     for team,name,n,positions in ((home,home_name,hs,home_pos),(away,away_name,as_,away_pos)):
         for _ in range(n):
-            p=pick_scorer(rng,team); a=pick_assist(rng,team,p); minute=rng.randint(2,90)
+            p=pick_scorer(rng,team)
+            if p is None: continue
+            a=pick_assist(rng,team,p); minute=rng.randint(2,90)
             events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!'))
             _goal_sequence(events,p,a,'HOME' if team is home else 'AWAY',minute,positions,visual_rng)
             if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.'))
@@ -185,7 +194,7 @@ def simulate_match(home_name,away_name,home,away,home_tactics,away_tactics,seed,
     events.sort(key=lambda e:(e.minute,_EVENT_ORDER.get(e.type,99))); ratings={}
     for p in home+away:
         r=6.2+(player_rating(p)-65)*.055+.15*(p.position=='GK')
-        r += .35*min(.15, player_talent_bonus(p,'team_stability')+player_talent_bonus(p,'composure')); r+=.85*sum(e.type=='GOAL' and e.player==p.name for e in events); r+=.45*sum(e.type=='ASSIST' and e.player==p.name for e in events); ratings[p.name]=round(max(5,min(10,r)),1)
+        r += .85*sum(e.type=='GOAL' and e.player==p.name for e in events); r+=.45*sum(e.type=='ASSIST' and e.player==p.name for e in events); ratings[p.name]=round(max(5,min(10,r)),1)
     motm=max(ratings,key=ratings.get); return MatchResult(hs,as_,hx,ax,events,ratings,motm)
 
 
@@ -200,21 +209,31 @@ def _half_result(home, away, ht, at, seed, half, home_counter=None, away_counter
     away_pos=_player_map(away,away_board or TacticalBoard(at.formation),'AWAY')
     for team,name,n,positions in ((home,'HOME',hs,home_pos),(away,'AWAY',as_,away_pos)):
         for _ in range(n):
-            p=pick_scorer(rng,team); a=pick_assist(rng,team,p); minute=rng.randint(1,45)
+            p=pick_scorer(rng,team)
+            if p is None: continue
+            a=pick_assist(rng,team,p); minute=rng.randint(1,45)
             events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!'))
             _goal_sequence(events,p,a,name,minute,positions,visual_rng)
             if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.'))
     _add_open_play_events(events,home,away,ht,at,home_board,away_board,seed*17+3,3,44,hx,ax)
     _add_non_goal_shots(events,home,away,ht,at,home_board,away_board,seed*17+4,6,44,count=2)
     for _ in range(rng.randint(0,2)):
-        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
+        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'; candidates=[x for x in team if x.position!='GK'] or list(team)
+        if not candidates: continue
+        p=rng.choice(candidates)
         events.append(MatchEvent(rng.randint(8,44),'YELLOW',name,p.name,text=f'🟨 {p.name} получает жёлтую.'))
     if rng.random()<0.025:
-        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
-        events.append(MatchEvent(rng.randint(20,44),'RED',name,p.name,text=f'🟥 {p.name} удалён.'))
+        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'
+        candidates=[x for x in team if x.position!='GK'] or list(team)
+        if candidates:
+            p=rng.choice(candidates)
+            events.append(MatchEvent(rng.randint(20,44),'RED',name,p.name,text=f'🟥 {p.name} удалён.'))
     if rng.random()<0.035:
-        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
-        events.append(MatchEvent(rng.randint(10,44),'INJURY',name,p.name,text=f'🩹 {p.name} получил травму.'))
+        team=home if rng.random()<.5 else away; name='HOME' if team is home else 'AWAY'
+        candidates=[x for x in team if x.position!='GK'] or list(team)
+        if candidates:
+            p=rng.choice(candidates)
+            events.append(MatchEvent(rng.randint(10,44),'INJURY',name,p.name,text=f'🩹 {p.name} получил травму.'))
     events.sort(key=lambda e:(e.minute,_EVENT_ORDER.get(e.type,99)))
     return hs,as_,events
 
@@ -223,40 +242,87 @@ def simulate_first_half(home, away, ht, at, seed, home_counter=None, away_counte
     return hs,as_,events
 
 def simulate_second_half(home, away, ht, at, seed, substitutions=None, home_counter=None, away_counter=None, home_board=None, away_board=None):
-    """Simulate 46-90. Substitutions are applied at their minute and affect later scoring pools."""
-    substitutions=sorted(substitutions or [], key=lambda x:x[0])
+    """Deterministic minute-by-minute second half.
+
+    Red cards/injuries are applied at their event minute, substitutions only when
+    the outgoing player is active, and later minutes use the resulting squads.
+    Empty sides are supported and simply cannot score.
+    """
+    substitutions=sorted(substitutions or [], key=lambda x:(x[0],x[1]))
     rng=Random(seed); visual_rng=Random(seed*31+46); events=[]; hs=as_=0
     home_now=list(home); away_now=list(away)
-    segments=[(46,60),(61,75),(76,90)]
-    for segment_index,(start,end) in enumerate(segments):
-        for minute,off_id,on_player,team in substitutions:
-            if start <= minute <= end:
-                pool=home_now if team=='HOME' else away_now
-                for i,p in enumerate(pool):
-                    if p.id==off_id:
-                        pool[i]=on_player; break
-                events.append(MatchEvent(minute,'SUBSTITUTION',team,on_player.name,None,f'🔄 {on_player.name} выходит на {off_id}.',{'visual_type':'SUBSTITUTION'}))
+    sub_by_minute={}
+    for item in substitutions:
+        sub_by_minute.setdefault(int(item[0]),[]).append(item)
+    # Generate incident schedule from the seed, then apply it in chronological order.
+    incidents=[]
+    for typ, chance, lo, hi in (('RED',.02,55,89),('INJURY',.035,50,88)):
+        if rng.random() < chance:
+            team_name='HOME' if rng.random()<.5 else 'AWAY'
+            pool=home_now if team_name=='HOME' else away_now
+            candidates=[p for p in pool if p.position!='GK'] or list(pool)
+            if candidates:
+                p=rng.choice(candidates)
+                incidents.append((rng.randint(lo,hi),typ,team_name,p.id))
+    incidents.sort(key=lambda x:(x[0], _EVENT_ORDER.get(x[1],99), x[3]))
+    incidents_by_minute={}
+    for item in incidents:
+        incidents_by_minute.setdefault(item[0],[]).append(item)
+
+    for minute in range(46,91):
+        for _,off_id,on_player,team in sub_by_minute.get(minute,[]):
+            pool=home_now if team=='HOME' else away_now
+            idx=next((i for i,p in enumerate(pool) if p.id==off_id),None)
+            if idx is not None and on_player.id not in {p.id for p in pool}:
+                pool[idx]=on_player
+                events.append(MatchEvent(minute,'SUBSTITUTION',team,on_player.name,None,
+                    f'🔄 {on_player.name} выходит вместо #{off_id}.',{'visual_type':'SUBSTITUTION'}))
+        for _,typ,team_name,pid in incidents_by_minute.get(minute,[]):
+            pool=home_now if team_name=='HOME' else away_now
+            idx=next((i for i,p in enumerate(pool) if p.id==pid),None)
+            if idx is None:
+                continue
+            player=pool[idx]
+            if typ=='RED':
+                pool.pop(idx)
+                events.append(MatchEvent(minute,'RED',team_name,player.name,None,f'🟥 {player.name} удалён.',{'visual_type':'CARD','card':'RED'}))
+            else:
+                pool.pop(idx)
+                events.append(MatchEvent(minute,'INJURY',team_name,player.name,None,f'🩹 {player.name} получил травму.',{'visual_type':'INJURY'}))
         hfx,afx=expected_goals(home_now,away_now,ht,at,home_board=home_board,away_board=away_board,home_counter=home_counter,away_counter=away_counter)
-        span=(end-start+1)/45
-        hfx*=span*fatigue_factor(home_now[0],end); afx*=span*fatigue_factor(away_now[0],end)
+        hfx=(hfx/45)*fatigue_factor_team(home_now,minute)
+        afx=(afx/45)*fatigue_factor_team(away_now,minute)
         sh,sa=poisson(rng,hfx),poisson(rng,afx); hs+=sh; as_+=sa
         for team,name,n,pool in ((home_now,'HOME',sh,home_now),(away_now,'AWAY',sa,away_now)):
-            positions=_player_map(pool,home_board or TacticalBoard(ht.formation) if name=='HOME' else away_board or TacticalBoard(at.formation),name)
+            positions=_player_map(pool,home_board if name=='HOME' else away_board,name)
             for _ in range(n):
-                p=pick_scorer(rng,pool); a=pick_assist(rng,pool,p); minute=rng.randint(start,end)
-                events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!'))
-                _goal_sequence(events,p,a,name,minute,positions,visual_rng)
-                if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.'))
-        _add_open_play_events(events,home_now,away_now,ht,at,home_board,away_board,seed*19+segment_index, start,end,hfx,afx,count=3 if segment_index<2 else 4)
-        _add_non_goal_shots(events,home_now,away_now,ht,at,home_board,away_board,seed*23+segment_index,start,end,count=1)
+                scorer=pick_scorer(rng,pool)
+                if scorer is None:
+                    continue
+                assist=pick_assist(rng,pool,scorer)
+                events.append(MatchEvent(minute,'GOAL',name,scorer.name,assist.name if assist else None,f'⚽ {scorer.name} забивает!'))
+                _goal_sequence(events,scorer,assist,name,minute,positions,visual_rng)
+                if assist:
+                    events.append(MatchEvent(minute,'ASSIST',name,assist.name,scorer.name,f'🅰️ Передача {assist.name}.'))
+        # A small deterministic sample of replay actions per 5-minute block.
+        if minute % 5 == 0:
+            _add_open_play_events(events,home_now,away_now,ht,at,home_board,away_board,seed*19+minute,minute,min(90,minute+4),hfx,afx,count=1)
+            _add_non_goal_shots(events,home_now,away_now,ht,at,home_board,away_board,seed*23+minute,minute,min(90,minute+4),count=1)
+
+    # Yellows are generated after incidents but never select a player who left the pitch.
     for _ in range(rng.randint(0,3)):
-        team=home_now if rng.random()<.5 else away_now; name='HOME' if team is home_now else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
+        team=home_now if rng.random()<.5 else away_now
+        candidates=[x for x in team if x.position!='GK'] or list(team)
+        if not candidates:
+            continue
+        p=rng.choice(candidates); name='HOME' if team is home_now else 'AWAY'
         events.append(MatchEvent(rng.randint(46,89),'YELLOW',name,p.name,text=f'🟨 {p.name} получает жёлтую.'))
-    if rng.random()<0.02:
-        team=home_now if rng.random()<.5 else away_now; name='HOME' if team is home_now else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
-        events.append(MatchEvent(rng.randint(55,89),'RED',name,p.name,text=f'🟥 {p.name} удалён.'))
-    if rng.random()<0.035:
-        team=home_now if rng.random()<.5 else away_now; name='HOME' if team is home_now else 'AWAY'; p=rng.choice([x for x in team if x.position!='GK'])
-        events.append(MatchEvent(rng.randint(50,88),'INJURY',name,p.name,text=f'🩹 {p.name} получил травму.'))
     events.sort(key=lambda e:(e.minute,_EVENT_ORDER.get(e.type,99)))
     return hs,as_,events
+
+
+def fatigue_factor_team(players, minute):
+    if not players:
+        return 0.0
+    return sum(fatigue_factor(p, minute) for p in players) / len(players)
+

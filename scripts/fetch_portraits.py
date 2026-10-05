@@ -63,7 +63,7 @@ async def main():
             # Rebuild this exact player card from the same player ID + portrait file.
             row=(await s.execute(text('SELECT * FROM players WHERE id=:id'),{'id':r['id']})).mappings().first()
             if row:
-                player_card(dict(row,portrait_path=path), out=ROOT/'visual'/'cards'/f'player_{r["id"]}.png')
+                player_card(dict(row,portrait_path=path), out=ROOT/'assets'/'visual'/'cards'/f'player_{r["id"]}.png')
             await s.commit(); done+=1; print('OK',name,path)
     print('Downloaded',done)
 

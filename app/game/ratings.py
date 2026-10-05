@@ -20,12 +20,17 @@ class TeamStrength:
 def avg(xs):
     xs=list(xs); return sum(xs)/len(xs) if xs else 50
 def team_strength(players,formation):
-    # A red card or untreated injury can leave a side with fewer than 11.
-    # Keep the engine playable for 7-11 players instead of crashing live matches.
-    if not 7 <= len(players) <= 11: raise ValueError('A match lineup must contain between 7 and 11 players.')
+    # Live incidents can reduce a team below seven players. The engine must not
+    # crash; missing players reduce effective strength instead. An empty side has
+    # zero strength and therefore cannot generate goals.
+    if len(players)>11: raise ValueError('A match lineup cannot contain more than 11 players.')
+    if not players:
+        return TeamStrength(0,0,0,0,0)
     atk=[p for p in players if p.position in {'ST','LW','RW','AM'}]
     mid=[p for p in players if p.position in {'DM','CM','AM'}]
     de=[p for p in players if p.position in {'CB','LB','RB','DM'}]
     gk=[p for p in players if p.position=='GK']
     a,m,d,g=avg(map(player_rating,atk)),avg(map(player_rating,mid)),avg(map(player_rating,de)),avg(map(player_rating,gk))
+    availability=.55 + .45*(len(players)/11)
+    a*=availability; m*=availability; d*=availability; g*=availability
     return TeamStrength(a,m,d,g,.38*a+.27*m+.27*d+.08*g)
