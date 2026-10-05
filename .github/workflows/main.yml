@@ -16,9 +16,9 @@ jobs:
 
       - name: Check archive parts
         run: |
-          test -f football-manager-bot-fixed-part-1.zip
-          test -f football-manager-bot-fixed-part-2.zip
-          test -f football-manager-bot-fixed-part-3.zip
+          test -f football-manager-bot-memory-optimized-part-1.zip
+          test -f football-manager-bot-memory-optimized-part-2.zip
+          test -f football-manager-bot-memory-optimized-part-3.zip
 
           echo "All three archive parts found."
 
@@ -27,9 +27,9 @@ jobs:
           rm -rf extracted
           mkdir extracted
 
-          unzip -q football-manager-bot-fixed-part-1.zip -d extracted
-          unzip -q football-manager-bot-fixed-part-2.zip -d extracted
-          unzip -q football-manager-bot-fixed-part-3.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-part-1.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-part-2.zip -d extracted
+          unzip -q football-manager-bot-memory-optimized-part-3.zip -d extracted
 
           echo "All archive parts unpacked."
 
@@ -56,9 +56,9 @@ jobs:
           find . -mindepth 1 -maxdepth 1 \
             ! -name '.git' \
             ! -name '.github' \
-            ! -name 'football-manager-bot-fixed-part-1.zip' \
-            ! -name 'football-manager-bot-fixed-part-2.zip' \
-            ! -name 'football-manager-bot-fixed-part-3.zip' \
+            ! -name 'football-manager-bot-memory-optimized-part-1.zip' \
+            ! -name 'football-manager-bot-memory-optimized-part-2.zip' \
+            ! -name 'football-manager-bot-memory-optimized-part-3.zip' \
             ! -name 'extracted' \
             -exec rm -rf {} +
 
@@ -66,9 +66,9 @@ jobs:
 
       - name: Remove archive parts
         run: |
-          rm -f football-manager-bot-fixed-part-1.zip
-          rm -f football-manager-bot-fixed-part-2.zip
-          rm -f football-manager-bot-fixed-part-3.zip
+          rm -f football-manager-bot-memory-optimized-part-1.zip
+          rm -f football-manager-bot-memory-optimized-part-2.zip
+          rm -f football-manager-bot-memory-optimized-part-3.zip
 
           rm -rf extracted
 
@@ -115,6 +115,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Restore fixed football manager project"
+          git commit -m "Optimize football manager memory usage"
           git push
-          
