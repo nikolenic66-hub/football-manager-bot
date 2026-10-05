@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - 'football-manager-bot-release-part-*.zip'
+      - '*.zip'
       - '.github/workflows/main.yml'
 
 permissions:
@@ -31,22 +31,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f "./football-manager-bot-release-part-1.zip"
-          test -f "./football-manager-bot-release-part-2.zip"
-          ls -lh \
-            "./football-manager-bot-release-part-1.zip" \
-            "./football-manager-bot-release-part-2.zip"
+          shopt -s nullglob
+          archives=(./*.zip)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "No release archives found — nothing to do."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ls -lh "${archives[@]}"
 
       - name: Extract release
+        if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
           rm -rf /tmp/football-extracted
           mkdir -p /tmp/football-extracted
-          unzip -oq "./football-manager-bot-release-part-1.zip" -d "/tmp/football-extracted"
-          unzip -oq "./football-manager-bot-release-part-2.zip" -d "/tmp/football-extracted"
+          for p in ./*.zip; do
+            unzip -oq "$p" -d "/tmp/football-extracted"
+          done
 
       - name: Find project
+        if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -64,11 +70,13 @@ jobs:
           echo "Project: $PROJECT"
 
       - name: Setup Python
+        if: env.SKIP != '1'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: env.SKIP != '1'
         working-directory: ${{ env.PROJECT }}
         run: |
           python -m pip install --upgrade pip
@@ -76,14 +84,17 @@ jobs:
           pip install pytest
 
       - name: Compile
+        if: env.SKIP != '1'
         working-directory: ${{ env.PROJECT }}
         run: python -m compileall -q app
 
       - name: Tests
+        if: env.SKIP != '1'
         working-directory: ${{ env.PROJECT }}
         run: pytest -q
 
       - name: Prepare project in temp
+        if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -92,6 +103,7 @@ jobs:
           cp -a "$PROJECT"/. /tmp/final-football-project/
 
       - name: Replace repo contents
+        if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
@@ -100,45 +112,37 @@ jobs:
             ! -name '.github' \
             -exec rm -rf {} +
           cp -a /tmp/final-football-project/. .
-          rm -f football-manager-bot-release-part-1.zip
-          rm -f football-manager-bot-release-part-2.zip
+          rm -f ./*.zip
 
       - name: Commit and rebase
+        if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add -A
           git restore --staged .github/workflows 2>/dev/null || true
-
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
             exit 0
           fi
-
           git commit -m "Deploy from release archives [skip ci]"
-
           git fetch origin main
           git rebase origin/main
 
       - name: Push
-        if: env.SKIP_COMMIT != '1'
+        if: env.SKIP != '1' && env.SKIP_COMMIT != '1'
         shell: bash
         run: |
           set -euo pipefail
-
           for i in 1 2 3; do
             if git push origin HEAD:main; then
               echo "Push succeeded."
               exit 0
             fi
-
             echo "Push failed (attempt $i), syncing and retrying..."
-
             git fetch origin main
             git rebase origin/main || {
               echo "Rebase conflict, aborting."
@@ -146,6 +150,5 @@ jobs:
             }
             sleep 5
           done
-
           echo "Push failed after 3 attempts."
           exit 1
