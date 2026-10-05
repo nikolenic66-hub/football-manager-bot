@@ -1,6 +1,22 @@
 services:
   db:
     image: postgres:17-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=16MB
+      - -c
+      - work_mem=1MB
+      - -c
+      - maintenance_work_mem=8MB
+      - -c
+      - max_connections=10
+      - -c
+      - max_parallel_workers=0
+      - -c
+      - max_parallel_workers_per_gather=0
+      - -c
+      - jit=off
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-football_manager}
       POSTGRES_USER: ${POSTGRES_USER:-football}

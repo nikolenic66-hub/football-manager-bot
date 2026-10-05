@@ -9,6 +9,6 @@ async def main():
     await init_db()
     await seed()
     bot,dp=create_bot()
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, tasks_concurrency_limit=8)
 
 if __name__=='__main__': asyncio.run(main())
