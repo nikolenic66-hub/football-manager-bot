@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.enums import ParseMode
 from sqlalchemy import text
 from pathlib import Path
 from .config import settings
@@ -47,8 +48,9 @@ def menu():
     k.adjust(2,2,2)
     return k.as_markup()
 
-async def current_user(s,m):
-    return await get_or_create_user(s,m.from_user.id,m.from_user.username,m.from_user.first_name)
+async def current_user(s,m,from_user=None):
+    u=from_user or m.from_user
+    return await get_or_create_user(s,u.id,u.username,u.first_name)
 
 async def current_club(s,uid):
     return (await s.execute(text('SELECT * FROM clubs WHERE owner_user_id=:u ORDER BY id LIMIT 1'),{'u':uid})).mappings().first()
@@ -229,9 +231,9 @@ async def cmd_matchimage(m:Message):
     await m.answer_photo(FSInputFile(path),caption=f'📺 <b>{row["home"]} {row["home_score"]}:{row["away_score"]} {row["away"]}</b>')
 
 @router.message(Command('squad'))
-async def cmd_squad(m:Message):
+async def cmd_squad(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         rows=(await s.execute(text('''SELECT p.*,cp.shirt_number,cp.fitness,cp.form,cp.is_injured
             FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c ORDER BY p.position,p.potential DESC,p.id'''),{'c':c['id']})).mappings().all()
@@ -258,9 +260,9 @@ async def cmd_squadview(m:Message):
     await m.answer_photo(FSInputFile(path),caption=f'👥 <b>{c["name"]}</b> · {len(data)} игроков')
 
 @router.message(Command('tableview'))
-async def cmd_tableview(m:Message):
+async def cmd_tableview(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         if not league:return await m.answer('Вы пока не участвуете в лиге.')
@@ -269,9 +271,9 @@ async def cmd_tableview(m:Message):
     await m.answer_photo(FSInputFile(path),caption=f'🏆 <b>{league["name"]}</b>')
 
 @router.message(Command('clubview'))
-async def cmd_clubview(m:Message):
+async def cmd_clubview(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
     path=club_dashboard(c)
     await m.answer_photo(FSInputFile(path),caption=f'🏟 <b>{c["name"]}</b> · профиль клуба')
@@ -289,9 +291,9 @@ async def cmd_marketview(m:Message):
     await m.answer_photo(FSInputFile(path),caption='🔄 <b>ТРАНСФЕРНЫЙ РЫНОК</b>\nСвободный агент: /buy PLAYER_ID\nИгрок другого клуба: /offer LISTING_ID AMOUNT\nСвой игрок: /list PLAYER_ID [PRICE]')
 
 @router.message(Command('fixturesview'))
-async def cmd_fixturesview(m:Message):
+async def cmd_fixturesview(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         if not league:return await m.answer('Вы пока не участвуете в лиге.')
@@ -300,9 +302,9 @@ async def cmd_fixturesview(m:Message):
     await m.answer_photo(FSInputFile(path),caption=f'📅 <b>{league["name"]}</b> · календарь')
 
 @router.message(Command('tactics'))
-async def cmd_tactics(m:Message):
+async def cmd_tactics(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         t=(await s.execute(text('SELECT * FROM club_tactics WHERE club_id=:c'),{'c':c['id']})).mappings().first()
         rows=await get_tactical_board(s,c['id'])
@@ -420,9 +422,9 @@ async def cmd_sub(m:Message):
     await m.answer(f'🔄 Запланирована замена на {minute}′: {off} → {on}.')
 
 @router.message(Command('matchcenter'))
-async def cmd_matchcenter(m:Message):
+async def cmd_matchcenter(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         row=(await s.execute(text('''SELECT m.id,m.status,m.current_minute,m.home_score,m.away_score,m.home_xg,m.away_xg,h.name home,a.name away
             FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
@@ -448,10 +450,10 @@ async def cmd_cards(m:Message):
 
 
 @router.message(Command('scout'))
-async def cmd_scout(m:Message):
+async def cmd_scout(m:Message, from_user=None):
     parts=(m.text or '').split()
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         if not league:return await m.answer('Сначала вступите в активную лигу.')
@@ -525,9 +527,9 @@ async def cmd_sell(m:Message):
     await m.answer(f'✅ {row["first_name"]} {row["last_name"]} продан за €{price:,}.')
 
 @router.message(Command('finance'))
-async def cmd_finance(m:Message):
+async def cmd_finance(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         summary,recent=await financial_report(s,c['id'],league['id'] if league else None)
@@ -726,24 +728,24 @@ async def create_prompt(c:CallbackQuery):
 
 @router.callback_query(F.data=='club')
 async def cb_club(c:CallbackQuery):
-    await c.answer(); await cmd_clubview(c.message)
+    await c.answer(); await cmd_clubview(c.message, c.from_user)
 
 @router.callback_query(F.data=='squad')
-async def cb_squad(c:CallbackQuery): await c.answer(); await cmd_squad(c.message)
+async def cb_squad(c:CallbackQuery): await c.answer(); await cmd_squad(c.message, c.from_user)
 @router.callback_query(F.data=='tactics')
-async def cb_tactics(c:CallbackQuery): await c.answer(); await cmd_tactics(c.message)
+async def cb_tactics(c:CallbackQuery): await c.answer(); await cmd_tactics(c.message, c.from_user)
 @router.callback_query(F.data=='market')
 async def cb_market(c:CallbackQuery): await c.answer(); await cmd_marketview(c.message)
 @router.callback_query(F.data=='table')
-async def cb_table(c:CallbackQuery): await c.answer(); await cmd_tableview(c.message)
+async def cb_table(c:CallbackQuery): await c.answer(); await cmd_tableview(c.message, c.from_user)
 @router.callback_query(F.data=='matchcenter')
-async def cb_matchcenter(c:CallbackQuery): await c.answer(); await cmd_matchcenter(c.message)
+async def cb_matchcenter(c:CallbackQuery): await c.answer(); await cmd_matchcenter(c.message, c.from_user)
 @router.callback_query(F.data=='fixtures')
-async def cb_fixtures(c:CallbackQuery): await c.answer(); await cmd_fixturesview(c.message)
+async def cb_fixtures(c:CallbackQuery): await c.answer(); await cmd_fixturesview(c.message, c.from_user)
 @router.callback_query(F.data=='scout')
-async def cb_scout(c:CallbackQuery): await c.answer(); await cmd_scout(c.message)
+async def cb_scout(c:CallbackQuery): await c.answer(); await cmd_scout(c.message, c.from_user)
 @router.callback_query(F.data=='finance')
-async def cb_finance(c:CallbackQuery): await c.answer(); await cmd_finance(c.message)
+async def cb_finance(c:CallbackQuery): await c.answer(); await cmd_finance(c.message, c.from_user)
 @router.callback_query(F.data=='league')
 async def cb_league(c:CallbackQuery):
     await c.message.answer('🏆 Лига:\n/createleague 8 Friends League\n/join CODE\n/startleague\n/playround\n/table\n/fixtures'); await c.answer()
@@ -813,7 +815,7 @@ async def text_router(m:Message):
     await m.answer(f'🏟 <b>{name}</b> создан! Вы получили стартовый состав.',reply_markup=menu())
 
 def create_bot():
-    bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(router)
+    bot=Bot(settings.bot_token, parse_mode=ParseMode.HTML); dp=Dispatcher(); dp.include_router(router)
     live_task=None
     async def on_startup(_bot=None):
         nonlocal live_task
