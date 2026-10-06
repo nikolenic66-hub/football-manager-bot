@@ -8,6 +8,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from sqlalchemy import text
 from pathlib import Path
 from .config import settings
@@ -815,7 +816,7 @@ async def text_router(m:Message):
     await m.answer(f'🏟 <b>{name}</b> создан! Вы получили стартовый состав.',reply_markup=menu())
 
 def create_bot():
-    bot=Bot(settings.bot_token, parse_mode=ParseMode.HTML); dp=Dispatcher(); dp.include_router(router)
+    bot=Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); dp.include_router(router)
     live_task=None
     async def on_startup(_bot=None):
         nonlocal live_task
