@@ -213,4 +213,4 @@ The visual tactical board uses the exact same formation slot source as the engin
 - `POSTGRES_PASSWORD` is required by Docker Compose; the database port is internal by default.
 - `DATABASE_URL` must use the same PostgreSQL credentials.
 - Migrations are versioned in `schema_migrations`; legacy installations are not replayed destructively.
-- Only one live worker is active at a time via PostgreSQL advisory lock.
+- Only one live worker is active at a time via PostgreSQL advisory lock. 
