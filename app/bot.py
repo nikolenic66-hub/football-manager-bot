@@ -71,6 +71,7 @@ def tactics_keyboard(formation):
     for st in ('BALANCE','ATTACK','COUNTER','DEFENSE','POSSESSION'):
         k.button(text=st, callback_data=f'tac:s:{st}')
     k.button(text='🔄 Обновить доску',callback_data='tac:refresh')
+    k.button(text='⬅ Назад',callback_data='menu')
     k.adjust(3,2,1)
     return k.as_markup()
 
