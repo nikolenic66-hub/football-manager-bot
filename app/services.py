@@ -184,7 +184,7 @@ async def set_player_instruction(s, club_id, player_id, role, instruction, x=50,
 async def get_tactical_board(s, club_id):
     return (await s.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,cp.shirt_number,
         COALESCE(i.role,'STARTER') role,COALESCE(i.instruction,'BALANCED') instruction,
-        COALESCE(i.board_x,50) board_x,COALESCE(i.board_y,50) board_y
+i.board_x board_x,i.board_y board_y
         FROM club_players cp JOIN players p ON p.id=cp.player_id
         LEFT JOIN club_player_instructions i ON i.club_id=cp.club_id AND i.player_id=cp.player_id
         WHERE cp.club_id=:c ORDER BY cp.shirt_number NULLS LAST,p.id"""),{"c":club_id})).mappings().all()
