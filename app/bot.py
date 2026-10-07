@@ -733,6 +733,10 @@ async def cb_club(c:CallbackQuery):
     await c.answer(); await cmd_clubview(c.message, c.from_user)
 
 @router.callback_query(F.data=='squad')
+@router.callback_query(F.data=='menu')
+async def cb_menu(c:CallbackQuery):
+    await c.answer()
+    await c.message.answer('Выберите действие:',reply_markup=menu())
 async def cb_squad(c:CallbackQuery): await c.answer(); await cmd_squad(c.message, c.from_user)
 @router.callback_query(F.data=='tactics')
 async def cb_tactics(c:CallbackQuery): await c.answer(); await cmd_tactics(c.message, c.from_user)
