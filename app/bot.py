@@ -44,9 +44,9 @@ router.message.middleware(RateLimitMiddleware())
 
 def menu():
     k=InlineKeyboardBuilder()
-    for t,d in [('🏟 Клуб','club'),('👥 Состав','squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notifications')]:
+    for t,d in [('🏟 Клуб','club'),('👥 Состав','squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market:list'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notifications'),('📝 Контракты','contract:list')]:
         k.button(text=t,callback_data=d)
-    k.adjust(3,3,3,3)
+    k.adjust(3,3,3,3,1)
     return k.as_markup()
 
 async def current_user(s,m,from_user=None):
@@ -93,6 +93,36 @@ def squad_keyboard(players, page=0, prefix='squad'):
 
 _SELECTED_SQUAD_PLAYERS={}
 _TACTIC_PICKS=defaultdict(set)
+_MARKET_VIEWS={}
+
+def _market_data(rows):
+    data=_market_data(rows)
+    return data
+
+def _market_keyboard(data):
+    k=InlineKeyboardBuilder()
+    for i,r in enumerate(data[:10]):
+        name=f"{r.get('first_name','')} {r.get('last_name','')}".strip()
+        price=r.get('asking_price') if r.get('listing_id') else r.get('market_value',0)
+        label=f"{name.split()[-1] if name else 'Игрок'} · {r.get('position','')} · €{int(price):,}"
+        k.button(text=label[:30],callback_data=f'market:item:{i}')
+    k.adjust(5)
+    for code,label in (('ATT','⚽ Нападающие'),('MID','🎯 Полузащита'),('DEF','🛡 Защита'),('GK','🧤 Вратари')):
+        k.button(text=label,callback_data=f'market:filter:{code}')
+    k.adjust(2,2)
+    k.button(text='⬅ Назад',callback_data='menu')
+    k.adjust(2,2,1)
+    return k.as_markup()
+
+def _contract_keyboard(rows):
+    k=InlineKeyboardBuilder()
+    for i,r in enumerate(rows):
+        last=(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
+        k.button(text=f'{i+1}. {last}',callback_data=f'contract:item:{i}')
+    k.adjust(6)
+    k.button(text='⬅ Назад',callback_data='menu')
+    k.adjust(6,1)
+    return k.as_markup()
 
 
 def _position_filter(position, code):
@@ -778,6 +808,194 @@ async def cb_squad(c:CallbackQuery): await c.answer(); await cmd_squad(c.message
 async def cb_tactics(c:CallbackQuery): await c.answer(); await cmd_tactics(c.message, c.from_user)
 @router.callback_query(F.data=='market')
 async def cb_market(c:CallbackQuery): await c.answer(); await cmd_marketview(c.message)
+
+async def _show_market(cq_or_message, telegram_id, data=None):
+    if data is None:
+        async with SessionLocal() as s:
+            rows=await market_players(s,10)
+        data=_market_data(rows)
+    _MARKET_VIEWS[telegram_id]=data
+    if not data:
+        if isinstance(cq_or_message, CallbackQuery):
+            return await cq_or_message.message.answer('Рынок пуст.')
+        return await cq_or_message.answer('Рынок пуст.')
+    path=market_screen(data)
+    caption='🔄 <b>ТРАНСФЕРНЫЙ РЫНОК</b>'
+    markup=_market_keyboard(data)
+    message=cq_or_message.message if isinstance(cq_or_message,CallbackQuery) else cq_or_message
+    try:
+        await message.edit_media(InputMediaPhoto(media=FSInputFile(path),caption=caption),reply_markup=markup)
+    except Exception:
+        await message.answer_photo(FSInputFile(path),caption=caption,reply_markup=markup)
+
+@router.callback_query(F.data=='market:list')
+async def cb_market_list(cq:CallbackQuery):
+    await cq.answer()
+    await _show_market(cq,cq.from_user.id)
+
+@router.callback_query(F.data.startswith('market:filter:'))
+async def cb_market_filter(cq:CallbackQuery):
+    code=cq.data.rsplit(':',1)[1]
+    if code not in {'ATT','MID','DEF','GK'}:
+        return await cq.answer('Неизвестный фильтр.',show_alert=True)
+    async with SessionLocal() as s:
+        rows=await market_players(s,10)
+    data=[r for r in _market_data(rows) if _position_filter(r.get('position'),code)]
+    _MARKET_VIEWS[cq.from_user.id]=data
+    await cq.answer()
+    if not data:
+        return await cq.answer('В этой категории нет игроков.',show_alert=True)
+    path=market_screen(data)
+    try:
+        await cq.message.edit_media(InputMediaPhoto(media=FSInputFile(path),caption='🔄 <b>ТРАНСФЕРНЫЙ РЫНОК</b>'),reply_markup=_market_keyboard(data))
+    except Exception:
+        await cq.message.answer_photo(FSInputFile(path),caption='🔄 <b>ТРАНСФЕРНЫЙ РЫНОК</b>',reply_markup=_market_keyboard(data))
+
+@router.callback_query(F.data.startswith('market:item:'))
+async def cb_market_item(cq:CallbackQuery):
+    try:index=int(cq.data.rsplit(':',1)[1])
+    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
+    data=_MARKET_VIEWS.get(cq.from_user.id)
+    if data is None:
+        async with SessionLocal() as s:
+            data=_market_data(await market_players(s,10))
+        _MARKET_VIEWS[cq.from_user.id]=data
+    if index<0 or index>=len(data):
+        return await cq.answer('Игрок не найден.',show_alert=True)
+    r=data[index]
+    card=player_card(dict(r),out=Path('assets/visual/cards')/f'market_player_{r["id"]}.png')
+    caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n'
+             f'{r["position"]} · рейтинг <b>{r.get("overall","—")}</b> · €{int(r.get("asking_price") or r.get("market_value") or 0):,} · POT {r.get("potential","—")}')
+    k=InlineKeyboardBuilder()
+    if r.get('listing_id'):
+        k.button(text=f'📨 Оффер €{int(r.get("asking_price") or 0):,}',callback_data=f'market:offer:{r["listing_id"]}')
+    else:
+        k.button(text=f'💰 Купить за €{int(r.get("market_value") or 0):,}',callback_data=f'market:buy:{r["id"]}')
+    k.button(text='⬅ Назад к рынку',callback_data='market:list')
+    k.adjust(1)
+    await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup())
+    await cq.answer()
+
+@router.callback_query(F.data.startswith('market:buy:'))
+async def cb_market_buy(cq:CallbackQuery):
+    try:index=int(cq.data.rsplit(':',1)[1])
+    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
+    data=_MARKET_VIEWS.get(cq.from_user.id,[])
+    if index<0 or index>=len(data):
+        return await cq.answer('Игрок не найден.',show_alert=True)
+    pid=int(data[index]['id'])
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        try:
+            player,price=await buy_player(s,c['id'],pid); await s.commit()
+        except ValueError as e:
+            await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer()
+    await cq.message.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
+    await _show_market(cq,cq.from_user.id)
+
+@router.callback_query(F.data.startswith('market:offer:'))
+async def cb_market_offer(cq:CallbackQuery):
+    await cq.answer('📨 Оффер отправлен')
+    await _show_market(cq,cq.from_user.id)
+
+@router.callback_query(F.data=='contract:list')
+async def cb_contract_list(cq:CallbackQuery):
+    await cq.answer()
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.message.answer('Сначала создайте клуб.')
+        rows=await player_management_report(s,c['id'])
+    if not rows:return await cq.message.answer('Состав пуст.')
+    data=[dict(r) for r in rows]
+    path=squad_screen(c['name'],data)
+    await cq.message.answer_photo(FSInputFile(path),caption='📝 <b>КОНТРАКТЫ И СОСТОЯНИЕ СОСТАВА</b>',reply_markup=_contract_keyboard(data))
+
+_CONTRACT_VIEWS={}
+
+@router.callback_query(F.data.startswith('contract:item:'))
+async def cb_contract_item(cq:CallbackQuery):
+    try:index=int(cq.data.rsplit(':',1)[1])
+    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        rows=await player_management_report(s,c['id'])
+    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
+    r=dict(rows[index]); _CONTRACT_VIEWS[cq.from_user.id]=r
+    card=player_card(r,out=Path('assets/visual/cards')/f'contract_player_{r["id"]}.png')
+    caption=(f'📝 <b>{r["first_name"]} {r["last_name"]}</b> · {r["position"]}\n'
+             f'Зарплата: €{int(r.get("contract_salary") or 0):,}\n'
+             f'Окончание: {r.get("contract_until") or "—"}\n'
+             f'Мораль: {r.get("morale","—")} · ожидание: {r.get("playing_time_expectation") or "—"}')
+    k=InlineKeyboardBuilder()
+    k.button(text='📝 3 года',callback_data=f'contract:renew:{r["id"]}:3')
+    k.button(text='📝 5 лет',callback_data=f'contract:renew:{r["id"]}:5')
+    for role in ('STAR','KEY','SQUAD','PROSPECT'):
+        k.button(text=f'⭐ {role}' if role=='STAR' else f'🔑 {role}' if role=='KEY' else f'👥 {role}' if role=='SQUAD' else f'🎓 {role}',callback_data=f'contract:role:{r["id"]}:{role}')
+    k.button(text='⬅ К контрактам',callback_data='contract:list')
+    k.adjust(2,2,2,1)
+    await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup())
+    await cq.answer()
+
+@router.callback_query(F.data.startswith('contract:renew:'))
+async def cb_contract_renew(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=4 or not parts[2].isdigit() or parts[3] not in {'3','5'}:
+        return await cq.answer('Некорректный контракт.',show_alert=True)
+    pid,years=int(parts[2]),int(parts[3])
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        role_row=(await s.execute(text('SELECT playing_time_expectation FROM club_players WHERE club_id=:c AND player_id=:p'),{'c':c['id'],'p':pid})).mappings().first()
+        role=role_row['playing_time_expectation'] if role_row else None
+        try: offer=await renew_contract(s,c['id'],pid,years,role); await s.commit()
+        except ValueError as e:
+            await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer('Контракт продлён.')
+    await cq.message.answer(f'✅ Контракт продлён на {years} лет. Зарплата: €{offer.salary:,}. Отступные: €{offer.release_clause:,}.')
+    # Refresh the contract card.
+    await _refresh_contract_item(cq,pid)
+
+@router.callback_query(F.data.startswith('contract:role:'))
+async def cb_contract_role(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=4 or not parts[2].isdigit() or parts[3] not in {'STAR','KEY','SQUAD','PROSPECT'}:
+        return await cq.answer('Некорректная роль.',show_alert=True)
+    pid,role=int(parts[2]),parts[3]
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        try:
+            await renew_contract(s,c['id'],pid,3,role); await s.commit()
+        except ValueError as e:
+            await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer()
+    await cq.message.answer(f'✅ Роль обновлена: {role}')
+    await _refresh_contract_item(cq,pid)
+
+async def _refresh_contract_item(cq,pid):
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return
+        rows=await player_management_report(s,c['id'])
+    row=next((dict(r) for r in rows if int(r['id'])==int(pid)),None)
+    if not row:return
+    card=player_card(row,out=Path('assets/visual/cards')/f'contract_player_{row["id"]}.png')
+    caption=(f'📝 <b>{row["first_name"]} {row["last_name"]}</b> · {row["position"]}\n'
+             f'Зарплата: €{int(row.get("contract_salary") or 0):,}\n'
+             f'Окончание: {row.get("contract_until") or "—"}\n'
+             f'Мораль: {row.get("morale","—")} · ожидание: {row.get("playing_time_expectation") or "—"}')
+    k=InlineKeyboardBuilder()
+    k.button(text='📝 3 года',callback_data=f'contract:renew:{row["id"]}:3')
+    k.button(text='📝 5 лет',callback_data=f'contract:renew:{row["id"]}:5')
+    for role in ('STAR','KEY','SQUAD','PROSPECT'):
+        k.button(text=f'⭐ {role}' if role=='STAR' else f'🔑 {role}' if role=='KEY' else f'👥 {role}' if role=='SQUAD' else f'🎓 {role}',callback_data=f'contract:role:{row["id"]}:{role}')
+    k.button(text='⬅ К контрактам',callback_data='contract:list')
+    k.adjust(2,2,2,1)
+    await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup())
+
 @router.callback_query(F.data=='table')
 async def cb_table(c:CallbackQuery): await c.answer(); await cmd_tableview(c.message, c.from_user)
 @router.callback_query(F.data=='matchcenter')
