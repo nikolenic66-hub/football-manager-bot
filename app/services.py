@@ -768,11 +768,12 @@ async def set_training_plan(s, club_id, focus, intensity):
     return focus,intensity
 
 async def train_squad(s, club_id):
-    plan=(await s.execute(text("SELECT focus,intensity FROM club_training WHERE club_id=:c"),{'c':club_id})).mappings().first() or {'focus':'BALANCED','intensity':'NORMAL'} last_training_at=(await s.execute(text("SELECT max(last_training_at) FROM club_players WHERE club_id=:c"),{'c':club_id})).scalar_one()
+    plan=(await s.execute(text("SELECT focus,intensity FROM club_training WHERE club_id=:c"),{'c':club_id})).mappings().first() or {'focus':'BALANCED','intensity':'NORMAL'}
+    last_training_at=(await s.execute(text("SELECT max(last_training_at) FROM club_players WHERE club_id=:c"),{'c':club_id})).scalar_one()
     if last_training_at is not None:
-    recent=(await s.execute(text("SELECT now() - :t < interval '20 hours'"), {'t': last_training_at})).scalar_one()
-            if recent:
-                return []
+        recent=(await s.execute(text("SELECT now() - :t < interval '20 hours'"), {'t': last_training_at})).scalar_one()
+        if recent:
+            return []
     rows=(await s.execute(text('''SELECT cp.*,p.* FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c FOR UPDATE'''),{'c':club_id})).mappings().all()
     changes=[]
     for r in rows:
