@@ -44,9 +44,9 @@ router.message.middleware(RateLimitMiddleware())
 
 def menu():
     k=InlineKeyboardBuilder()
-    for t,d in [('🏟 Клуб','club'),('👥 Состав','visual:squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notifications')]:
+    for t,d in [('🏟 Клуб','club'),('👥 Состав','squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notifications')]:
         k.button(text=t,callback_data=d)
-    k.adjust(2,2,2)
+    k.adjust(3,3,3,3)
     return k.as_markup()
 
 async def current_user(s,m,from_user=None):
@@ -64,6 +64,42 @@ async def active_league(s,club_id):
 async def club_by_tg(s, telegram_id):
     return (await s.execute(text('SELECT c.* FROM users u JOIN clubs c ON c.owner_user_id=u.id WHERE u.telegram_id=:t ORDER BY c.id LIMIT 1'),{'t':telegram_id})).mappings().first()
 
+def paginated_keyboard(items_count, prefix, page=0, page_size=6):
+    k=InlineKeyboardBuilder()
+    start=page*page_size
+    end=min(start+page_size,items_count)
+    for i in range(start,end):
+        k.button(text=f'{i+1}',callback_data=f'{prefix}:item:{i}')
+    k.adjust(page_size)
+    return k.as_markup()
+
+
+def squad_keyboard(players, page=0, prefix='squad'):
+    k=InlineKeyboardBuilder()
+    start=page*6
+    end=min(start+6,len(players))
+    for i in range(start,end):
+        p=players[i]
+        last=(p.get('last_name') or p.get('name') or 'Игрок')[:10]
+        k.button(text=f'{i+1}. {last}',callback_data=f'{prefix}:item:{i}')
+    k.adjust(2)
+    for code,label in (('GK','🧤 Вратари'),('DEF','🛡 Защита'),('MID','⚙ Полузащита'),('ATT','⚡ Атака')):
+        k.button(text=label,callback_data=f'{prefix}:filter:{code}')
+    k.adjust(2,2)
+    k.button(text='⬅ Назад',callback_data='menu')
+    k.adjust(2,2,1)
+    return k.as_markup()
+
+
+_SELECTED_SQUAD_PLAYERS={}
+_TACTIC_PICKS=defaultdict(set)
+
+
+def _position_filter(position, code):
+    groups={'GK':{'GK'},'DEF':{'LB','CB','RB'},'MID':{'DM','CM','AM'},'ATT':{'LW','RW','ST'}}
+    return position in groups.get(code,set())
+
+
 def tactics_keyboard(formation):
     k=InlineKeyboardBuilder()
     for f in ('4-3-3','4-2-3-1','4-4-2','3-5-2','5-3-2'):
@@ -71,8 +107,9 @@ def tactics_keyboard(formation):
     for st in ('BALANCE','ATTACK','COUNTER','DEFENSE','POSSESSION'):
         k.button(text=st, callback_data=f'tac:s:{st}')
     k.button(text='🔄 Обновить доску',callback_data='tac:refresh')
+    k.button(text='👥 Выбрать состав',callback_data='tactic:pick')
     k.button(text='⬅ Назад',callback_data='menu')
-    k.adjust(3,2,1)
+    k.adjust(3,2,1,2)
     return k.as_markup()
 
 @router.message(CommandStart())
@@ -732,7 +769,6 @@ async def create_prompt(c:CallbackQuery):
 async def cb_club(c:CallbackQuery):
     await c.answer(); await cmd_clubview(c.message, c.from_user)
 
-@router.callback_query(F.data=='squad')
 @router.callback_query(F.data=='menu')
 async def cb_menu(c:CallbackQuery):
     await c.answer()
@@ -782,6 +818,143 @@ async def cb_tactics_visual(cq:CallbackQuery):
     except Exception:
         await cq.message.answer_photo(FSInputFile(path),caption=caption,reply_markup=tactics_keyboard(t['formation']))
     await cq.answer('Тактика обновлена.')
+
+@router.callback_query(F.data=='squad')
+async def cb_squad_screen(cq:CallbackQuery):
+    await cq.answer()
+    await _show_squad(cq.message,cq.from_user.id)
+
+
+async def _load_squad_rows(telegram_id, filter_code=None):
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,telegram_id)
+        if not c:return None,None
+        rows=(await s.execute(text("""SELECT p.*,cp.shirt_number,cp.fitness,cp.form,cp.is_injured
+            FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c
+            ORDER BY p.position,p.potential DESC,p.id"""),{'c':c['id']})).mappings().all()
+    if filter_code:
+        rows=[r for r in rows if _position_filter(r['position'],filter_code)]
+    return c,rows
+
+
+async def _show_squad(message,telegram_id,filter_code=None,page=0):
+    c,rows=await _load_squad_rows(telegram_id,filter_code)
+    if not c:return await message.answer('Сначала создайте клуб.')
+    if not rows:return await message.answer('Состав пуст.')
+    data=[]
+    for r in rows:
+        pr=type('P',(),dict(r,suspended=False,name=f"{r['first_name']} {r['last_name']}"))()
+        data.append(dict(r,overall=player_rating(pr)))
+    path=squad_screen(c['name'],data)
+    caption=f'👥 <b>{c["name"]}</b> · {len(data)} игроков'
+    await message.answer_photo(FSInputFile(path),caption=caption,reply_markup=squad_keyboard(data,page))
+
+
+@router.callback_query(F.data.startswith('squad:item:'))
+async def cb_squad_item(cq:CallbackQuery):
+    try:index=int(cq.data.rsplit(':',1)[1])
+    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
+    c,rows=await _load_squad_rows(cq.from_user.id)
+    if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
+    r=rows[index]; _SELECTED_SQUAD_PLAYERS[cq.from_user.id]=int(r['id'])
+    talents=r.get('talents') or []
+    if isinstance(talents,str):
+        import json; talents=json.loads(talents)
+    caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n{r["position"]} · {r["nationality"]} · {r["rarity"]}\n'
+             f'⚡ PAC {r["pace"]} · SHO {r["shooting"]} · PAS {r["passing"]} · DRI {r["dribbling"]}\n'
+             f'🛡 DEF {r["defending"]} · PHY {r["physical"]} · STA {r["stamina"]} · MENT {r["mental"]}\n'
+             f'🎯 POT {r["potential"]} · €{r["market_value"]:,}\n✨ <b>Таланты:</b> {", ".join(talents) or "—"}')
+    portrait=r.get('portrait_url'); portrait_path=None
+    if portrait:
+        candidate=Path(str(portrait)); portrait_path=candidate if candidate.is_absolute() else Path(__file__).resolve().parents[1]/candidate
+    card=player_card(dict(r,portrait_path=portrait_path),out=Path('assets/visual/cards')/f'player_{r["id"]}.png')
+    k=InlineKeyboardBuilder(); k.button(text='📝 Контракт',callback_data='squad:contract'); k.button(text='💸 Продать',callback_data='squad:sell'); k.button(text='🔄 Трансфер',callback_data='squad:transfer'); k.button(text='⬅ К составу',callback_data='squad'); k.adjust(2,2)
+    await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup()); await cq.answer()
+
+
+@router.callback_query(F.data.startswith('squad:filter:'))
+async def cb_squad_filter(cq:CallbackQuery):
+    code=cq.data.rsplit(':',1)[1]
+    if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестный фильтр.',show_alert=True)
+    await cq.answer(); await _show_squad(cq.message,cq.from_user.id,code)
+
+
+@router.callback_query(F.data=='squad:contract')
+async def cb_squad_contract(cq:CallbackQuery):
+    pid=_SELECTED_SQUAD_PLAYERS.get(cq.from_user.id)
+    if not pid:return await cq.answer('Сначала выберите игрока.',show_alert=True)
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        try: offer=await renew_contract(s,c['id'],pid); await s.commit()
+        except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer('Контракт обновлён.')
+    await cq.message.answer(f'📝 Контракт продлён на <b>{offer.years} лет</b>.\nЗарплата: <b>€{offer.salary:,}/период</b>.\nОтступные: <b>€{offer.release_clause:,}</b>.',reply_markup=InlineKeyboardBuilder().as_markup())
+
+
+@router.callback_query(F.data=='squad:sell')
+async def cb_squad_sell(cq:CallbackQuery):
+    pid=_SELECTED_SQUAD_PLAYERS.get(cq.from_user.id)
+    if not pid:return await cq.answer('Сначала выберите игрока.',show_alert=True)
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        try: row,price=await sell_player(s,c['id'],pid); await s.commit()
+        except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer('Игрок продан.'); await cq.message.answer(f'💸 {row["first_name"]} {row["last_name"]} продан за <b>€{price:,}</b>.',reply_markup=squad_keyboard([]))
+
+
+@router.callback_query(F.data=='squad:transfer')
+async def cb_squad_transfer(cq:CallbackQuery):
+    pid=_SELECTED_SQUAD_PLAYERS.get(cq.from_user.id)
+    if not pid:return await cq.answer('Сначала выберите игрока.',show_alert=True)
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        try: lid,ask,minimum=await list_player_for_transfer(s,c['id'],pid); await s.commit()
+        except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+    await cq.answer('Игрок выставлен на трансфер.'); await cq.message.answer(f'🔄 Игрок выставлен на трансфер. Listing #{lid}\nЦена: €{ask:,}\nМинимум: €{minimum:,}.')
+
+
+@router.callback_query(F.data=='tactic:pick')
+async def cb_tactic_pick(cq:CallbackQuery):
+    _TACTIC_PICKS[cq.from_user.id].clear()
+    c,rows=await _load_squad_rows(cq.from_user.id)
+    if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    if not rows:return await cq.answer('Состав пуст.',show_alert=True)
+    await cq.message.answer('👥 <b>Выберите 11 игроков</b> для стартового состава:',reply_markup=squad_keyboard(rows,prefix='tactic'))
+    await cq.answer()
+
+
+@router.callback_query(F.data.startswith('tactic:filter:'))
+async def cb_tactic_filter(cq:CallbackQuery):
+    code=cq.data.rsplit(':',1)[1]
+    if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестный фильтр.',show_alert=True)
+    c,rows=await _load_squad_rows(cq.from_user.id,code)
+    if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    if not rows:return await cq.answer('В этой группе игроков нет.',show_alert=True)
+    await cq.message.answer(f'👥 <b>Выберите игроков</b> · выбрано {len(_TACTIC_PICKS[cq.from_user.id])}/11:',reply_markup=squad_keyboard(rows,prefix='tactic'))
+    await cq.answer()
+
+
+@router.callback_query(F.data.startswith('tactic:item:'))
+async def cb_tactic_item(cq:CallbackQuery):
+    try:index=int(cq.data.rsplit(':',1)[1])
+    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
+    c,rows=await _load_squad_rows(cq.from_user.id)
+    if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
+    pid=int(rows[index]['id']); picks=_TACTIC_PICKS[cq.from_user.id]
+    if pid in picks:picks.remove(pid); await cq.answer('Игрок убран из состава.')
+    elif len(picks)>=11:return await cq.answer('Уже выбрано 11 игроков.',show_alert=True)
+    else:picks.add(pid); await cq.answer(f'Выбрано: {len(picks)}/11')
+    if len(picks)==11:
+        async with SessionLocal() as s:
+            try: await set_starting_lineup(s,c['id'],list(picks)); await s.commit()
+            except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        picks.clear(); await cq.message.answer('✅ Стартовый состав сохранён.')
+
 
 @router.callback_query(F.data=='visual:squad')
 async def cb_visual_squad(cq:CallbackQuery):
