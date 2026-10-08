@@ -58,7 +58,7 @@ for i in range(1,1249):
         pos=POSITIONS[(i-121)%len(POSITIONS)]; first=FIRST[(i*7)%len(FIRST)]; last=f'{LAST[(i*11)%len(LAST)]} {i:04d}'; nat='NLD'; full=f'{first} {last}'
     rar=rarity(i,full); base={'BASE':63,'RARE':76,'EPIC':87,'LEGENDARY':94}[rar]
     target=ROOT/'assets/visual/cards'/f'player_{i}.png'
-    portrait_candidates=sorted((ROOT/'assets'/'portraits').glob(f'{i}_*'))
+    portrait_candidates=[p for p in (ROOT/'assets'/'portraits'/f'{i}_real.png', ROOT/'assets'/'portraits'/f'{i}_avatar.png') if p.exists()]
     d=dict(id=i,first_name=first,last_name=last,nationality=nat,position=pos,rarity=rar,talents=['TACTICAL'],**stats(rng,base,pos))
     if portrait_candidates: d['portrait_path']=portrait_candidates[0]
     if not target.exists():

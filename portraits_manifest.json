@@ -1,0 +1,962 @@
+[
+  {
+    "player_id": 1,
+    "name": "Gianluigi Donnarumma",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 2,
+    "name": "Thibaut Courtois",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a4/Thibaut_Courtois_Belgium_v_USA_6_July_2026-076_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 3,
+    "name": "Alisson Becker",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/6a/Alisson_Becker_Brazil_V_Morocco_13_June_2026-65_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 4,
+    "name": "Manuel Neuer",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 5,
+    "name": "Jan Oblak",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 6,
+    "name": "Ederson Moraes",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 7,
+    "name": "Mike Maignan",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/e/e1/Mike_Maignan_France_v_Norway_26_June_26-132_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 8,
+    "name": "Emiliano Martinez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 9,
+    "name": "Marc-Andre ter Stegen",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 10,
+    "name": "Yassine Bounou",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/c8/Yassine_Bounou_Brazil_V_Morocco_13_June_2026-160.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 11,
+    "name": "David Raya",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/5/5e/David_Raya_France_v_Spain_7.24.26-019.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 12,
+    "name": "Diogo Costa",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 13,
+    "name": "Virgil van Dijk",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 14,
+    "name": "Ruben Dias",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 15,
+    "name": "William Saliba",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/c0/William_Saliba_France_v_Senegal_16_June_2026-459.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 16,
+    "name": "Antonio Rudiger",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 17,
+    "name": "Marquinhos",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 18,
+    "name": "Alessandro Bastoni",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 19,
+    "name": "Ronald Araujo",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 20,
+    "name": "Eder Militao",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 21,
+    "name": "Matthijs de Ligt",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 22,
+    "name": "William Pacho",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 23,
+    "name": "Pau Torres",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 24,
+    "name": "Kim Min-jae",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 25,
+    "name": "Achraf Hakimi",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/0/08/Achraf_Hakimi_France_v_Morocco_9_July_2026-140.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 26,
+    "name": "Trent Alexander-Arnold",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 27,
+    "name": "Kyle Walker",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 28,
+    "name": "Reece James",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 29,
+    "name": "Dani Carvajal",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 30,
+    "name": "Jeremie Frimpong",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 31,
+    "name": "Jules Kounde",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b5/Jules_Kounde_France_v_Spain_7.24.26-180.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 32,
+    "name": "Joao Cancelo",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/e/ef/Joao_Cancelo_Croatia_v_Portugal_2_July_2026-002.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 33,
+    "name": "Theo Hernandez",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/e/e5/Theo_Hernandez_France_v_Spain_7.24.26-225.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 34,
+    "name": "Alphonso Davies",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 35,
+    "name": "Andrew Robertson",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 36,
+    "name": "Nuno Mendes",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 37,
+    "name": "Federico Dimarco",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 38,
+    "name": "Alejandro Grimaldo",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 39,
+    "name": "Marc Cucurella",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/ca/Marc_Cucurella_Argentina_v_Spain_19_July_2026-069.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 40,
+    "name": "Ferland Mendy",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 41,
+    "name": "Rodri Hernandez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 42,
+    "name": "Declan Rice",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 43,
+    "name": "Martin Zubimendi",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 44,
+    "name": "Joshua Kimmich",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 45,
+    "name": "Aurelien Tchouameni",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 46,
+    "name": "Moisés Caicedo",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/0/0e/Moises_Caicedo_Ecuador_v_Germany_25_June_2026-051_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 47,
+    "name": "Bruno Guimaraes",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/7/70/Bruno_Guimaraes_Brazil_V_Morocco_13_June_2026-78_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 48,
+    "name": "Nicolo Barella",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 49,
+    "name": "Jude Bellingham",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/d/da/Jude_Bellingham_England_v_Panama_27_June_26-117.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 50,
+    "name": "Pedri Gonzalez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 51,
+    "name": "Federico Valverde",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 52,
+    "name": "Toni Kroos",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 53,
+    "name": "Luka Modric",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b6/Luka_Modric_Croatia_v_Portugal_2_July_2026-177.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 54,
+    "name": "Bernardo Silva",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 55,
+    "name": "Kevin De Bruyne",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 56,
+    "name": "Martin Odegaard",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 57,
+    "name": "Jamal Musiala",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/d/d3/Jamal_Musiala_10%2C_Pedro_Vite_15_Ecuador_v_Germany_at_2026_Fifa_World_Cup_by_YantsImages_02.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 58,
+    "name": "Florian Wirtz",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 59,
+    "name": "Phil Foden",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 60,
+    "name": "Cole Palmer",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 61,
+    "name": "Vinicius Junior",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 62,
+    "name": "Kylian Mbappe",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 63,
+    "name": "Khvicha Kvaratskhelia",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 64,
+    "name": "Rafael Leao",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 65,
+    "name": "Luis Diaz",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 66,
+    "name": "Nico Williams",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/cb/Nico_Williams_France_v_Spain_7.24.26-255.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 67,
+    "name": "Jack Grealish",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 68,
+    "name": "Leroy Sane",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 69,
+    "name": "Mohamed Salah",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 70,
+    "name": "Bukayo Saka",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/8/85/Bukayo_Saka_England_v_Panama_27_June_26-065.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 71,
+    "name": "Rodrygo Goes",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 72,
+    "name": "Lamine Yamal",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/8/88/Lamine_Yamal_France_v_Spain_7.24.26-059.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 73,
+    "name": "Riyad Mahrez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 74,
+    "name": "Lionel Messi",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/d/d7/Lionel_Messi_Argentina_v_Spain_19_July_2026-093.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 75,
+    "name": "Cristiano Ronaldo",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/64/Cristiano_Ronaldo_Croatia_v_Portugal_2_July_2026-086.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 76,
+    "name": "Erling Haaland",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 77,
+    "name": "Harry Kane",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/5/55/Harry_Kane_England_v_Ghana_23_June_2026-221.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 78,
+    "name": "Robert Lewandowski",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 79,
+    "name": "Victor Osimhen",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/6d/Victor_Osimhen.png",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 80,
+    "name": "Lautaro Martinez",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/ba/Lautaro_Martinez_Argentina_v_Egypt_7_July_2026-261_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 81,
+    "name": "Alexander Isak",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 82,
+    "name": "Victor Gyokeres",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 83,
+    "name": "Julian Alvarez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 84,
+    "name": "Ollie Watkins",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 85,
+    "name": "Dusan Vlahovic",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 86,
+    "name": "Romelu Lukaku",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 87,
+    "name": "Karim Benzema",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/2/23/Karim_Benzema.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 88,
+    "name": "Luis Suarez",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/8/8a/Luis-Suarez.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 89,
+    "name": "Neymar Junior",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a2/Neymar_Junior_Brazil_V_Morocco_13_June_2026-145.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 90,
+    "name": "Zlatan Ibrahimovic",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 91,
+    "name": "Sergio Ramos",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 92,
+    "name": "Marcelo Vieira",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b8/Marcelo_Vieira.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 93,
+    "name": "Andres Iniesta",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/5/52/Andres_Iniesta.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 94,
+    "name": "Xavi Hernandez",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 95,
+    "name": "Andrea Pirlo",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/4/4c/Andrea_Pirlo.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 96,
+    "name": "Francesco Totti",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/61/Francesco_Totti.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 97,
+    "name": "Kaká",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 98,
+    "name": "Ronaldinho Gaucho",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 99,
+    "name": "Ronaldo Nazario",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 100,
+    "name": "Thierry Henry",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b8/Thierry_Henry.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 101,
+    "name": "Didier Drogba",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b7/Didier_Drogba_(2019).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 102,
+    "name": "Samuel Eto'o",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a2/Samuel_Eto%27o.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 103,
+    "name": "George Weah",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/3/39/George_Weah_in_2019_(cropped).jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 104,
+    "name": "Pelé",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 105,
+    "name": "Diego Maradona",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 106,
+    "name": "Johan Cruyff",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a0/Johan_Cruijff.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 107,
+    "name": "Franz Beckenbauer",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b9/Franz_Beckenbauer.JPG",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 108,
+    "name": "Paolo Maldini",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/1/1c/PaoloMaldini.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 109,
+    "name": "Lev Yashin",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/a/a3/Lev_Yashin.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 110,
+    "name": "Bobby Charlton",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 111,
+    "name": "Michel Platini",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 112,
+    "name": "Marco van Basten",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/4/4d/Marco_van_Basten.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 113,
+    "name": "Ruud Gullit",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/f/f6/Ruud_Gullit_1988.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 114,
+    "name": "Lothar Matthaus",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 115,
+    "name": "Gerd Muller",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/5/5a/Gerd_M%C3%BCller.JPG",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 116,
+    "name": "Roberto Baggio",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  },
+  {
+    "player_id": 117,
+    "name": "Zinedine Zidane",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/d/de/Zinedine_Zidane.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 118,
+    "name": "Fabio Cannavaro",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/6a/Fabio_Cannavaro.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 119,
+    "name": "Cafu",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/6/64/Cafu_-_26.02.2026_-_Cerim%C3%B4nia_de_apresenta%C3%A7%C3%A3o_das_ta%C3%A7as_da_Copa_do_Mundo_de_2026.jpg",
+    "source": "wikimedia_commons",
+    "license": "CC-BY-SA-4.0",
+    "check": true
+  },
+  {
+    "player_id": 120,
+    "name": "Roberto Carlos",
+    "url": null,
+    "source": "wikimedia_commons",
+    "license": null,
+    "check": false
+  }
+]

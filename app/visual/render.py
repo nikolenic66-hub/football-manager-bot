@@ -27,11 +27,19 @@ def player_card(player,out=None,size=(620,860)):
     rarity=player.get('rarity','BASE'); bg,accent=RARITY.get(rarity,RARITY['BASE'])
     if out is None: out=CARD_DIR/f"player_{player.get('id','x')}.png"
     out=Path(out)
-    portrait = player.get('portrait_path') or player.get('portrait_url')
     portrait_path = None
-    if portrait:
-        pp=Path(str(portrait))
-        portrait_path = pp if pp.is_absolute() else ROOT/pp
+    pid=player.get('id')
+    if pid is not None:
+        # Local approved real portrait always wins, then deterministic fallback.
+        for candidate in (ROOT/'assets'/'portraits'/f'{pid}_real.png', ROOT/'assets'/'portraits'/f'{pid}_avatar.png'):
+            if candidate.exists():
+                portrait_path=candidate
+                break
+    if portrait_path is None:
+        portrait = player.get('portrait_path') or player.get('portrait_url')
+        if portrait and not str(portrait).startswith(('http://','https://')):
+            pp=Path(str(portrait))
+            portrait_path = pp if pp.is_absolute() else ROOT/pp
     fingerprint=hashlib.sha256(repr((
         player.get('id'), player.get('first_name'), player.get('last_name'), player.get('position'),
         player.get('nationality'), rarity, player.get('overall'), player.get('pace'), player.get('shooting'),

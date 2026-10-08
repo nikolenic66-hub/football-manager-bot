@@ -29,8 +29,11 @@ async def ensure_squad(s, club_id):
     if n>=23: return n
     need=23-n
     rows=(await s.execute(text(f'''SELECT {PLAYER_FIELDS} FROM players p
-        WHERE NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id)
-        ORDER BY p.potential DESC,p.id LIMIT :n'''),{'n':need})).mappings().all()
+        WHERE p.rarity IN ('BASE','RARE')
+          AND p.age BETWEEN 17 AND 24
+          AND p.potential BETWEEN 60 AND 90
+          AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id)
+        ORDER BY random() LIMIT :n'''),{'n':need})).mappings().all()
     if len(rows)<need: raise RuntimeError('Not enough free players in the market.')
     for r in rows:
         await s.execute(text('INSERT INTO club_players(club_id,player_id) VALUES(:c,:p)'),{'c':club_id,'p':r['id']})

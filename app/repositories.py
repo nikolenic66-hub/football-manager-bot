@@ -67,10 +67,13 @@ async def create_club(s, owner_id, name):
         p = (await s.execute(text("""
             SELECT id FROM players p
             WHERE p.position=:pos
+              AND p.rarity IN ('BASE','RARE')
+              AND p.age BETWEEN 17 AND 24
+              AND p.potential BETWEEN 60 AND 90
               AND NOT EXISTS(
                   SELECT 1 FROM club_players cp WHERE cp.player_id=p.id
               )
-            ORDER BY p.potential DESC,p.id
+            ORDER BY random()
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         """), {'pos': pos})).first()
