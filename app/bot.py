@@ -58,7 +58,7 @@ router.message.middleware(RateLimitMiddleware())
 
 def menu():
     k=InlineKeyboardBuilder()
-    for t,d in [('🏟 Клуб','club'),('👥 Состав','squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market:list'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notifications'),('📝 Контракты','contract:list')]:
+    for t,d in [('🏟 Клуб','club'),('👥 Состав','squad'),('📋 Тактика','tactics'),('📺 Матч','matchcenter'),('🏆 Лига','league'),('🔄 Рынок','market:list'),('💰 Финансы','finance'),('🏋️ Тренировки','training'),('📊 Таблица','table'),('📅 Календарь','fixtures'),('🕵️ Скаутинг','scout'),('🔔 Уведомления','notif:menu'),('📝 Контракты','contract:list')]:
         k.button(text=t,callback_data=d)
     k.adjust(3,3,3,3,1)
     return k.as_markup()
@@ -655,6 +655,153 @@ async def cmd_upgradestadium(m:Message):
     await m.answer(f'🏟 Стадион улучшен до <b>LVL {level}</b>.\nСтоимость: €{cost:,}\nВместимость: <b>{capacity:,}</b>.')
 
 
+def training_keyboard(focus, intensity):
+    k=InlineKeyboardBuilder()
+    for value in ('ATTACK','DEFENSE','PHYSICAL','TECHNICAL','MENTAL','PLAYMAKING','BALANCED','RECOVERY'):
+        k.button(text=('✅ ' if value==focus else '')+value, callback_data=f'training:focus:{value}')
+    for value in ('LIGHT','NORMAL','HIGH'):
+        k.button(text=('✅ ' if value==intensity else '')+value, callback_data=f'training:intensity:{value}')
+    k.button(text='🏋️ Тренировать', callback_data='training:run')
+    k.button(text='⬅ Назад', callback_data='training:back')
+    k.adjust(3,3,2,3,2)
+    return k.as_markup()
+
+
+async def _show_training_menu(message, telegram_id, state=None):
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,telegram_id)
+        if not c:
+            return await message.answer('Сначала создайте клуб.')
+        plan=(await s.execute(text('SELECT focus,intensity FROM club_training WHERE club_id=:c'), {'c':c['id']})).mappings().first()
+    focus=(plan['focus'] if plan else 'BALANCED')
+    intensity=(plan['intensity'] if plan else 'NORMAL')
+    if state is not None:
+        await state.update_data(training_focus=focus,training_intensity=intensity)
+    await message.answer(
+        '🏋️ <b>ТРЕНИРОВКИ</b>\n\n'
+        f'Текущий план: <b>{focus} / {intensity}</b>\n\n'
+        'ФОКУС: выберите направление\n'
+        'ИНТЕНСИВНОСТЬ: выберите нагрузку',
+        reply_markup=training_keyboard(focus,intensity)
+    )
+
+
+@router.callback_query(F.data=='training')
+async def cb_training(c:CallbackQuery, state:FSMContext):
+    await c.answer()
+    await _show_training_menu(c.message,c.from_user.id,state)
+
+
+@router.callback_query(F.data.startswith('training:focus:'))
+async def cb_training_focus(c:CallbackQuery, state:FSMContext):
+    focus=c.data.rsplit(':',1)[1]
+    if focus not in {'ATTACK','DEFENSE','PHYSICAL','TECHNICAL','MENTAL','PLAYMAKING','BALANCED','RECOVERY'}:
+        await c.answer('Недопустимый фокус.',show_alert=True)
+        return
+    async with SessionLocal() as s:
+        club=await club_by_tg(s,c.from_user.id)
+        if not club:
+            await c.answer('Сначала создайте клуб.',show_alert=True)
+            return
+        plan=(await s.execute(text('SELECT focus,intensity FROM club_training WHERE club_id=:c'), {'c':club['id']})).mappings().first()
+    data=await state.get_data()
+    intensity=data.get('training_intensity') or (plan['intensity'] if plan else 'NORMAL')
+    await state.update_data(training_focus=focus,training_intensity=intensity)
+    await c.answer()
+    try:
+        await c.message.edit_text(
+            '🏋️ <b>ТРЕНИРОВКИ</b>\n\n'
+            f'Текущий план: <b>{focus} / {intensity}</b>\n\n'
+            'ФОКУС: выберите направление\n'
+            'ИНТЕНСИВНОСТЬ: выберите нагрузку',
+            reply_markup=training_keyboard(focus,intensity)
+        )
+    except Exception:
+        await c.message.answer(
+            '🏋️ <b>ТРЕНИРОВКИ</b>\n\n'
+            f'Текущий план: <b>{focus} / {intensity}</b>\n\n'
+            'ФОКУС: выберите направление\n'
+            'ИНТЕНСИВНОСТЬ: выберите нагрузку',
+            reply_markup=training_keyboard(focus,intensity)
+        )
+
+
+@router.callback_query(F.data.startswith('training:intensity:'))
+async def cb_training_intensity(c:CallbackQuery, state:FSMContext):
+    intensity=c.data.rsplit(':',1)[1]
+    if intensity not in {'LIGHT','NORMAL','HIGH'}:
+        await c.answer('Недопустимая интенсивность.',show_alert=True)
+        return
+    async with SessionLocal() as s:
+        club=await club_by_tg(s,c.from_user.id)
+        if not club:
+            await c.answer('Сначала создайте клуб.',show_alert=True)
+            return
+        plan=(await s.execute(text('SELECT focus,intensity FROM club_training WHERE club_id=:c'), {'c':club['id']})).mappings().first()
+    data=await state.get_data()
+    focus=data.get('training_focus') or (plan['focus'] if plan else 'BALANCED')
+    await state.update_data(training_focus=focus,training_intensity=intensity)
+    await c.answer()
+    try:
+        await c.message.edit_text(
+            '🏋️ <b>ТРЕНИРОВКИ</b>\n\n'
+            f'Текущий план: <b>{focus} / {intensity}</b>\n\n'
+            'ФОКУС: выберите направление\n'
+            'ИНТЕНСИВНОСТЬ: выберите нагрузку',
+            reply_markup=training_keyboard(focus,intensity)
+        )
+    except Exception:
+        await c.message.answer(
+            '🏋️ <b>ТРЕНИРОВКИ</b>\n\n'
+            f'Текущий план: <b>{focus} / {intensity}</b>\n\n'
+            'ФОКУС: выберите направление\n'
+            'ИНТЕНСИВНОСТЬ: выберите нагрузку',
+            reply_markup=training_keyboard(focus,intensity)
+        )
+
+
+@router.callback_query(F.data=='training:run')
+async def cb_training_run(c:CallbackQuery, state:FSMContext):
+    data=await state.get_data()
+    async with SessionLocal() as s:
+        club=await club_by_tg(s,c.from_user.id)
+        if not club:
+            await c.answer('Сначала создайте клуб.',show_alert=True)
+            return
+        plan=(await s.execute(text('SELECT focus,intensity FROM club_training WHERE club_id=:c'), {'c':club['id']})).mappings().first() or {'focus':'BALANCED','intensity':'NORMAL'}
+        focus=data.get('training_focus') or plan['focus']
+        intensity=data.get('training_intensity') or plan['intensity']
+        try:
+            focus,intensity=await set_training_plan(s,club['id'],focus,intensity)
+            changes=await train_squad(s,club['id'])
+            await s.commit()
+        except ValueError as e:
+            await s.rollback()
+            await c.answer(str(e),show_alert=True)
+            return
+        except Exception:
+            await s.rollback()
+            logger.exception('Failed to run training')
+            await c.answer('Не удалось провести тренировку.',show_alert=True)
+            return
+    progressed=sum(1 for _,pts,ch in changes if ch)
+    points=sum(pts for _,pts,_ in changes)
+    await state.clear()
+    await c.answer()
+    await c.message.answer(
+        f'🏋️ <b>Тренировка завершена</b>. Фокус: {focus}. Интенсивность: {intensity}.\n'
+        f'Развитие: {points} очков, игроков с изменениями: {progressed}.',
+        reply_markup=training_keyboard(focus,intensity)
+    )
+
+
+@router.callback_query(F.data=='training:back')
+async def cb_training_back(c:CallbackQuery, state:FSMContext):
+    await state.clear()
+    await c.answer()
+    await c.message.answer('Выберите действие:',reply_markup=menu())
+
+
 @router.message(Command('training'))
 async def cmd_training(m:Message):
     parts=(m.text or '').split()
@@ -784,9 +931,75 @@ async def cmd_notifications(m:Message):
     k.adjust(2,2,2,2,1)
     await m.answer(f'🔔 <b>Уведомления</b> · непрочитанных: <b>{unread}</b>\n\nНажми категорию, чтобы включить или выключить её.',reply_markup=k.as_markup())
 
+def notification_menu_keyboard(counts):
+    k=InlineKeyboardBuilder()
+    for category,label in (('transfer','📨 Трансферы'),('injury','🏥 Травмы'),('match','⚽ Матчи'),('finance','💰 Финансы')):
+        k.button(text=f'{label} ({counts.get(category,0)})',callback_data=f'notif:cat:{category}')
+    k.button(text='✅ Прочитать всё',callback_data='notif:read_all')
+    k.button(text='📜 Последние 20',callback_data='notif:list')
+    k.button(text='⬅ Назад',callback_data='notif:back')
+    k.adjust(2,2,2,1)
+    return k.as_markup()
+
+
+async def _show_notification_menu(cq:CallbackQuery):
+    async with SessionLocal() as s:
+        uid=await get_or_create_user(s,cq.from_user.id,cq.from_user.username,cq.from_user.first_name)
+        unread=await notification_unread_count(s,uid)
+        rows=(await s.execute(text('''SELECT lower(category) AS category,count(*) AS count
+            FROM notifications
+            WHERE user_id=:u AND read_at IS NULL AND deliver_at<=now() AND sent_at IS NOT NULL AND cancelled_at IS NULL
+            GROUP BY category'''), {'u':uid})).mappings().all()
+    counts={r['category']:int(r['count']) for r in rows}
+    await cq.message.answer(
+        f'🔔 <b>УВЕДОМЛЕНИЯ</b>\nНепрочитанных: <b>{unread}</b>',
+        reply_markup=notification_menu_keyboard(counts)
+    )
+
+
+async def _show_notification_category(cq:CallbackQuery, category):
+    labels={'transfer':'📨 Трансферы','injury':'🏥 Травмы','match':'⚽ Матчи','finance':'💰 Финансы'}
+    if category not in labels:
+        await cq.answer('Неизвестная категория.',show_alert=True)
+        return
+    async with SessionLocal() as s:
+        uid=await get_or_create_user(s,cq.from_user.id,cq.from_user.username,cq.from_user.first_name)
+        rows=(await s.execute(text('''SELECT title,body,created_at
+            FROM notifications
+            WHERE user_id=:u AND lower(category)=:cat AND deliver_at<=now() AND sent_at IS NOT NULL AND cancelled_at IS NULL
+            ORDER BY created_at DESC,id DESC LIMIT 20'''), {'u':uid,'cat':category})).mappings().all()
+    if not rows:
+        await cq.message.answer(f'{labels[category]}\n\nУведомлений пока нет.',reply_markup=notification_menu_keyboard({}))
+    else:
+        lines=[f'{labels[category]} <b>— последние 20</b>','']
+        for r in rows:
+            lines.append(f"<b>{r['title']}</b>\n{r['body']}")
+        await cq.message.answer('\n\n'.join(lines),reply_markup=notification_menu_keyboard({}))
+    await cq.answer()
+
+
 @router.callback_query(F.data.startswith('notif:'))
 async def cb_notifications(cq:CallbackQuery):
     action=cq.data.split(':',1)[1]
+    if action=='menu':
+        await cq.answer()
+        await _show_notification_menu(cq)
+        return
+    if action=='back':
+        await cq.answer()
+        await cq.message.answer('Выберите действие:',reply_markup=menu())
+        return
+    if action.startswith('cat:'):
+        await _show_notification_category(cq,action.split(':',1)[1])
+        return
+    if action=='read_all':
+        async with SessionLocal() as s:
+            uid=await get_or_create_user(s,cq.from_user.id,cq.from_user.username,cq.from_user.first_name)
+            await mark_notifications_read(s,uid)
+            await s.commit()
+        await cq.answer('Все уведомления прочитаны.')
+        await _show_notification_menu(cq)
+        return
     allowed={'match','injury','transfer','finance','development','discipline','morale','tournament','list'}
     if action not in allowed:
         await cq.answer('Неизвестная настройка.',show_alert=True)
@@ -794,7 +1007,7 @@ async def cb_notifications(cq:CallbackQuery):
     async with SessionLocal() as s:
         uid=await get_or_create_user(s,cq.from_user.id,cq.from_user.username,cq.from_user.first_name)
         if action=='list':
-            rows=await notification_list(s,uid,12)
+            rows=await notification_list(s,uid,20)
             await mark_notifications_read(s,uid)
             await s.commit()
             if not rows:
