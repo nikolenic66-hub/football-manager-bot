@@ -773,7 +773,7 @@ async def train_squad(s, club_id):
     if last_training_at is not None:
         recent=(await s.execute(text("SELECT now() - :t < interval '20 hours'"), {'t': last_training_at})).scalar_one()
         if recent:
-            remaining=(await s.execute(text("SELECT GREATEST(0, EXTRACT(EPOCH FROM ((:t + interval '20 hours') - now())))"), {'t': last_training_at})).scalar_one()
+            remaining=(await s.execute(text("SELECT GREATEST(0, EXTRACT(EPOCH FROM (interval '20 hours' - (now() - CAST(:t AS timestamptz)))))"), {'t': last_training_at})).scalar_one()
             return [('COOLDOWN', int(remaining or 0), False)]
     rows=(await s.execute(text('''SELECT cp.*,p.* FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c FOR UPDATE'''),{'c':club_id})).mappings().all()
     changes=[]
