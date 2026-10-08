@@ -96,7 +96,19 @@ _TACTIC_PICKS=defaultdict(set)
 _MARKET_VIEWS={}
 
 def _market_data(rows):
-    data=_market_data(rows)
+    data=[]
+    for r in rows:
+        pr=type('P',(),dict(
+            r,
+            name=f"{r.get('first_name','')} {r.get('last_name','')}".strip() or 'Игрок',
+            fitness=100,
+            form=0,
+        ))()
+        data.append(dict(
+            r,
+            overall=player_rating(pr),
+            rarity=r.get('rarity','BASE'),
+        ))
     return data
 
 def _market_keyboard(data):
