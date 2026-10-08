@@ -5,6 +5,8 @@ from collections import defaultdict
 from aiogram import BaseMiddleware
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
@@ -22,12 +24,24 @@ router=Router()
 logger=logging.getLogger(__name__)
 
 
+class LeagueCreate(StatesGroup):
+    choosing_size = State()
+    entering_name = State()
+
+
+class LeagueJoin(StatesGroup):
+    entering_code = State()
+
+
 class RateLimitMiddleware(BaseMiddleware):
     def __init__(self, cooldown=0.75):
         self.cooldown=cooldown
         self._last=defaultdict(float)
 
     async def __call__(self, handler, event, data):
+        state=data.get('state')
+        if state is not None and await state.get_state() is not None:
+            return await handler(event,data)
         user=getattr(getattr(event, 'from_user', None), 'id', None)
         if user is not None:
             command=(getattr(event, 'text', None) or '').split(maxsplit=1)[0].lower()
@@ -1018,9 +1032,164 @@ async def cb_fixtures(c:CallbackQuery): await c.answer(); await cmd_fixturesview
 async def cb_scout(c:CallbackQuery): await c.answer(); await cmd_scout(c.message, c.from_user)
 @router.callback_query(F.data=='finance')
 async def cb_finance(c:CallbackQuery): await c.answer(); await cmd_finance(c.message, c.from_user)
+def league_menu_keyboard():
+    k=InlineKeyboardBuilder()
+    k.button(text='➕ Создать лигу', callback_data='league:create')
+    k.button(text='🔗 Вступить в лигу', callback_data='league:join')
+    k.button(text='▶️ Начать сезон', callback_data='league:start')
+    k.button(text='⚽ Сыграть тур', callback_data='league:play')
+    k.button(text='📊 Таблица', callback_data='league:table')
+    k.button(text='📅 Календарь', callback_data='league:fixtures')
+    k.button(text='⬅ Назад', callback_data='menu')
+    k.adjust(2,2,2,1)
+    return k.as_markup()
+
+
 @router.callback_query(F.data=='league')
 async def cb_league(c:CallbackQuery):
-    await c.message.answer('🏆 Лига:\n/createleague 8 Friends League\n/join CODE\n/startleague\n/playround\n/table\n/fixtures'); await c.answer()
+    await c.answer()
+    await c.message.answer(
+        '🏆 <b>СОРЕВНОВАНИЕ</b>\n\nВыберите действие:',
+        reply_markup=league_menu_keyboard()
+    )
+
+
+@router.callback_query(F.data=='league:create')
+async def cb_league_create(c:CallbackQuery, state:FSMContext):
+    await c.answer()
+    await state.set_state(LeagueCreate.choosing_size)
+    k=InlineKeyboardBuilder()
+    for n in (4,6,8,10,12):
+        k.button(text=str(n), callback_data=f'league:create:size:{n}')
+    k.button(text='⬅ Отмена', callback_data='league')
+    k.adjust(5,1)
+    await c.message.answer(
+        '➕ <b>Создать лигу</b>\n\n'
+        'Сколько клубов будет в лиге?',
+        reply_markup=k.as_markup()
+    )
+
+
+@router.callback_query(LeagueCreate.choosing_size, F.data.startswith('league:create:size:'))
+async def cb_league_create_size(c:CallbackQuery, state:FSMContext):
+    await c.answer()
+    n=int(c.data.rsplit(':',1)[1])
+    if n not in (4,6,8,10,12):
+        await c.message.answer('Недопустимое число клубов.')
+        return
+    await state.update_data(max_teams=n)
+    await state.set_state(LeagueCreate.entering_name)
+    await c.message.answer(
+        f'➕ Лига на <b>{n}</b> клубов.\n\n'
+        'Отправьте название лиги одним сообщением\n'
+        '(до 30 символов).\n\n'
+        'Отмена — /cancel'
+    )
+
+
+@router.message(LeagueCreate.entering_name)
+async def league_create_name(m:Message, state:FSMContext):
+    name=(m.text or '').strip()
+    if not 3 <= len(name) <= 30:
+        return await m.answer('Название от 3 до 30 символов. Попробуйте ещё.')
+    data=await state.get_data()
+    n=data.get('max_teams',8)
+    await state.clear()
+    async with SessionLocal() as s:
+        uid=await current_user(s,m)
+        c=await current_club(s,uid)
+        if not c:
+            return await m.answer('Сначала создайте клуб.')
+        try:
+            league_id,code=await create_league(s,uid,name,n)
+            await s.commit()
+        except ValueError as e:
+            await s.rollback()
+            return await m.answer(str(e))
+        except Exception:
+            await s.rollback()
+            logger.exception('Failed to create league')
+            return await m.answer('Не удалось создать лигу.')
+    await m.answer(
+        f'🏆 Лига <b>{name}</b> создана.\n'
+        f'Код приглашения: <code>{code}</code>\n\n'
+        f'Друзья могут вступить: <code>/join {code}</code>',
+        reply_markup=league_menu_keyboard()
+    )
+
+
+@router.callback_query(F.data=='league:join')
+async def cb_league_join(c:CallbackQuery, state:FSMContext):
+    await c.answer()
+    await state.set_state(LeagueJoin.entering_code)
+    await c.message.answer(
+        '🔗 <b>Вступить в лигу</b>\n\n'
+        'Отправьте код приглашения одним сообщением.\n\n'
+        'Отмена — /cancel'
+    )
+
+
+@router.message(LeagueJoin.entering_code)
+async def league_join_code(m:Message, state:FSMContext):
+    code=(m.text or '').strip().upper()
+    if not code.isalnum() or not 4 <= len(code) <= 8:
+        return await m.answer('Код — 4–8 символов, буквы и цифры.')
+    await state.clear()
+    async with SessionLocal() as s:
+        uid=await current_user(s,m)
+        c=await current_club(s,uid)
+        if not c:
+            return await m.answer('Сначала создайте клуб.')
+        league=(await s.execute(
+            text('SELECT id,name FROM leagues WHERE invite_code=:c'),
+            {'c':code}
+        )).first()
+        if not league:
+            return await m.answer('Лига не найдена. Проверьте код.')
+        try:
+            await join_league(s,uid,code)
+            await s.commit()
+        except ValueError as e:
+            await s.rollback()
+            return await m.answer(str(e))
+    await m.answer(
+        f'✅ Вы вступили в лигу <b>{league.name}</b>.',
+        reply_markup=league_menu_keyboard()
+    )
+
+
+@router.callback_query(F.data=='league:start')
+async def cb_league_start(c:CallbackQuery):
+    await c.answer()
+    await cmd_startleague(c.message)
+
+
+@router.callback_query(F.data=='league:play')
+async def cb_league_play(c:CallbackQuery):
+    await c.answer()
+    await cmd_playround(c.message)
+
+
+@router.callback_query(F.data=='league:table')
+async def cb_league_table(c:CallbackQuery):
+    await c.answer()
+    await cmd_tableview(c.message, c.from_user)
+
+
+@router.callback_query(F.data=='league:fixtures')
+async def cb_league_fixtures(c:CallbackQuery):
+    await c.answer()
+    await cmd_fixturesview(c.message, c.from_user)
+
+
+@router.message(Command('cancel'))
+async def cmd_cancel(m:Message, state:FSMContext):
+    current=await state.get_state()
+    if current is None:
+        return await m.answer('Нечего отменять.')
+    await state.clear()
+    await m.answer('Отменено.', reply_markup=menu())
+
 
 @router.callback_query(F.data.startswith('tac:'))
 async def cb_tactics_visual(cq:CallbackQuery):
