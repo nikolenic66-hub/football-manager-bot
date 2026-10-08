@@ -63,6 +63,13 @@ def menu():
     k.adjust(3,3,3,3,1)
     return k.as_markup()
 
+def back_keyboard(back_cb: str):
+    k=InlineKeyboardBuilder()
+    k.button(text='⬅️ Назад', callback_data=back_cb)
+    k.button(text='🏠 Главное меню', callback_data='menu:main')
+    k.adjust(2)
+    return k.as_markup()
+
 async def current_user(s,m,from_user=None):
     u=from_user or m.from_user
     return await get_or_create_user(s,u.id,u.username,u.first_name)
@@ -363,7 +370,7 @@ async def cmd_tableview(m:Message, from_user=None):
         if not league:return await m.answer('Вы пока не участвуете в лиге.')
         rows=(await s.execute(text("SELECT c.name,t.played,t.wins,t.draws,t.losses,t.points,t.goals_for,t.goals_against FROM league_teams t JOIN clubs c ON c.id=t.club_id WHERE t.league_id=:l ORDER BY t.points DESC,(t.goals_for-t.goals_against) DESC,t.goals_for DESC,c.name"),{'l':league['id']})).mappings().all()
     path=league_table_screen(league['name'],rows)
-    await m.answer_photo(FSInputFile(path),caption=f'🏆 <b>{league["name"]}</b>')
+    await m.answer_photo(FSInputFile(path),caption=f'🏆 <b>{league["name"]}</b>',reply_markup=back_keyboard('menu:main'))
 
 @router.message(Command('clubview'))
 async def cmd_clubview(m:Message, from_user=None):
@@ -371,7 +378,7 @@ async def cmd_clubview(m:Message, from_user=None):
         uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
     path=club_dashboard(c)
-    await m.answer_photo(FSInputFile(path),caption=f'🏟 <b>{c["name"]}</b> · профиль клуба')
+    await m.answer_photo(FSInputFile(path),caption=f'🏟 <b>{c["name"]}</b> · профиль клуба',reply_markup=back_keyboard('menu:main'))
 
 @router.message(Command('marketview'))
 async def cmd_marketview(m:Message):
@@ -394,7 +401,7 @@ async def cmd_fixturesview(m:Message, from_user=None):
         if not league:return await m.answer('Вы пока не участвуете в лиге.')
         rows=(await s.execute(text("SELECT m.round,h.name home,a.name away,m.home_score,m.away_score,m.status FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.league_id=:l ORDER BY m.round,m.id"),{'l':league['id']})).mappings().all()
     path=fixtures_screen(league['name'],rows)
-    await m.answer_photo(FSInputFile(path),caption=f'📅 <b>{league["name"]}</b> · календарь')
+    await m.answer_photo(FSInputFile(path),caption=f'📅 <b>{league["name"]}</b> · календарь',reply_markup=back_keyboard('menu:main'))
 
 @router.message(Command('tactics'))
 async def cmd_tactics(m:Message, from_user=None):
@@ -1052,6 +1059,11 @@ async def cb_club(c:CallbackQuery):
 async def cb_menu(c:CallbackQuery):
     await c.answer()
     await c.message.answer('Выберите действие:',reply_markup=menu())
+
+@router.callback_query(F.data=='menu:main')
+async def cb_menu_main(c:CallbackQuery):
+    await c.answer()
+    await c.message.answer('Выберите действие:',reply_markup=menu())
 async def cb_squad(c:CallbackQuery): await c.answer(); await cmd_squad(c.message, c.from_user)
 @router.callback_query(F.data=='tactics')
 async def cb_tactics(c:CallbackQuery): await c.answer(); await cmd_tactics(c.message, c.from_user)
@@ -1127,12 +1139,8 @@ async def cb_market_item(cq:CallbackQuery):
 
 @router.callback_query(F.data.startswith('market:buy:'))
 async def cb_market_buy(cq:CallbackQuery):
-    try:index=int(cq.data.rsplit(':',1)[1])
+    try:pid=int(cq.data.rsplit(':',1)[1])
     except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
-    data=_MARKET_VIEWS.get(cq.from_user.id,[])
-    if index<0 or index>=len(data):
-        return await cq.answer('Игрок не найден.',show_alert=True)
-    pid=int(data[index]['id'])
     async with SessionLocal() as s:
         c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
@@ -1278,6 +1286,15 @@ async def cb_league(c:CallbackQuery):
     )
 
 
+@router.callback_query(F.data=='league:menu')
+async def cb_league_menu(c:CallbackQuery):
+    await c.answer()
+    await c.message.answer(
+        '🏆 <b>СОРЕВНОВАНИЕ</b>\n\nВыберите действие:',
+        reply_markup=league_menu_keyboard()
+    )
+
+
 @router.callback_query(F.data=='league:info')
 async def cb_league_info(c:CallbackQuery):
     await c.answer()
@@ -1321,7 +1338,7 @@ async def cb_league_info(c:CallbackQuery):
             k.button(text='❌ Удалить лигу',callback_data='league:delete')
         k.button(text='⬅ Назад',callback_data='menu')
         k.adjust(2,1)
-        await c.message.answer('\n'.join(lines),reply_markup=k.as_markup())
+        await c.message.answer('\n'.join(lines),reply_markup=back_keyboard('league:menu'))
 
 
 @router.callback_query(F.data=='league:info:refresh')
