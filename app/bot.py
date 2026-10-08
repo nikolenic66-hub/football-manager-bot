@@ -784,7 +784,17 @@ async def cb_training_run(c:CallbackQuery, state:FSMContext):
             logger.exception('Failed to run training')
             await c.answer('Не удалось провести тренировку.',show_alert=True)
             return
-    progressed=sum(1 for _,pts,ch in changes if ch)
+    if changes and changes[0][0]=='COOLDOWN':
+        remaining=max(0,int(changes[0][1]))
+        hours,rem=divmod(remaining,3600)
+        minutes=rem//60
+        await c.answer()
+        await c.message.answer(
+            f'⏱️ Следующая тренировка доступна через: <b>{hours:02d}ч {minutes:02d}м</b>',
+            reply_markup=training_keyboard(focus,intensity)
+        )
+        return
+    progressed=sum(1 for _,pts,changed in changes if changed)
     points=sum(pts for _,pts,_ in changes)
     await state.clear()
     await c.answer()
@@ -817,7 +827,7 @@ async def cmd_training(m:Message):
         try:
             await set_training_plan(s,c['id'],focus,intensity); changes=await train_squad(s,c['id']); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
-    progressed=sum(1 for _,pts,ch in changes if ch); points=sum(pts for _,pts,_ in changes)
+    progressed=sum(1 for _,_,upd in changes if upd); points=sum(pts for _,pts,_ in changes)
     await m.answer(f'🏋️ <b>Тренировка завершена</b>\nФокус: {focus} · интенсивность: {intensity}\nРазвитие: {points} очков · игроков с изменениями: {progressed}\n\nСледующий тур использует этот план автоматически.')
 
 @router.message(Command('contract'))
@@ -1253,8 +1263,9 @@ def league_menu_keyboard():
     k.button(text='⚽ Сыграть тур', callback_data='league:play')
     k.button(text='📊 Таблица', callback_data='league:table')
     k.button(text='📅 Календарь', callback_data='league:fixtures')
+    k.button(text='ℹ️ Код лиги', callback_data='league:info')
     k.button(text='⬅ Назад', callback_data='menu')
-    k.adjust(2,2,2,1)
+    k.adjust(2,2,2,2,1)
     return k.as_markup()
 
 
@@ -1265,6 +1276,102 @@ async def cb_league(c:CallbackQuery):
         '🏆 <b>СОРЕВНОВАНИЕ</b>\n\nВыберите действие:',
         reply_markup=league_menu_keyboard()
     )
+
+
+@router.callback_query(F.data=='league:info')
+async def cb_league_info(c:CallbackQuery):
+    await c.answer()
+    async with SessionLocal() as s:
+        uid=await current_user(s,c.message,from_user=c.from_user)
+        club=await current_club(s,uid)
+        if not club:
+            k=InlineKeyboardBuilder()
+            k.button(text='➕ Создать лигу',callback_data='league:create')
+            k.button(text='🔗 Вступить в лигу',callback_data='league:join')
+            k.button(text='⬅ Назад',callback_data='menu')
+            k.adjust(2,1)
+            return await c.message.answer('Сначала создайте клуб.',reply_markup=k.as_markup())
+        league=(await s.execute(text("""SELECT l.id,l.name,l.invite_code,l.status,l.current_round,l.max_teams,
+                    l.creator_user_id,COUNT(t.club_id) AS team_count
+                FROM leagues l JOIN league_teams t ON t.league_id=l.id
+                WHERE t.club_id=:c
+                GROUP BY l.id
+                ORDER BY CASE l.status WHEN 'ACTIVE' THEN 0 WHEN 'WAITING' THEN 1 ELSE 2 END,l.id DESC
+                LIMIT 1"""),{'c':club['id']})).mappings().first()
+        if not league:
+            k=InlineKeyboardBuilder()
+            k.button(text='➕ Создать лигу',callback_data='league:create')
+            k.button(text='🔗 Вступить в лигу',callback_data='league:join')
+            k.button(text='⬅ Назад',callback_data='menu')
+            k.adjust(2,1)
+            return await c.message.answer('🏆 У вас пока нет лиги.',reply_markup=k.as_markup())
+        status_label={'WAITING':'Ожидание','ACTIVE':'Активна','FINISHED':'Завершена'}.get(league['status'],league['status'])
+        lines=[
+            f'🏆 <b>{league["name"]}</b>',
+            f'Код приглашения: <code>{league["invite_code"]}</code>',
+            f'Клубы: <b>{league["team_count"]} / {league["max_teams"]}</b>',
+            f'Статус: <b>{status_label}</b>',
+        ]
+        if league['status']=='ACTIVE':
+            lines.append(f'Текущий тур: <b>{league["current_round"]}</b>')
+        lines.append(f'\nОтправьте код друзьям: <code>/join {league["invite_code"]}</code>')
+        k=InlineKeyboardBuilder()
+        k.button(text='🔄 Обновить',callback_data='league:info:refresh')
+        if league['status']=='WAITING' and league['creator_user_id']==uid:
+            k.button(text='❌ Удалить лигу',callback_data='league:delete')
+        k.button(text='⬅ Назад',callback_data='menu')
+        k.adjust(2,1)
+        await c.message.answer('\n'.join(lines),reply_markup=k.as_markup())
+
+
+@router.callback_query(F.data=='league:info:refresh')
+async def cb_league_info_refresh(c:CallbackQuery):
+    await cb_league_info(c)
+
+
+@router.callback_query(F.data=='league:delete')
+async def cb_league_delete(c:CallbackQuery):
+    await c.answer()
+    async with SessionLocal() as s:
+        uid=await current_user(s,c.message,from_user=c.from_user)
+        club=await current_club(s,uid)
+        if not club:
+            return await c.message.answer('Лига недоступна.',reply_markup=league_menu_keyboard())
+        league=(await s.execute(text("""SELECT l.id,l.name,l.status,l.creator_user_id
+            FROM leagues l JOIN league_teams t ON t.league_id=l.id
+            WHERE t.club_id=:c
+            ORDER BY CASE l.status WHEN 'ACTIVE' THEN 0 WHEN 'WAITING' THEN 1 ELSE 2 END,l.id DESC
+            LIMIT 1"""),{'c':club['id']})).mappings().first()
+        if not league or league['creator_user_id']!=uid or league['status']!='WAITING':
+            return await c.message.answer('Удалить можно только свою лигу в статусе WAITING.',reply_markup=league_menu_keyboard())
+    k=InlineKeyboardBuilder()
+    k.button(text='✅ Да, удалить',callback_data='league:delete:confirm')
+    k.button(text='❌ Отмена',callback_data='league')
+    k.adjust(2)
+    await c.message.answer(f'Удалить лигу <b>{league["name"]}</b>?',reply_markup=k.as_markup())
+
+
+@router.callback_query(F.data=='league:delete:confirm')
+async def cb_league_delete_confirm(c:CallbackQuery):
+    await c.answer()
+    async with SessionLocal() as s:
+        uid=await current_user(s,c.message,from_user=c.from_user)
+        club=await current_club(s,uid)
+        if not club:
+            return await c.message.answer('Лига недоступна.',reply_markup=league_menu_keyboard())
+        league=(await s.execute(text("""SELECT l.id,l.name,l.status,l.creator_user_id
+            FROM leagues l JOIN league_teams t ON t.league_id=l.id
+            WHERE t.club_id=:c
+            ORDER BY CASE l.status WHEN 'ACTIVE' THEN 0 WHEN 'WAITING' THEN 1 ELSE 2 END,l.id DESC
+            LIMIT 1"""),{'c':club['id']})).mappings().first()
+        if not league or league['creator_user_id']!=uid or league['status']!='WAITING':
+            return await c.message.answer('Удаление отменено: лига уже недоступна для удаления.',reply_markup=league_menu_keyboard())
+        await s.execute(text('DELETE FROM league_teams WHERE league_id=:l'),{'l':league['id']})
+        await s.execute(text('DELETE FROM leagues WHERE id=:l'),{'l':league['id']})
+        await s.commit()
+    k=InlineKeyboardBuilder()
+    k.button(text='⬅ Назад',callback_data='menu')
+    await c.message.answer(f'🗑 Лига <b>{league["name"]}</b> удалена.',reply_markup=k.as_markup())
 
 
 @router.callback_query(F.data=='league:create')
