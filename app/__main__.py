@@ -4,20 +4,21 @@ from .db import init_db
 from .bot import create_bot
 from .seed import seed
 
+logger=logging.getLogger(__name__)
+
 async def _portrait_warmup():
     # Run outside the polling loop so cold-start image preparation never blocks the bot.
     for module in ('scripts.build_portraits','scripts.load_real_portraits'):
+        logger.info('Portrait warmup starting: %s',module)
         try:
             proc=await asyncio.create_subprocess_exec(sys.executable,'-m',module)
-            try:
-                await asyncio.wait_for(proc.wait(),timeout=12)
-            except asyncio.TimeoutError:
-                logging.getLogger(__name__).warning('Portrait warmup still running: %s',module)
-                return
-            if proc.returncode:
-                logging.getLogger(__name__).warning('Portrait warmup failed (%s): exit=%s',module,proc.returncode)
+            returncode=await proc.wait()
+            if returncode:
+                logger.error('Portrait warmup failed (%s): exit=%s',module,returncode)
+            else:
+                logger.info('Portrait warmup finished: %s',module)
         except Exception:
-            logging.getLogger(__name__).exception('Portrait warmup could not start: %s',module)
+            logger.exception('Portrait warmup could not start: %s',module)
 
 async def main():
     logging.basicConfig(level=getattr(logging,settings.log_level.upper(),logging.INFO))

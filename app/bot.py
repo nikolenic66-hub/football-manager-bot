@@ -112,6 +112,32 @@ def squad_keyboard(players, page=0, prefix='squad'):
     return k.as_markup()
 
 
+def tactic_keyboard(players, filter_code, page=0, selected=None, page_size=8):
+    selected=selected or set()
+    k=InlineKeyboardBuilder()
+    total_pages=max(1,(len(players)+page_size-1)//page_size)
+    page=max(0,min(page,total_pages-1))
+    start=page*page_size
+    end=min(start+page_size,len(players))
+    for r in players[start:end]:
+        pid=int(r['id'])
+        last=(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
+        mark='✓ ' if pid in selected else ''
+        k.button(text=f'{mark}{last}',callback_data=f'tactic:item:{pid}:{filter_code}:{page}')
+    k.adjust(2)
+    for code,label in (('ATT','⚡ Атака'),('MID','⚙ Полузащита'),('DEF','🛡 Защита'),('GK','🧤 Вратари')):
+        k.button(text=('✓ ' if code==filter_code else '')+label,callback_data=f'tactic:filter:{code}:0')
+    k.adjust(2,2)
+    nav=[]
+    if page>0: nav.append(('◀️ Назад',f'tactic:filter:{filter_code}:{page-1}'))
+    if page+1<total_pages: nav.append(('Вперёд ▶️',f'tactic:filter:{filter_code}:{page+1}'))
+    for label,callback in nav: k.button(text=label,callback_data=callback)
+    if nav: k.adjust(len(nav))
+    k.button(text='⬅ Назад',callback_data='tactics')
+    k.adjust(1)
+    return k.as_markup()
+
+
 _SELECTED_SQUAD_PLAYERS={}
 _TACTIC_PICKS=defaultdict(set)
 _MARKET_VIEWS={}
@@ -1656,35 +1682,51 @@ async def cb_squad_transfer(cq:CallbackQuery):
 @router.callback_query(F.data=='tactic:pick')
 async def cb_tactic_pick(cq:CallbackQuery):
     _TACTIC_PICKS[cq.from_user.id].clear()
-    c,rows=await _load_squad_rows(cq.from_user.id)
+    c,rows=await _load_squad_rows(cq.from_user.id,'ATT')
     if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
-    if not rows:return await cq.answer('Состав пуст.',show_alert=True)
-    await cq.message.answer('👥 <b>Выберите 11 игроков</b> для стартового состава:',reply_markup=squad_keyboard(rows,prefix='tactic'))
+    if not rows:return await cq.answer('В этой группе игроков нет.',show_alert=True)
+    await cq.message.answer('👥 <b>Игроки · Атака</b>',reply_markup=tactic_keyboard(rows,'ATT',0,_TACTIC_PICKS[cq.from_user.id]))
     await cq.answer()
 
 
 @router.callback_query(F.data.startswith('tactic:filter:'))
 async def cb_tactic_filter(cq:CallbackQuery):
-    code=cq.data.rsplit(':',1)[1]
+    parts=cq.data.split(':')
+    code=parts[2] if len(parts)>2 else ''
+    try: page=int(parts[3]) if len(parts)>3 else 0
+    except ValueError: return await cq.answer('Некорректная страница.',show_alert=True)
     if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестный фильтр.',show_alert=True)
     c,rows=await _load_squad_rows(cq.from_user.id,code)
     if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
     if not rows:return await cq.answer('В этой группе игроков нет.',show_alert=True)
-    await cq.message.answer(f'👥 <b>Выберите игроков</b> · выбрано {len(_TACTIC_PICKS[cq.from_user.id])}/11:',reply_markup=squad_keyboard(rows,prefix='tactic'))
+    names={'ATT':'Атака','MID':'Полузащита','DEF':'Защита','GK':'Вратари'}
+    await cq.message.edit_text(f'👥 <b>Игроки · {names[code]}</b>',reply_markup=tactic_keyboard(rows,code,page,_TACTIC_PICKS[cq.from_user.id]))
     await cq.answer()
 
 
 @router.callback_query(F.data.startswith('tactic:item:'))
 async def cb_tactic_item(cq:CallbackQuery):
-    try:index=int(cq.data.rsplit(':',1)[1])
-    except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
-    c,rows=await _load_squad_rows(cq.from_user.id)
-    if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
-    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
-    pid=int(rows[index]['id']); picks=_TACTIC_PICKS[cq.from_user.id]
-    if pid in picks:picks.remove(pid); await cq.answer('Игрок убран из состава.')
-    elif len(picks)>=11:return await cq.answer('Уже выбрано 11 игроков.',show_alert=True)
-    else:picks.add(pid); await cq.answer(f'Выбрано: {len(picks)}/11')
+    parts=cq.data.split(':')
+    try: pid=int(parts[2]); code=parts[3]; page=int(parts[4])
+    except (ValueError,IndexError):return await cq.answer('Некорректный игрок.',show_alert=True)
+    if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестная линия.',show_alert=True)
+    async with SessionLocal() as s:
+        c=await club_by_tg(s,cq.from_user.id)
+        if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
+        row=(await s.execute(text("""SELECT p.*,cp.shirt_number,cp.fitness,cp.form,cp.is_injured
+            FROM club_players cp JOIN players p ON p.id=cp.player_id
+            WHERE cp.club_id=:c AND p.id=:pid"""),{'c':c['id'],'pid':pid})).mappings().first()
+    if not row:return await cq.answer('Игрок не найден в вашем составе.',show_alert=True)
+    picks=_TACTIC_PICKS[cq.from_user.id]
+    if pid in picks:
+        picks.remove(pid); message='Игрок убран из состава.'
+    elif len(picks)>=11:
+        return await cq.answer('Уже выбрано 11 игроков.',show_alert=True)
+    else:
+        picks.add(pid); message=f'Выбрано: {len(picks)}/11'
+    _,rows=await _load_squad_rows(cq.from_user.id,code)
+    await cq.message.edit_reply_markup(reply_markup=tactic_keyboard(rows,code,page,picks))
+    await cq.answer(message)
     if len(picks)==11:
         async with SessionLocal() as s:
             try: await set_starting_lineup(s,c['id'],list(picks)); await s.commit()
