@@ -6,6 +6,7 @@ individual cards when portrait files are available.
 """
 from pathlib import Path
 import sys
+import asyncio
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from random import Random
@@ -14,6 +15,8 @@ import json
 from app.visual.render import formation_board, club_crest, player_card
 from app.player_catalog import REAL_ORDER, LEGEND_NAMES
 from app.game.board import FORMATION_SLOTS
+from app.db import SessionLocal
+from app.game.ratings import player_rating
 
 ROOT=Path(__file__).resolve().parents[1]; ICON=ROOT/'assets/visual/icons'; ICON.mkdir(parents=True,exist_ok=True)
 FIRST=['Lars','Marco','Jonas','Daniel','Milan','Alex','Noah','Sven','Rafael','Nico','Victor','Leo','Max','Tom','Elias','Felix','Oscar','Lucas','Mateo','Ivan','Adrian','Julian','Matias','Dario','Enzo','Leon','Theo','Samuel','David','Oskar']
@@ -21,7 +24,7 @@ LAST=['van Dijk','Silva','Jansen','Costa','Martin','Santos','Muller','Rossi','Ba
 POSITIONS=['GK']*100+['CB']*190+['LB']*90+['RB']*90+['DM']*100+['CM']*210+['AM']*120+['LW']*80+['RW']*80+['ST']*188
 
 def stats(rng,base,pos):
-    v={k:max(35,min(99,base+rng.randint(-9,9))) for k in ['pace','shooting','passing','dribbling','defending','physical']}
+    v={k:max(35,min(99,base+rng.randint(-9,9))) for k in ['pace','shooting','passing','dribbling','defending','physical','stamina','mental']}
     if pos=='GK': v.update(pace=base-8,shooting=base-25,passing=base-3,dribbling=base-15,defending=base+3,physical=base+2)
     elif pos in ('CB','LB','RB'): v.update(defending=base+6,physical=base+3)
     elif pos in ('DM','CM','AM'): v.update(passing=base+5)
@@ -48,22 +51,31 @@ for f,slots in FORMATION_SLOTS.items():
 for i,name in enumerate(['FOOTBALL MANAGER','UNITED','CITY','ATHLETIC','ROYAL','SPORTING','DYNAMO','LEGENDS','TITANS','RANGERS','WANDERERS','PHOENIX'],1): club_crest(name,i)
 for n,g in {'goal':'⚽','yellow':'!','red':'×','sub':'↔','injury':'+','transfer':'€','whistle':'▶','tactics':'◇','star':'★','cup':'♛'}.items(): icon(n,g)
 
-rng=Random(20261002); count=0
-manifest=[]
-for i in range(1,1249):
-    if i<=len(REAL_ORDER):
-        first,last,nat,pos=REAL_ORDER[i-1]
-        full=f'{first} {last}'.strip()
-    else:
-        pos=POSITIONS[(i-121)%len(POSITIONS)]; first=FIRST[(i*7)%len(FIRST)]; last=f'{LAST[(i*11)%len(LAST)]} {i:04d}'; nat='NLD'; full=f'{first} {last}'
-    rar=rarity(i,full); base={'BASE':63,'RARE':76,'EPIC':87,'LEGENDARY':94}[rar]
-    target=ROOT/'assets/visual/cards'/f'player_{i}.png'
-    portrait_candidates=[p for p in (ROOT/'assets'/'portraits'/f'{i}_real.png', ROOT/'assets'/'portraits'/f'{i}_avatar.png') if p.exists()]
-    d=dict(id=i,first_name=first,last_name=last,nationality=nat,position=pos,rarity=rar,talents=['TACTICAL'],**stats(rng,base,pos))
-    if portrait_candidates: d['portrait_path']=portrait_candidates[0]
-    if not target.exists():
-        player_card(d, target)
-    count+=1
-    manifest.append({'id':i,'first_name':first,'last_name':last,'nationality':nat,'position':pos,'rarity':rar,'portrait_file':str(portrait_candidates[0].relative_to(ROOT)) if portrait_candidates else None})
+async def build_player_cards_from_db():
+    count=0; manifest=[]
+    async with SessionLocal() as s:
+        from sqlalchemy import text
+        rows=(await s.execute(text('SELECT * FROM players ORDER BY id'))).mappings().all()
+    for row in rows:
+        d=dict(row)
+        pr=type('CardPlayer',(),dict(
+            {k:int(d.get(k) or 0) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')},
+            position=str(d.get('position') or 'CM'),fitness=100,form=0,morale=70
+        ))()
+        d['overall']=player_rating(pr)
+        target=ROOT/'assets/visual/cards'/f'player_{d["id"]}.png'
+        player_card(d,target)
+        count+=1
+        manifest.append({
+            'id':d['id'],'first_name':d['first_name'],'last_name':d['last_name'],
+            'nationality':d['nationality'],'position':d['position'],'rarity':d['rarity'],
+            'portrait_file': next((str(p.relative_to(ROOT)) for p in (
+                ROOT/'assets'/'portraits'/f'{d["id"]}_real.png',
+                ROOT/'assets'/'portraits'/f'{d["id"]}_avatar.png'
+            ) if p.exists()),None)
+        })
+    return count,manifest
+
+count,manifest=asyncio.run(build_player_cards_from_db())
 (ROOT/'assets'/'visual'/'cards_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
 print(f'Built {count} player cards, 5 formations, 12 crests and 10 event icons.')

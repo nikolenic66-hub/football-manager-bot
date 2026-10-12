@@ -24,6 +24,15 @@ router=Router()
 logger=logging.getLogger(__name__)
 
 
+def _card_player(r):
+    data=dict(r)
+    if data.get('overall') is None:
+        attrs={k:int(data.get(k) or 0) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
+        pr=type('CardPlayer',(),dict(attrs,position=str(data.get('position') or 'CM'),fitness=100,form=0,morale=70))()
+        data['overall']=player_rating(pr)
+    return data
+
+
 class LeagueCreate(StatesGroup):
     choosing_size = State()
     entering_name = State()
@@ -329,7 +338,7 @@ async def cmd_player(m:Message):
     if portrait:
         candidate=Path(str(portrait))
         portrait_path=candidate if candidate.is_absolute() else Path(__file__).resolve().parents[1]/candidate
-    card=player_card(dict(r,portrait_path=portrait_path), out=Path('assets/visual/cards')/f'player_{r["id"]}.png')
+    card=player_card(_card_player(r), out=Path('assets/visual/cards')/f'player_{r["id"]}.png')
     note='\n\n📸 Портрет встроен в карточку.' if portrait_path and portrait_path.exists() else '\n\n🎨 Силуэт используется как fallback до загрузки разрешённого портрета.'
     await m.answer_photo(FSInputFile(card),caption=caption+note)
 
@@ -1150,7 +1159,7 @@ async def cb_market_item(cq:CallbackQuery):
     if index<0 or index>=len(data):
         return await cq.answer('Игрок не найден.',show_alert=True)
     r=data[index]
-    card=player_card(dict(r),out=Path('assets/visual/cards')/f'market_player_{r["id"]}.png')
+    card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'market_player_{r["id"]}.png')
     caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n'
              f'{r["position"]} · рейтинг <b>{r.get("overall","—")}</b> · €{int(r.get("asking_price") or r.get("market_value") or 0):,} · POT {r.get("potential","—")}')
     k=InlineKeyboardBuilder()
@@ -1207,7 +1216,7 @@ async def cb_contract_item(cq:CallbackQuery):
         rows=await player_management_report(s,c['id'])
     if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
     r=dict(rows[index]); _CONTRACT_VIEWS[cq.from_user.id]=r
-    card=player_card(r,out=Path('assets/visual/cards')/f'contract_player_{r["id"]}.png')
+    card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'contract_player_{r["id"]}.png')
     caption=(f'📝 <b>{r["first_name"]} {r["last_name"]}</b> · {r["position"]}\n'
              f'Зарплата: €{int(r.get("contract_salary") or 0):,}\n'
              f'Окончание: {r.get("contract_until") or "—"}\n'
@@ -1265,7 +1274,7 @@ async def _refresh_contract_item(cq,pid):
         rows=await player_management_report(s,c['id'])
     row=next((dict(r) for r in rows if int(r['id'])==int(pid)),None)
     if not row:return
-    card=player_card(row,out=Path('assets/visual/cards')/f'contract_player_{row["id"]}.png')
+    card=player_card(_card_player(row),out=Path('assets/visual/cards')/f'contract_player_{row["id"]}.png')
     caption=(f'📝 <b>{row["first_name"]} {row["last_name"]}</b> · {row["position"]}\n'
              f'Зарплата: €{int(row.get("contract_salary") or 0):,}\n'
              f'Окончание: {row.get("contract_until") or "—"}\n'

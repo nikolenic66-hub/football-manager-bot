@@ -40,6 +40,10 @@ async def main():
                 pid=int(item['player_id']); url=item.get('url')
                 path=OUT/f'{pid}_real.png'
                 if path.exists():
+                    if url:
+                        await s.execute(text('''UPDATE players SET portrait_url=:url,portrait_source=:source,portrait_license=:license WHERE id=:id'''),{
+                            'url':str(path.relative_to(ROOT)),'source':item.get('source') or 'wikimedia_commons','license':item.get('license') or 'verify-on-source','id':pid})
+                        await s.commit()
                     skipped+=1; continue
                 if not url:
                     skipped+=1; continue
