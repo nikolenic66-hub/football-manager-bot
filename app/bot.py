@@ -105,19 +105,27 @@ def paginated_keyboard(items_count, prefix, page=0, page_size=6):
 
 
 def squad_keyboard(players, page=0, prefix='squad'):
+    page_size=8
+    total_pages=max(1,(len(players)+page_size-1)//page_size)
+    page=max(0,min(page,total_pages-1))
     k=InlineKeyboardBuilder()
-    start=page*6
-    end=min(start+6,len(players))
+    start=page*page_size
+    end=min(start+page_size,len(players))
     for i in range(start,end):
         p=players[i]
         last=(p.get('last_name') or p.get('name') or 'Игрок')[:10]
         k.button(text=f'{i+1}. {last}',callback_data=f'{prefix}:item:{i}')
-    k.adjust(2)
     for code,label in (('GK','🧤 Вратари'),('DEF','🛡 Защита'),('MID','⚙ Полузащита'),('ATT','⚡ Атака')):
         k.button(text=label,callback_data=f'{prefix}:filter:{code}')
-    k.adjust(2,2)
+    nav=[]
+    if page>0:
+        nav.append(('◀️ Назад',f'{prefix}:page:{page-1}'))
+    if page+1<total_pages:
+        nav.append(('Вперёд ▶️',f'{prefix}:page:{page+1}'))
+    for label,callback in nav:
+        k.button(text=label,callback_data=callback)
     k.button(text='⬅ Назад',callback_data='menu')
-    k.adjust(2,2,1)
+    k.adjust(2,2,2,2,len(nav) or 1,1)
     return k.as_markup()
 
 
@@ -1592,6 +1600,7 @@ async def cb_tactics_visual(cq:CallbackQuery):
 
 @router.callback_query(F.data=='squad')
 async def cb_squad_screen(cq:CallbackQuery):
+    _SQUAD_FILTERS.pop(cq.from_user.id,None)
     await cq.answer()
     await _show_squad(cq.message,cq.from_user.id)
 
@@ -1644,11 +1653,30 @@ async def cb_squad_item(cq:CallbackQuery):
     await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup()); await cq.answer()
 
 
+_SQUAD_FILTERS={}
+
+@router.callback_query(F.data.startswith('squad:page:'))
+async def cb_squad_page(cq:CallbackQuery):
+    try:
+        page=int(cq.data.rsplit(':',1)[1])
+    except ValueError:
+        return await cq.answer('Некорректная страница.',show_alert=True)
+    filter_code=_SQUAD_FILTERS.get(cq.from_user.id)
+    c,rows=await _load_squad_rows(cq.from_user.id,filter_code)
+    if not c:
+        return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    if not rows:
+        return await cq.answer('Состав пуст.',show_alert=True)
+    await cq.message.edit_reply_markup(reply_markup=squad_keyboard(rows,page))
+    await cq.answer()
+
+
 @router.callback_query(F.data.startswith('squad:filter:'))
 async def cb_squad_filter(cq:CallbackQuery):
     code=cq.data.rsplit(':',1)[1]
     if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестный фильтр.',show_alert=True)
-    await cq.answer(); await _show_squad(cq.message,cq.from_user.id,code)
+    _SQUAD_FILTERS[cq.from_user.id]=code
+    await cq.answer(); await _show_squad(cq.message,cq.from_user.id,code,0)
 
 
 @router.callback_query(F.data=='squad:contract')

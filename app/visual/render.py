@@ -3,6 +3,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import hashlib, math
 from functools import lru_cache
 from app.game.economy import stadium_capacity
+from app.game.ratings import player_rating
 
 ROOT=Path(__file__).resolve().parents[2]
 ASSET=ROOT/'assets'/'visual'
@@ -51,7 +52,14 @@ def player_card(player,out=None,size=(620,860)):
                 break
 
     overall=player.get('overall')
-    overall_text='—' if overall is None else str(overall)
+    if overall is None:
+        attrs={k:int(player.get(k) or 0) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
+        pr=type('CardPlayer',(),dict(attrs,position=str(player.get('position') or 'CM'),fitness=100,form=0,morale=70))()
+        overall=player_rating(pr)
+    try:
+        overall_text=str(int(round(float(overall))))
+    except (TypeError,ValueError):
+        overall_text='—'
 
     # PHY is a presentation value explicitly defined by the card format.
     phy=round((int(player.get('physical') or 0)+int(player.get('stamina') or 0))/2)
@@ -116,10 +124,11 @@ def player_card(player,out=None,size=(620,860)):
     # OVR / position / country plaque.
     text_center(d,(91,91),overall_text,font(64,True),light)
     text_center(d,(91,151),str(player.get('position') or '—'),font(27,True),accent)
-    nation=str(player.get('nationality') or '---').upper()[:3]
-    plaque=(48,177,143,220)
-    rounded(d,plaque,9,fill=tuple(max(0,min(255,int(c*.30))) for c in accent),outline=accent,w=2)
-    text_center(d,((plaque[0]+plaque[2])//2,(plaque[1]+plaque[3])//2),nation,font(18,True),light)
+    nation=str(player.get('nationality') or '').strip().upper()[:3]
+    if nation and nation != '---':
+        plaque=(48,177,143,220)
+        rounded(d,plaque,9,fill=tuple(max(0,min(255,int(c*.30))) for c in accent),outline=accent,w=2)
+        text_center(d,((plaque[0]+plaque[2])//2,(plaque[1]+plaque[3])//2),nation,font(18,True),light)
 
     # Name band.
     first=str(player.get('first_name') or '').strip().upper()
@@ -153,10 +162,6 @@ def player_card(player,out=None,size=(620,860)):
 
     ment=int(player.get('mental') or 0)
     text_center(d,(W//2,748),f'MENT  {ment}',font(17,True),accent)
-
-    # Empty club-crest mount in the lower-right corner.
-    cx,cy=W-88,H-72; r=27
-    d.polygon([(cx,cy-r),(cx+r,cy-r+10),(cx+r-5,cy+r-5),(cx,cy+r),(cx-r+5,cy+r-5),(cx-r,cy-r+10)],fill=(7,13,22),outline=accent)
 
     im.save(out,format='PNG',optimize=True)
     cache_meta.write_text(fingerprint,encoding='ascii')
