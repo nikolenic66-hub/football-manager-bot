@@ -17,10 +17,10 @@ def test_admin_migration_has_required_audit_columns():
         assert field in source
 
 
-def test_admin_router_is_registered_after_main_router():
+def test_admin_router_is_registered_before_main_router():
     source = (ROOT / 'app' / 'bot.py').read_text()
     assert 'from .handlers.admin import admin_router' in source
-    assert 'dp=Dispatcher(); dp.include_router(router); dp.include_router(admin_router)' in source
+    assert 'dp=Dispatcher(); dp.include_router(admin_router); dp.include_router(router)' in source
 
 
 def test_admin_id_is_configurable_with_requested_default():
@@ -28,3 +28,12 @@ def test_admin_id_is_configurable_with_requested_default():
     env = (ROOT / '.env.example').read_text()
     assert 'admin_id: int = 6521319127' in source
     assert 'ADMIN_ID=6521319127' in env
+
+
+def test_admin_destructive_callbacks_require_matching_confirmation_state():
+    source = (ROOT / 'app' / 'handlers' / 'admin.py').read_text()
+    assert "AdminStates.player_delete_confirm.state" in source
+    assert "AdminStates.club_delete_confirm.state" in source
+    assert "AdminStates.league_delete_confirm.state" in source
+    assert "AdminStates.training_all_confirm.state" in source
+    assert "Подтверждение устарело. Начните заново." in source

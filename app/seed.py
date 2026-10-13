@@ -4,6 +4,7 @@ from random import Random
 from sqlalchemy import text
 from .db import SessionLocal
 from .player_catalog import REAL_ORDER, LEGEND_NAMES
+from .real_player_stats import REAL_PLAYER_STATS
 
 TOTAL_PLAYERS=1248
 RARITY_COUNTS={'BASE':888,'RARE':250,'EPIC':80,'LEGENDARY':30}
@@ -40,8 +41,8 @@ def _talents(rng,pos,rarity):
     pool=TALENTS[pos]; count=1 if rarity=='BASE' else (2 if rarity=='RARE' else 3)
     return rng.sample(pool,k=min(count,len(pool)))
 
-def _insert_values(i,first,last,nat,pos,rarity,rng,real=False,card='STANDARD',market=None,age=None):
-    base=_base_for(rng,rarity); st=_stats(rng,base,pos)
+def _insert_values(i,first,last,nat,pos,rarity,rng,real=False,card='STANDARD',market=None,age=None,stats=None):
+    base=_base_for(rng,rarity); st=dict(stats) if stats is not None else _stats(rng,base,pos)
     if market is None: market=int((base/60)**6*180_000)
     if rarity=='LEGENDARY': market=max(market,25_000_000)
     elif rarity=='EPIC': market=max(market,8_000_000)
@@ -61,7 +62,10 @@ async def seed():
         for i,(first,last,nat,pos) in enumerate(REAL_ORDER,1):
             full=f'{first} {last}'.strip()
             rarity='LEGENDARY' if full in LEGEND_NAMES else ('EPIC' if i<=110 else 'RARE')
-            rows.append(_insert_values(i,first,last,nat,pos,rarity,rng,real=True,card='ICON' if rarity=='LEGENDARY' else ('EPIC' if rarity=='EPIC' else 'STANDARD')))
+            real_stats=REAL_PLAYER_STATS.get(i)
+            if real_stats is None:
+                raise RuntimeError(f'Missing curated stats for real player {i}')
+            rows.append(_insert_values(i,first,last,nat,pos,rarity,rng,real=True,card='ICON' if rarity=='LEGENDARY' else ('EPIC' if rarity=='EPIC' else 'STANDARD'),stats=real_stats))
             used.add(full.lower())
         # Complete the market to 1,248 cards. Generated cards are intentionally separated from real cards.
         for i in range(len(rows)+1,TOTAL_PLAYERS+1):

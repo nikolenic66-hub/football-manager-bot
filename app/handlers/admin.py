@@ -1,5 +1,6 @@
 import json
 import random
+import logging
 from pathlib import Path
 
 from aiogram import BaseMiddleware, F, Router
@@ -16,6 +17,7 @@ from ..game.ratings import player_rating
 from ..services import start_league
 
 admin_router = Router()
+logger = logging.getLogger(__name__)
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
@@ -58,6 +60,14 @@ class AdminStates(StatesGroup):
     league_add_club = State()
     league_remove_club = State()
     league_delete_confirm = State()
+
+
+
+
+async def _confirm_state(state: FSMContext, expected_state: str, key: str, value: int) -> bool:
+    current = await state.get_state()
+    data = await state.get_data()
+    return current == expected_state and data.get(key) == value
 
 
 def kb(rows):
@@ -218,26 +228,36 @@ async def admin_player_edit_input(m: Message, state: FSMContext):
 @admin_router.callback_query(F.data.startswith('admin:player:') & F.data.endswith(':delete:yes'))
 async def admin_player_delete(c: CallbackQuery, state: FSMContext):
     pid=int(c.data.split(':')[2])
-    async with SessionLocal() as s:
-        await s.execute(text('UPDATE matches SET motm_player_id=NULL WHERE motm_player_id=:id'),{'id':pid})
-        for table,col in [('match_events','player_id'),('match_events','secondary_player_id')]: await s.execute(text(f'UPDATE {table} SET {col}=NULL WHERE {col}=:id'),{'id':pid})
-        await s.execute(text('UPDATE club_lineups SET player_ids=array_remove(player_ids,:id)'),{'id':pid})
-        await s.execute(text('DELETE FROM club_player_instructions WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM match_player_instructions WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM match_substitutions WHERE player_off_id=:id OR player_on_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM club_substitution_plans WHERE player_off_id=:id OR player_on_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM match_player_stats WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM match_lineups WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM transfers WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM transfer_offers WHERE listing_id IN (SELECT id FROM transfer_listings WHERE player_id=:id)'),{'id':pid})
-        await s.execute(text('DELETE FROM transfer_listings WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM player_development_log WHERE player_id=:id'),{'id':pid})
-        await s.execute(text('DELETE FROM club_players WHERE player_id=:id'),{'id':pid})
-        res=await s.execute(text('DELETE FROM players WHERE id=:id'),{'id':pid})
-        await s.commit()
-    if not res.rowcount: return await c.answer('Игрок уже удалён.',show_alert=True)
-    await log_action(c.from_user.id,'player_delete','player',pid)
-    await state.clear(); await c.message.edit_text('🗑 Игрок удалён.',reply_markup=back('admin:players')); await c.answer()
+    if not await _confirm_state(state, AdminStates.player_delete_confirm.state, 'player_id', pid):
+        return await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
+    try:
+        async with SessionLocal() as s:
+            await s.execute(text('UPDATE matches SET motm_player_id=NULL WHERE motm_player_id=:id'),{'id':pid})
+            for table,col in [('match_events','player_id'),('match_events','secondary_player_id')]: await s.execute(text(f'UPDATE {table} SET {col}=NULL WHERE {col}=:id'),{'id':pid})
+            await s.execute(text('UPDATE club_lineups SET player_ids=array_remove(player_ids,:id)'),{'id':pid})
+            await s.execute(text('DELETE FROM club_player_instructions WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM match_player_instructions WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM match_substitutions WHERE player_off_id=:id OR player_on_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM club_substitution_plans WHERE player_off_id=:id OR player_on_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM match_player_stats WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM match_lineups WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM transfers WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM transfer_offers WHERE listing_id IN (SELECT id FROM transfer_listings WHERE player_id=:id)'),{'id':pid})
+            await s.execute(text('DELETE FROM transfer_listings WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM player_development_log WHERE player_id=:id'),{'id':pid})
+            await s.execute(text('DELETE FROM club_players WHERE player_id=:id'),{'id':pid})
+            res=await s.execute(text('DELETE FROM players WHERE id=:id'),{'id':pid})
+            await s.commit()
+        if not res.rowcount:
+            await state.clear()
+            return await c.answer('Игрок уже удалён.',show_alert=True)
+        await log_action(c.from_user.id,'player_delete','player',pid)
+        await state.clear(); await c.message.edit_text('🗑 Игрок удалён.',reply_markup=back('admin:players')); await c.answer()
+    except Exception:
+        if 's' in locals():
+            await s.rollback()
+        logger.exception('Admin player delete failed: player_id=%s', pid)
+        await c.answer('❌ Не удалось удалить игрока.', show_alert=True)
 
 
 @admin_router.callback_query(F.data == 'admin:player:create')
@@ -354,14 +374,23 @@ async def admin_transfer_target(m,state):
 @admin_router.callback_query(F.data.startswith('admin:club:') & F.data.endswith(':delete:yes'))
 async def admin_club_delete(c,state):
     parts=c.data.split(':')
-    if len(parts)<5 or parts[1]!='club':return
+    if len(parts)<5 or parts[1]!='club': return
     cid=int(parts[2])
-    async with SessionLocal() as s:
-        await s.execute(text('DELETE FROM matches WHERE home_club_id=:id OR away_club_id=:id'), {'id': cid})
-        for q in ['DELETE FROM club_players WHERE club_id=:id','DELETE FROM club_tactics WHERE club_id=:id','DELETE FROM club_lineups WHERE club_id=:id','DELETE FROM club_training WHERE club_id=:id','DELETE FROM club_player_instructions WHERE club_id=:id','DELETE FROM club_substitution_plans WHERE club_id=:id','DELETE FROM club_counterplans WHERE club_id=:id','DELETE FROM club_financial_transactions WHERE club_id=:id','DELETE FROM club_season_finances WHERE club_id=:id','DELETE FROM league_teams WHERE club_id=:id']:
-            await s.execute(text(q),{'id':cid})
-        await s.execute(text('DELETE FROM clubs WHERE id=:id'),{'id':cid});await s.commit()
-    await log_action(c.from_user.id,'club_delete','club',cid);await state.clear();await c.message.edit_text('🗑 Клуб удалён.',reply_markup=back('admin:clubs'));await c.answer()
+    if not await _confirm_state(state, AdminStates.club_delete_confirm.state, 'club_id', cid):
+        return await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
+    try:
+        async with SessionLocal() as s:
+            await s.execute(text('DELETE FROM matches WHERE home_club_id=:id OR away_club_id=:id'), {'id': cid})
+            for q in ['DELETE FROM club_players WHERE club_id=:id','DELETE FROM club_tactics WHERE club_id=:id','DELETE FROM club_lineups WHERE club_id=:id','DELETE FROM club_training WHERE club_id=:id','DELETE FROM club_player_instructions WHERE club_id=:id','DELETE FROM club_substitution_plans WHERE club_id=:id','DELETE FROM club_counterplans WHERE club_id=:id','DELETE FROM club_financial_transactions WHERE club_id=:id','DELETE FROM club_season_finances WHERE club_id=:id','DELETE FROM league_teams WHERE club_id=:id']:
+                await s.execute(text(q),{'id':cid})
+            await s.execute(text('DELETE FROM clubs WHERE id=:id'),{'id':cid}); await s.commit()
+        await log_action(c.from_user.id,'club_delete','club',cid); await state.clear(); await c.message.edit_text('🗑 Клуб удалён.',reply_markup=back('admin:clubs')); await c.answer()
+    except Exception:
+        if 's' in locals():
+            await s.rollback()
+        logger.exception('Admin club delete failed: club_id=%s', cid)
+        await c.answer('❌ Не удалось удалить клуб.', show_alert=True)
+
 
 @admin_router.callback_query(F.data == 'admin:club:create')
 async def admin_club_create(c,state):await state.set_state(AdminStates.club_create_owner);await c.message.answer('Введите Telegram user_id владельца:');await c.answer()
@@ -445,8 +474,18 @@ async def admin_training_club_input(m,state):
 async def admin_training_all(c,state):await state.set_state(AdminStates.training_all_confirm);await c.message.edit_text('⚠️ Сбросить кулдаун у всех клубов?',reply_markup=kb([('⚠️ Да, сбросить всех','admin:training:all:yes'),('⬅️ Отмена','admin:training')]));await c.answer()
 @admin_router.callback_query(F.data == 'admin:training:all:yes')
 async def admin_training_all_yes(c,state):
-    async with SessionLocal() as s:await s.execute(text('UPDATE club_players SET last_training_at=NULL'));await s.commit()
-    await log_action(c.from_user.id,'training_cooldown_reset_all','club',None);await state.clear();await c.message.edit_text('✅ Кулдаун всех клубов сброшен.',reply_markup=back('admin:training'));await c.answer()
+    current = await state.get_state()
+    if current != AdminStates.training_all_confirm.state:
+        return await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
+    try:
+        async with SessionLocal() as s:
+            await s.execute(text('UPDATE club_players SET last_training_at=NULL')); await s.commit()
+        await log_action(c.from_user.id,'training_cooldown_reset_all','club',None); await state.clear(); await c.message.edit_text('✅ Кулдаун всех клубов сброшен.',reply_markup=back('admin:training')); await c.answer()
+    except Exception:
+        if 's' in locals():
+            await s.rollback()
+        logger.exception('Admin training cooldown reset all failed')
+        await c.answer('❌ Не удалось сбросить кулдаун.', show_alert=True)
 
 
 # ---------------- leagues ----------------
@@ -497,10 +536,19 @@ async def admin_league_remove(m,state):
 @admin_router.callback_query(F.data.startswith('admin:league:') & F.data.endswith(':delete:yes'))
 async def admin_league_delete(c,state):
     parts=c.data.split(':')
-    if len(parts)<5 or parts[1]!='league':return
+    if len(parts)<5 or parts[1]!='league': return
     lid=int(parts[2])
-    async with SessionLocal() as s:await s.execute(text('DELETE FROM leagues WHERE id=:id'),{'id':lid});await s.commit()
-    await log_action(c.from_user.id,'league_delete','league',lid);await state.clear();await c.message.edit_text('🗑 Лига удалена.',reply_markup=back('admin:leagues'));await c.answer()
+    if not await _confirm_state(state, AdminStates.league_delete_confirm.state, 'league_id', lid):
+        return await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
+    try:
+        async with SessionLocal() as s:
+            await s.execute(text('DELETE FROM leagues WHERE id=:id'),{'id':lid}); await s.commit()
+        await log_action(c.from_user.id,'league_delete','league',lid); await state.clear(); await c.message.edit_text('🗑 Лига удалена.',reply_markup=back('admin:leagues')); await c.answer()
+    except Exception:
+        if 's' in locals():
+            await s.rollback()
+        logger.exception('Admin league delete failed: league_id=%s', lid)
+        await c.answer('❌ Не удалось удалить лигу.', show_alert=True)
 
 
 # ---------------- system ----------------

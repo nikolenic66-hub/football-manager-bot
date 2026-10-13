@@ -269,6 +269,9 @@ async def cmd_join(m:Message):
         if not league:return await m.answer('Лига не найдена.')
         try: await join_league(s,uid,code); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(str(e))
+        except Exception:
+            await s.rollback(); logger.exception('Failed to join league')
+            return await m.answer('Не удалось вступить в лигу. Попробуйте ещё раз.')
     await m.answer(f'✅ Вы вступили в лигу <b>{league.name}</b>.')
 
 @router.message(Command('startleague'))
@@ -281,6 +284,9 @@ async def cmd_startleague(m:Message):
         if lt.creator_user_id!=uid:return await m.answer('Начать сезон может создатель лиги.')
         try: await start_league(s,uid); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(str(e))
+        except Exception:
+            await s.rollback(); logger.exception('Failed to start league')
+            return await m.answer('Не удалось начать сезон. Попробуйте ещё раз.')
     await m.answer(f'🚦 Сезон <b>{lt.name}</b> начался! Теперь можно использовать /playround.')
 
 @router.message(Command('playround'))
@@ -535,7 +541,10 @@ async def cmd_boardset(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try:
             await set_player_instruction(s,c['id'],pid,parts[2].upper(),parts[3].upper(),x,y); await s.commit()
-        except ValueError as e:return await m.answer(f'❌ {e}')
+        except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to set player instruction')
+            return await m.answer('❌ Не удалось сохранить инструкцию. Попробуйте ещё раз позже.')
     await m.answer('✅ Позиция, роль и инструкция сохранены.')
 
 @router.message(Command('lineup'))
@@ -558,6 +567,9 @@ async def cmd_lineup(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: await set_starting_lineup(s,c['id'],ids); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to save starting lineup')
+            return await m.answer('❌ Не удалось сохранить состав. Попробуйте ещё раз позже.')
     await m.answer('✅ Стартовые 11 сохранены. Теперь тактическая доска и следующие матчи будут использовать их.')
 
 @router.message(Command('sub'))
@@ -571,6 +583,9 @@ async def cmd_sub(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: await plan_substitution(s,c['id'],minute,off,on); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to plan substitution')
+            return await m.answer('❌ Не удалось запланировать замену. Попробуйте ещё раз позже.')
     await m.answer(f'🔄 Запланирована замена на {minute}′: {off} → {on}.')
 
 @router.message(Command('matchcenter'))
@@ -615,6 +630,9 @@ async def cmd_scout(m:Message, from_user=None):
             except ValueError:return await m.answer('Использование: /scout OPPONENT_CLUB_ID')
             try: report=await scout_opponent(s,c['id'],opponent_id)
             except ValueError as e:return await m.answer(f'❌ {e}')
+            except Exception:
+                logger.exception('Failed to scout opponent: club_id=%s opponent_id=%s', c['id'], opponent_id)
+                return await m.answer('❌ Не удалось выполнить скаутинг. Попробуйте ещё раз позже.')
         path=scouting_screen(report)
         caption=(f'🕵️ <b>{report.opponent_name}</b> · выборка {report.sample_matches}\n'
                  f'Схема: <b>{report.typical_formation}</b> · стиль: <b>{report.typical_style}</b>\n'
@@ -737,7 +755,7 @@ def _scout_results_text(rows, total, page):
 async def _show_scout_results(target, uid, page=0):
     filters=_scout_filter_state(uid)
     async with SessionLocal() as s:
-        c=await current_club(s,uid)
+        c=await club_by_tg(s,uid)
         if not c:
             if isinstance(target,CallbackQuery): return await target.answer('Сначала создайте клуб.',show_alert=True)
             return await target.answer('Сначала создайте клуб.')
@@ -767,6 +785,9 @@ async def cmd_setcounter(m:Message):
         try:
             plan=await set_counterplan(s,c['id'],opponent_id,parts[2],70,target); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to set counterplan')
+            return await m.answer('❌ Не удалось сохранить контртактику. Попробуйте ещё раз позже.')
     target_txt=f' · цель #{target}' if target else ''
     await m.answer(f'🎯 Контртактика сохранена: <b>{plan["focus"]}</b> · интенсивность {plan["intensity"]}{target_txt}')
 
@@ -792,7 +813,9 @@ async def cmd_buy(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: player,price=await buy_player(s,c['id'],int(parts[1])); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(str(e))
-        except Exception: await s.rollback(); raise
+        except Exception:
+            await s.rollback(); logger.exception('Failed to buy player via /buy: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось выполнить покупку. Попробуйте ещё раз позже.')
     await m.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
 
 @router.message(Command('sell'))
@@ -804,7 +827,9 @@ async def cmd_sell(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: row,price=await sell_player(s,c['id'],int(parts[1])); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(str(e))
-        except Exception: await s.rollback(); raise
+        except Exception:
+            await s.rollback(); logger.exception('Failed to sell player via /sell: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось выполнить продажу. Попробуйте ещё раз позже.')
     await m.answer(f'✅ {row["first_name"]} {row["last_name"]} продан за €{price:,}.')
 
 def _finance_keyboard():
@@ -847,7 +872,7 @@ async def cmd_finance(m:Message, from_user=None):
 @router.callback_query(F.data=='finance:ticket')
 async def cb_finance_ticket(cq:CallbackQuery,state:FSMContext):
     async with SessionLocal() as s:
-        c=await current_club(s,cq.from_user.id)
+        c=await club_by_tg(s,cq.from_user.id)
     if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
     await state.set_state(FinanceStates.entering_ticket_price)
     await cq.answer()
@@ -860,7 +885,7 @@ async def finance_ticket_price_input(m:Message,state:FSMContext):
     if not value.isdigit():
         return await m.answer('Введите целое число от €5 до €120.')
     async with SessionLocal() as s:
-        c=await current_club(s,m.from_user.id)
+        c=await club_by_tg(s,m.from_user.id)
         if not c:
             await state.clear()
             return await m.answer('Сначала создайте клуб.')
@@ -868,6 +893,9 @@ async def finance_ticket_price_input(m:Message,state:FSMContext):
             price=await set_ticket_price(s,c['id'],int(value)); await s.commit()
         except ValueError as e:
             await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to set ticket price from Finance FSM')
+            return await m.answer('❌ Не удалось изменить цену билета. Попробуйте ещё раз позже.')
     await state.clear()
     await m.answer(f'✅ Цена билета обновлена: €{price}')
     await _show_finance(m,m.from_user.id)
@@ -876,7 +904,7 @@ async def finance_ticket_price_input(m:Message,state:FSMContext):
 @router.callback_query(F.data=='finance:stadium')
 async def cb_finance_stadium(cq:CallbackQuery):
     async with SessionLocal() as s:
-        c=await current_club(s,cq.from_user.id)
+        c=await club_by_tg(s,cq.from_user.id)
     if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
     level=int(c['stadium_level'])
     if level>=20:
@@ -898,12 +926,15 @@ async def cb_finance_stadium(cq:CallbackQuery):
 @router.callback_query(F.data=='finance:stadium:confirm')
 async def cb_finance_stadium_confirm(cq:CallbackQuery):
     async with SessionLocal() as s:
-        c=await current_club(s,cq.from_user.id)
+        c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         try:
             level,cost,capacity=await upgrade_stadium(s,c['id']); await s.commit()
         except ValueError as e:
             await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Finance stadium upgrade failed')
+            return await cq.answer('❌ Не удалось выполнить операцию.', show_alert=True)
     await cq.answer('Стадион улучшен.')
     await cq.message.answer(f'✅ Стадион улучшен до <b>LVL {level}</b>.\nСтоимость: €{cost:,}\nВместимость: <b>{capacity:,}</b>.')
     await _show_finance(cq.message,cq.from_user.id)
@@ -912,7 +943,7 @@ async def cb_finance_stadium_confirm(cq:CallbackQuery):
 @router.callback_query(F.data=='finance:transactions')
 async def cb_finance_transactions(cq:CallbackQuery):
     async with SessionLocal() as s:
-        c=await current_club(s,cq.from_user.id)
+        c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         rows=(await s.execute(text('''SELECT created_at,category,amount,description FROM club_financial_transactions
             WHERE club_id=:c ORDER BY id DESC LIMIT 30'''),{'c':c['id']})).mappings().all()
@@ -934,7 +965,7 @@ async def cb_finance_transactions(cq:CallbackQuery):
 @router.callback_query(F.data=='finance:salaries')
 async def cb_finance_salaries(cq:CallbackQuery):
     async with SessionLocal() as s:
-        c=await current_club(s,cq.from_user.id)
+        c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         total=int((await s.execute(text('''SELECT COALESCE(SUM(COALESCE(cp.contract_salary,p.salary)),0)
             FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c'''),{'c':c['id']})).scalar_one())
@@ -957,6 +988,9 @@ async def cmd_ticketprice(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: price=await set_ticket_price(s,c['id'],int(parts[1])); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to set ticket price via /ticketprice')
+            return await m.answer('❌ Не удалось изменить цену билета. Попробуйте ещё раз позже.')
     await m.answer(f'🎟 Цена билета установлена: <b>€{price}</b>. Более высокая цена повышает доход с места, но снижает спрос.')
 
 
@@ -967,6 +1001,9 @@ async def cmd_upgradestadium(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: level,cost,capacity=await upgrade_stadium(s,c['id']); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to upgrade stadium via /upgradestadium')
+            return await m.answer('❌ Не удалось улучшить стадион. Попробуйте ещё раз позже.')
     await m.answer(f'🏟 Стадион улучшен до <b>LVL {level}</b>.\nСтоимость: €{cost:,}\nВместимость: <b>{capacity:,}</b>.')
 
 
@@ -1142,6 +1179,9 @@ async def cmd_training(m:Message):
         try:
             await set_training_plan(s,c['id'],focus,intensity); changes=await train_squad(s,c['id']); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to run training via /training')
+            return await m.answer('❌ Не удалось провести тренировку. Попробуйте ещё раз позже.')
     progressed=sum(1 for _,_,upd in changes if upd); points=sum(pts for _,pts,_ in changes)
     await m.answer(f'🏋️ <b>Тренировка завершена</b>\nФокус: {focus} · интенсивность: {intensity}\nРазвитие: {points} очков · игроков с изменениями: {progressed}\n\nСледующий тур использует этот план автоматически.')
 
@@ -1156,6 +1196,9 @@ async def cmd_contract(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: offer=await renew_contract(s,c['id'],int(parts[1]),years,role); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to renew contract via /contract: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось обновить контракт. Попробуйте ещё раз позже.')
     await m.answer(f'📝 Контракт продлён на <b>{offer.years} лет</b>.\nЗарплата: <b>€{offer.salary:,}/период</b>\nОтступные: <b>€{offer.release_clause:,}</b>.')
 
 @router.message(Command('expect'))
@@ -1167,6 +1210,9 @@ async def cmd_expect(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: role=await set_player_expectation(s,c['id'],int(parts[1]),parts[2]); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to set player expectation: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось изменить ожидание. Попробуйте ещё раз позже.')
     await m.answer(f'🎯 Ожидание игрового времени установлено: <b>{role}</b>.')
 
 @router.message(Command('contracts'))
@@ -1189,6 +1235,9 @@ async def cmd_list(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: lid,ask,minimum=await list_player_for_transfer(s,c['id'],int(parts[1]),int(parts[2]) if len(parts)==3 else None); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to list player for transfer: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось выставить игрока на рынок. Попробуйте ещё раз позже.')
     await m.answer(f'📋 Игрок выставлен на рынок. Listing #{lid}\nЦена: €{ask:,}\nМинимум: €{minimum:,}.')
 
 @router.message(Command('offer'))
@@ -1200,6 +1249,9 @@ async def cmd_offer(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: oid=await make_transfer_offer(s,c['id'],int(parts[1]),int(parts[2])); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to make transfer offer: player_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось отправить предложение. Попробуйте ещё раз позже.')
     await m.answer(f'📨 Предложение #{oid} отправлено владельцу игрока.')
 
 @router.message(Command('acceptoffer'))
@@ -1211,6 +1263,9 @@ async def cmd_acceptoffer(m:Message):
         if not c:return await m.answer('Сначала создайте клуб.')
         try: offer=await accept_transfer_offer(s,c['id'],int(parts[1])); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(f'❌ {e}')
+        except Exception:
+            await s.rollback(); logger.exception('Failed to accept transfer offer: offer_id=%s', int(parts[1]))
+            return await m.answer('❌ Не удалось завершить трансфер. Попробуйте ещё раз позже.')
     await m.answer(f'✅ Трансфер завершён за €{int(offer["amount"]):,}.')
 
 @router.message(Command('offers'))
@@ -1456,6 +1511,9 @@ async def cb_market_buy(cq:CallbackQuery):
             player,price=await buy_player(s,c['id'],pid); await s.commit()
         except ValueError as e:
             await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Market buy failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось выполнить операцию.', show_alert=True)
     await cq.answer()
     await cq.message.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
     await _show_market(cq,cq.from_user.id)
@@ -1518,6 +1576,9 @@ async def cb_contract_renew(cq:CallbackQuery):
         try: offer=await renew_contract(s,c['id'],pid,years,role); await s.commit()
         except ValueError as e:
             await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Contract renewal callback failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось обновить контракт.', show_alert=True)
     await cq.answer('Контракт продлён.')
     await cq.message.answer(f'✅ Контракт продлён на {years} лет. Зарплата: €{offer.salary:,}. Отступные: €{offer.release_clause:,}.')
     # Refresh the contract card.
@@ -1536,6 +1597,9 @@ async def cb_contract_role(cq:CallbackQuery):
             await renew_contract(s,c['id'],pid,3,role); await s.commit()
         except ValueError as e:
             await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Contract role update callback failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось обновить роль.', show_alert=True)
     await cq.answer()
     await cq.message.answer(f'✅ Роль обновлена: {role}')
     await _refresh_contract_item(cq,pid)
@@ -1657,7 +1721,7 @@ async def cb_scout_item(c:CallbackQuery):
     try: pid=int(c.data.rsplit(':',1)[1])
     except ValueError: return await c.answer('Некорректный игрок.',show_alert=True)
     async with SessionLocal() as s:
-        club=await current_club(s,c.from_user.id)
+        club=await club_by_tg(s,c.from_user.id)
         if not club:return await c.answer('Сначала создайте клуб.',show_alert=True)
         row=(await s.execute(text('''SELECT p.* FROM players p
             WHERE p.id=:p AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id)'''),{'p':pid})).mappings().first()
@@ -1682,12 +1746,15 @@ async def cb_scout_buy(c:CallbackQuery):
     try: pid=int(c.data.rsplit(':',1)[1])
     except ValueError: return await c.answer('Некорректный игрок.',show_alert=True)
     async with SessionLocal() as s:
-        club=await current_club(s,c.from_user.id)
+        club=await club_by_tg(s,c.from_user.id)
         if not club:return await c.answer('Сначала создайте клуб.',show_alert=True)
         try:
             player,price=await buy_player(s,club['id'],pid); await s.commit()
         except ValueError as e:
             await s.rollback(); return await c.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Scout buy failed: player_id=%s', pid)
+            return await c.answer('❌ Не удалось выполнить операцию.', show_alert=True)
     await c.answer()
     await c.message.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
     await c.message.answer(_scout_menu_text(c.from_user.id),reply_markup=_scout_menu_keyboard(c.from_user.id))
@@ -2073,6 +2140,9 @@ async def cb_squad_contract(cq:CallbackQuery):
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         try: offer=await renew_contract(s,c['id'],pid); await s.commit()
         except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Squad contract renewal failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось обновить контракт.',show_alert=True)
     await cq.answer('Контракт обновлён.')
     await cq.message.answer(f'📝 Контракт продлён на <b>{offer.years} лет</b>.\nЗарплата: <b>€{offer.salary:,}/период</b>.\nОтступные: <b>€{offer.release_clause:,}</b>.',reply_markup=InlineKeyboardBuilder().as_markup())
 
@@ -2086,6 +2156,9 @@ async def cb_squad_sell(cq:CallbackQuery):
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         try: row,price=await sell_player(s,c['id'],pid); await s.commit()
         except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Squad sell failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось выполнить операцию.',show_alert=True)
     await cq.answer('Игрок продан.'); await cq.message.answer(f'💸 {row["first_name"]} {row["last_name"]} продан за <b>€{price:,}</b>.',reply_markup=squad_keyboard([]))
 
 
@@ -2098,6 +2171,9 @@ async def cb_squad_transfer(cq:CallbackQuery):
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         try: lid,ask,minimum=await list_player_for_transfer(s,c['id'],pid); await s.commit()
         except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Squad transfer listing failed: player_id=%s', pid)
+            return await cq.answer('❌ Не удалось выполнить операцию.',show_alert=True)
     await cq.answer('Игрок выставлен на трансфер.'); await cq.message.answer(f'🔄 Игрок выставлен на трансфер. Listing #{lid}\nЦена: €{ask:,}\nМинимум: €{minimum:,}.')
 
 
@@ -2132,6 +2208,14 @@ async def cb_tactic_item(cq:CallbackQuery):
     try: pid=int(parts[2]); code=parts[3]; page=int(parts[4])
     except (ValueError,IndexError):return await cq.answer('Некорректный игрок.',show_alert=True)
     if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестная линия.',show_alert=True)
+    c,rows=await _load_squad_rows(cq.from_user.id,code)
+    if not c:
+        return await cq.answer('Сначала создайте клуб.',show_alert=True)
+    page_size=8
+    page=max(0,page)
+    page_rows=rows[page*page_size:(page+1)*page_size]
+    if not any(int(r['id'])==pid for r in page_rows):
+        return await cq.answer('Устаревшая кнопка. Откройте Тактику заново.',show_alert=True)
     async with SessionLocal() as s:
         c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
@@ -2153,6 +2237,9 @@ async def cb_tactic_item(cq:CallbackQuery):
         async with SessionLocal() as s:
             try: await set_starting_lineup(s,c['id'],list(picks)); await s.commit()
             except ValueError as e: await s.rollback(); return await cq.answer(str(e),show_alert=True)
+            except Exception:
+                await s.rollback(); logger.exception('Tactic starting lineup save failed')
+                return await cq.answer('❌ Не удалось сохранить состав.', show_alert=True)
         picks.clear(); await cq.message.answer('✅ Стартовый состав сохранён.')
 
 
@@ -2194,7 +2281,7 @@ async def text_router(m:Message):
     await m.answer(f'🏟 <b>{name}</b> создан! Вы получили стартовый состав.',reply_markup=menu())
 
 def create_bot():
-    bot=Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); dp.include_router(router); dp.include_router(admin_router)
+    bot=Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(); dp.include_router(admin_router); dp.include_router(router)
     live_task=None
     async def on_startup(_bot=None):
         nonlocal live_task

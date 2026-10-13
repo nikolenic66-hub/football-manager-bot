@@ -774,7 +774,7 @@ async def train_squad(s, club_id):
     plan=(await s.execute(text("SELECT focus,intensity FROM club_training WHERE club_id=:c"),{'c':club_id})).mappings().first() or {'focus':'BALANCED','intensity':'NORMAL'}
     last_training_at=(await s.execute(text("SELECT max(last_training_at) FROM club_players WHERE club_id=:c"),{'c':club_id})).scalar_one()
     if last_training_at is not None:
-        recent=(await s.execute(text("SELECT now() - :t < interval '20 hours'"), {'t': last_training_at})).scalar_one()
+        recent=(await s.execute(text("SELECT now() - CAST(:t AS timestamptz) < interval '20 hours'"), {'t': last_training_at})).scalar_one()
         if recent:
             remaining=(await s.execute(text("SELECT GREATEST(0, EXTRACT(EPOCH FROM (interval '20 hours' - (now() - CAST(:t AS timestamptz)))))"), {'t': last_training_at})).scalar_one()
             return [('COOLDOWN', int(remaining or 0), False)]
