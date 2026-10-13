@@ -110,10 +110,69 @@ def poisson(rng,lam):
     lam=min(lam,4.5); L=exp(-lam); k=0;p=1
     while p>L: k+=1;p*=rng.random()
     return k-1
+FORMATION_PROFILE = {
+    '4-3-3':   {'defenders': 4, 'midfielders': 3, 'attackers': 3, 'wingers': 2, 'am': 0, 'dm': 1},
+    '4-4-2':   {'defenders': 4, 'midfielders': 4, 'attackers': 2, 'wingers': 2, 'am': 0, 'dm': 0},
+    '4-2-3-1': {'defenders': 4, 'midfielders': 5, 'attackers': 1, 'wingers': 2, 'am': 1, 'dm': 2},
+    '3-5-2':   {'defenders': 3, 'midfielders': 5, 'attackers': 2, 'wingers': 0, 'am': 0, 'dm': 1},
+    '5-3-2':   {'defenders': 5, 'midfielders': 3, 'attackers': 2, 'wingers': 0, 'am': 0, 'dm': 1},
+}
+
+
+def _formation_matchup(own_formation, opp_formation):
+    own = FORMATION_PROFILE[own_formation]
+    opp = FORMATION_PROFILE[opp_formation]
+    # Midfield control: extra central bodies create a small possession/chance edge.
+    midfield = 1.0 + (own['midfielders'] - opp['midfielders']) * 0.028
+    # Defensive density: defenders against the opponent's attackers reduce chance quality.
+    defensive_density = opp['defenders'] / max(1, own['attackers'])
+    defense = 1.0 - min(0.10, max(-0.08, (defensive_density - 1.33) * 0.045))
+    # Wide overload: wingers are more useful when the opponent has fewer wide defenders.
+    wide = 1.0 + (own['wingers'] - opp['wingers']) * 0.012
+    # AM/DM structure affects the central channel without overpowering player quality.
+    central = 1.0 + (own['am'] - opp['dm']) * 0.012 - (opp['am'] - own['dm']) * 0.008
+    return max(.90, min(1.10, midfield * defense * wide * central))
+
+
+def _channel_rating(players, positions, board):
+    values=[]
+    for i,p in enumerate(players):
+        if p.position in positions:
+            slot=board.slots[i].slot if i < len(board.slots) else p.position
+            values.append(player_rating(p, slot))
+    return sum(values)/len(values) if values else None
+
+
+def _channel_matchup(attackers, defenders, attack_positions, defense_positions, attack_board, defense_board, fallback_attack, fallback_defense):
+    ar=_channel_rating(attackers, attack_positions, attack_board) or fallback_attack
+    dr=_channel_rating(defenders, defense_positions, defense_board) or fallback_defense
+    return max(.70, min(1.35, (ar/max(1,dr))**.9))
+
+
+def _position_channel_factors(home, away, hb, ab):
+    # Channels are expressed from each team's attacking perspective.
+    h_attack=sum(player_rating(p, hb.slots[i].slot if i < len(hb.slots) else None) for i,p in enumerate(home))/len(home)
+    a_attack=sum(player_rating(p, ab.slots[i].slot if i < len(ab.slots) else None) for i,p in enumerate(away))/len(away)
+    h_def=sum(player_rating(p, hb.slots[i].slot if i < len(hb.slots) else None) for i,p in enumerate(home))/len(home)
+    a_def=sum(player_rating(p, ab.slots[i].slot if i < len(ab.slots) else None) for i,p in enumerate(away))/len(away)
+    channels_home=(
+        _channel_matchup(home, away, {'LW','LM'}, {'RB','RM'}, hb, ab, h_attack, a_def),
+        _channel_matchup(home, away, {'ST','AM'}, {'CB','DM'}, hb, ab, h_attack, a_def),
+        _channel_matchup(home, away, {'RW','RM'}, {'LB','LM'}, hb, ab, h_attack, a_def),
+    )
+    channels_away=(
+        _channel_matchup(away, home, {'LW','LM'}, {'RB','RM'}, ab, hb, a_attack, h_def),
+        _channel_matchup(away, home, {'ST','AM'}, {'CB','DM'}, ab, hb, a_attack, h_def),
+        _channel_matchup(away, home, {'RW','RM'}, {'LB','LM'}, ab, hb, a_attack, h_def),
+    )
+    # Three channel xG values are base_xg/3 * factor; their sum is base_xg * average(factor).
+    return channels_home, channels_away
+
+
 def expected_goals(home,away,ht,at,home_board=None,away_board=None,home_counter=None,away_counter=None):
     if not home or not away:
         return 0.0, 0.0
-    hs,as_=team_strength(home,ht.formation),team_strength(away,at.formation); ha,hd=tactical_modifiers(ht); aa,ad=tactical_modifiers(at)
+    hs,as_=team_strength(home,ht.formation,home_board),team_strength(away,at.formation,away_board); ha,hd=tactical_modifiers(ht); aa,ad=tactical_modifiers(at)
     he=board_effect(home_board or TacticalBoard(ht.formation),ht.style,ht.pressing,ht.width,ht.defensive_line); ae=board_effect(away_board or TacticalBoard(at.formation),at.style,at.pressing,at.width,at.defensive_line)
     hb=home_board or TacticalBoard(ht.formation); ab=away_board or TacticalBoard(at.formation)
     he=board_effect(hb,ht.style,ht.pressing,ht.width,ht.defensive_line); ae=board_effect(ab,at.style,at.pressing,at.width,at.defensive_line)
@@ -135,7 +194,22 @@ def expected_goals(home,away,ht,at,home_board=None,away_board=None,home_counter=
     a_at=(.52*as_.attack+.30*as_.midfield+.18*as_.overall)*aa*ae['central_control']*ae['chance_creation']
     h_de=(.60*hs.defense+.40*hs.goalkeeper)*hd*he['transition_def']
     a_de=(.60*as_.defense+.40*as_.goalkeeper)*ad*ae['transition_def']
-    hx=1.35*(h_at/max(1,a_de))**.90*1.06; ax=1.15*(a_at/max(1,h_de))**.90
+    # Formation defensive density: five-man lines and extra defensive midfielders
+    # make the same player quality harder to play through.
+    hpdef=FORMATION_PROFILE[ht.formation]
+    apdef=FORMATION_PROFILE[at.formation]
+    h_de *= 1 + (hpdef['defenders']-4)*.18 + (hpdef['dm']-1)*.012
+    a_de *= 1 + (apdef['defenders']-4)*.18 + (apdef['dm']-1)*.012
+    hx=1.35*(h_at/max(1,a_de))**.90; ax=1.15*(a_at/max(1,h_de))**.90
+    # Systematic home advantage: venue, crowd and travel effects.
+    hx *= 1.24; ax *= 0.85
+    # Formation-level matchups: midfield control, defensive density and width.
+    hx *= _formation_matchup(ht.formation, at.formation)
+    ax *= _formation_matchup(at.formation, ht.formation)
+    # Position-vs-position channels: exploit weak full-backs/central defenders.
+    channel_home, channel_away = _position_channel_factors(home, away, hb, ab)
+    hx *= sum(channel_home) / len(channel_home)
+    ax *= sum(channel_away) / len(channel_away)
     hx *= hx_phase * (1 + min(.12, talent_bonus(home, 'chance_creation'))); hx *= 1 + min(.05, (he['width_attack']-1)*.8)
     ax *= ax_phase * (1 + min(.12, talent_bonus(away, 'chance_creation'))); ax *= 1 + min(.05, (ae['width_attack']-1)*.8)
     if ht.style==Style.COUNTER and at.defensive_line>65: hx*=1.05 + min(.05, talent_bonus(home, 'counter'))

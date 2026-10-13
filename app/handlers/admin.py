@@ -304,84 +304,9 @@ async def apc_pot(m,state):
 
 
 # ---------------- clubs ----------------
-def _admin_budget_str(value):
-    value=int(value or 0)
-    sign='-' if value < 0 else ''
-    value=abs(value)
-    if value >= 1_000_000:
-        return f'{sign}€{value/1_000_000:.1f}M'
-    if value >= 1_000:
-        return f'{sign}€{value/1_000:.0f}K'
-    return f'{sign}€{value}'
-
-
 @admin_router.callback_query(F.data == 'admin:clubs')
 async def admin_clubs(c,state):
-    await state.clear()
-    await c.message.edit_text(
-        '🏟 <b>КЛУБЫ</b>',
-        reply_markup=kb([
-            ('🔍 Найти по ID/названию','admin:clubs:search'),
-            ('📋 Все клубы','admin:clubs:list'),
-            ('➕ Создать клуб для юзера','admin:club:create'),
-            ('⬅️ Назад','admin:menu')
-        ])
-    )
-    await c.answer()
-
-
-@admin_router.callback_query(F.data.regexp(r'^admin:clubs:list(?::\d+)?$'))
-async def admin_clubs_list(c,state):
-    await state.clear()
-    parts=c.data.split(':')
-    requested_page=int(parts[3]) if len(parts)==4 else 0
-    page=requested_page
-    async with SessionLocal() as s:
-        total=int((await s.execute(text('SELECT count(*) FROM clubs'))).scalar_one())
-        rows=(await s.execute(text('''
-            SELECT id, name, owner_user_id, budget
-            FROM clubs
-            ORDER BY id
-            LIMIT 10 OFFSET :offset
-        '''), {'offset': page*10})).mappings().all()
-
-    if total == 0:
-        await c.message.edit_text(
-            '🏟 <b>ВСЕ КЛУБЫ</b>\n\nКлубов пока нет.',
-            reply_markup=kb([('⬅️ Назад','admin:clubs')])
-        )
-        return await c.answer()
-
-    pages=max(1,(total+9)//10)
-    page=max(0,min(page,pages-1))
-    # Re-read the clamped page if the requested page was out of range.
-    if page != requested_page:
-        async with SessionLocal() as s:
-            rows=(await s.execute(text('''
-                SELECT id, name, owner_user_id, budget
-                FROM clubs
-                ORDER BY id
-                LIMIT 10 OFFSET :offset
-            '''), {'offset': page*10})).mappings().all()
-
-    b=InlineKeyboardBuilder()
-    for n,r in enumerate(rows, start=page*10+1):
-        b.button(
-            text=f'{n}. {r["name"]} (id={r["id"]}, {_admin_budget_str(r["budget"])})',
-            callback_data=f'admin:club:{r["id"]}'
-        )
-    if page>0:
-        b.button(text='◀️ Назад',callback_data=f'admin:clubs:list:{page-1}')
-    else:
-        b.button(text='◀️ Назад',callback_data='admin:clubs')
-    if page+1<pages:
-        b.button(text='Вперёд ▶️',callback_data=f'admin:clubs:list:{page+1}')
-    b.adjust(1,2)
-    await c.message.edit_text(
-        f'🏟 <b>ВСЕ КЛУБЫ</b> (всего {total})\nСтраница {page+1}/{pages}',
-        reply_markup=b.as_markup()
-    )
-    await c.answer()
+    await state.clear(); await c.message.edit_text('🏟 <b>КЛУБЫ</b>',reply_markup=kb([('🔍 Найти по ID/названию','admin:clubs:search'),('➕ Создать клуб для юзера','admin:club:create'),('⬅️ Назад','admin:menu')])); await c.answer()
 
 @admin_router.callback_query(F.data == 'admin:clubs:search')
 async def admin_club_search(c,state): await state.set_state(AdminStates.club_search); await c.message.answer('Введите ID или название клуба:'); await c.answer()

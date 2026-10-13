@@ -4,7 +4,6 @@ import hashlib, math
 from functools import lru_cache
 from app.game.economy import stadium_capacity
 from app.game.ratings import player_rating
-from app.services import clean_display_name
 
 ROOT=Path(__file__).resolve().parents[2]
 ASSET=ROOT/'assets'/'visual'
@@ -147,7 +146,7 @@ def player_card(player,out=None,size=(620,860)):
 
     # Name band.
     first=str(player.get('first_name') or '').strip().upper()
-    last=clean_display_name(str(player.get('last_name') or '').strip()).upper()
+    last=str(player.get('last_name') or '').strip().upper()
     name=' '.join(x for x in (first,last) if x) or 'PLAYER'
     name_y=476
     if len(name)>18 and ' ' in name:

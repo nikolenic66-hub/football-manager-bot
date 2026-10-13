@@ -1,22 +1,16 @@
 from secrets import token_urlsafe
 import json
-import re
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 from app.game.engine import simulate_match, expected_goals
 from app.game.tactics import Tactics, Style
 from app.game.league import round_robin
 from app.game.board import FORMATION_SLOTS
+from app.game.positions import POSITION_LABELS_RU
 from app.models import Player
 from app.game.economy import calculate_match_economy, sponsor_income, wage_bill, prize_money, stadium_capacity, TICKET_MIN, TICKET_MAX
 
 PLAYER_FIELDS='id,first_name,last_name,position,age,pace,shooting,passing,dribbling,defending,physical,stamina,mental,talents'
-
-_SUFFIX_RE = re.compile(r'\s+\d{4}$')
-
-
-def clean_display_name(name: str) -> str:
-    return _SUFFIX_RE.sub('', name or '')
 
 
 def row_player(r):
@@ -87,7 +81,7 @@ async def start_league(s, user_id):
         seed=f.round_no*1_000_003+f.home_club_id*1009+f.away_club_id
         kickoff=season_start+timedelta(minutes=(f.round_no-1)*10)
         await s.execute(text('''INSERT INTO matches(league_id,round,home_club_id,away_club_id,seed,started_at,scheduled_at,prestart_notified_at)
-            VALUES(:l,:r,:h,:a,:seed,NULL,:kickoff,NULL)'''),
+            VALUES(:l,:r,:h,:a,:seed,NULL,CAST(:kickoff AS timestamptz),NULL)'''),
             {'l':league['id'],'r':f.round_no,'h':f.home_club_id,'a':f.away_club_id,'seed':seed,'kickoff':kickoff})
         for cid in (f.home_club_id, f.away_club_id):
             await queue_club_notification(s,cid,'MATCH','⏰ Ваш матч начнётся через 10 минут',
@@ -98,8 +92,65 @@ async def start_league(s, user_id):
                      {'r':total,'started':season_start,'l':league['id']})
     return league['id'],len(fixtures),total
 
+def _player_value(player, key, default=0):
+    if isinstance(player, dict):
+        return player.get(key, default) or default
+    return getattr(player, key, default) or default
+
+
+_AUTOSQUAD_STATS = {
+    'GK': ('defending', 'mental'),
+    'CB': ('defending', 'physical', 'mental'),
+    'LB': ('defending', 'pace', 'stamina'),
+    'RB': ('defending', 'pace', 'stamina'),
+    'DM': ('defending', 'passing', 'physical'),
+    'CM': ('passing', 'dribbling', 'mental'),
+    'AM': ('passing', 'dribbling', 'shooting'),
+    'LW': ('pace', 'dribbling', 'shooting'),
+    'RW': ('pace', 'dribbling', 'shooting'),
+    'LM': ('passing', 'pace', 'stamina'),
+    'RM': ('passing', 'pace', 'stamina'),
+    'ST': ('shooting', 'pace', 'physical'),
+}
+
+
+def _secondary_positions(player):
+    value=_player_value(player, 'secondary_positions', ())
+    if isinstance(value, str):
+        try:
+            import json as _json
+            parsed=_json.loads(value)
+            if isinstance(parsed, list): value=parsed
+        except Exception:
+            value=[x.strip() for x in value.split(',') if x.strip()]
+    return set(value or ())
+
+
+def _relevant_score(player, slot):
+    return sum(float(_player_value(player, stat)) for stat in _AUTOSQUAD_STATS.get(slot, ('mental',)))
+
+
+def build_starting_lineup(players, slots):
+    """Build an ordered XI, preferring exact and secondary positions before fallback."""
+    available=list(players)
+    chosen=[]
+    used=set()
+    for slot in slots:
+        exact=[p for p in available if _player_value(p, 'id') not in used and _player_value(p, 'position') == slot]
+        secondary=[p for p in available if _player_value(p, 'id') not in used and slot in _secondary_positions(p)]
+        pool=exact or secondary
+        if not pool:
+            pool=[p for p in available if _player_value(p, 'id') not in used]
+        if not pool:
+            raise ValueError(f'No available player for {slot}.')
+        p=max(pool, key=lambda x: (_relevant_score(x, slot), float(_player_value(x, 'potential'))))
+        chosen.append(p)
+        used.add(_player_value(p, 'id'))
+    return chosen
+
+
 async def _starting_players(s,club_id):
-    rows=(await s.execute(text(f"SELECT {PLAYER_FIELDS},cp.fitness,cp.form,cp.morale,cp.is_injured,cp.injury_matches,cp.suspension_matches FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c AND cp.is_injured=false AND cp.suspension_matches=0 ORDER BY p.potential DESC,p.id"),{'c':club_id})).mappings().all()
+    rows=(await s.execute(text(f"SELECT {PLAYER_FIELDS},cp.fitness,cp.form,cp.morale,cp.is_injured,cp.injury_matches,cp.suspension_matches, p.secondary_positions FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c AND cp.is_injured=false AND cp.suspension_matches=0 ORDER BY p.potential DESC,p.id"),{'c':club_id})).mappings().all()
     by_id={r['id']:row_player(r) for r in rows}
     tactics=await _club_tactics(s,club_id)
     slots=[slot for slot,_,_ in FORMATION_SLOTS[tactics.formation]]
@@ -111,20 +162,9 @@ async def _starting_players(s,club_id):
             if len(chosen)==11: break
         if len(chosen)==11:
             return chosen
-    by={}
-    for r in rows: by.setdefault(r['position'],[]).append(by_id[r['id']])
-    groups={
-        'GK':['GK'], 'LB':['LB','RB','LW'], 'RB':['RB','LB','RW'], 'CB':['CB','LB','RB'],
-        'DM':['DM','CM','CB'], 'CM':['CM','DM','AM'], 'AM':['AM','CM','ST'],
-        'LM':['LW','RW','CM','AM'], 'RM':['RW','LW','CM','AM'],
-        'LW':['LW','RW','AM','ST'], 'RW':['RW','LW','AM','ST'], 'ST':['ST','AM','RW','LW'],
-    }
-    chosen=[]; used=set()
-    for role in slots:
-        choices=[p for q in groups.get(role,[role]) for p in by.get(q,[]) if p.id not in used]
-        if not choices: raise ValueError(f'Club {club_id} lacks a player for {role}.')
-        p=choices[0]; chosen.append(p); used.add(p.id)
-    return chosen
+    rows_by_id={r['id']:r for r in rows}
+    lineup_rows=build_starting_lineup(list(rows_by_id.values()), slots)
+    return [by_id[r['id']] for r in lineup_rows]
 
 async def _bench_players(s,club_id,starting_ids=None):
     ids=list(starting_ids or []) or [0]
@@ -413,7 +453,7 @@ async def schedule_round(s, league_id, round_no, delay_minutes=10):
     scheduled_at=ms[0].get('scheduled_at') if 'scheduled_at' in ms[0] else None
     if scheduled_at is None:
         scheduled_at=datetime.now(timezone.utc)+timedelta(minutes=delay_minutes)
-        await s.execute(text("UPDATE matches SET scheduled_at=:at WHERE league_id=:l AND round=:r AND status='SCHEDULED'"),{'at':scheduled_at,'l':league_id,'r':round_no})
+        await s.execute(text("UPDATE matches SET scheduled_at=CAST(:at AS timestamptz) WHERE league_id=:l AND round=:r AND status='SCHEDULED'"),{'at':scheduled_at,'l':league_id,'r':round_no})
     return scheduled_at,len(ms)
 
 async def start_round_halftime(s, league_id, round_no):
@@ -441,7 +481,7 @@ async def start_round_halftime(s, league_id, round_no):
         hs,as_,events=simulate_first_half(home,away,ht,at,m['seed']*2+1,hc,ac,hb,ab)
         kickoff=m.get('scheduled_at') or now
         phase_start=min(kickoff, now)
-        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=:hx,away_xg=:ax,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=:phase_start,halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,:phase_start),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'hx':round((expected_goals(home,away,ht,at)[0]*0.48),2),'ax':round((expected_goals(home,away,ht,at)[1]*0.48),2),'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots]})})
+        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=:hx,away_xg=:ax,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=:phase_start,halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,:phase_start),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'hx':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[0]*0.48),2),'ax':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[1]*0.48),2),'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots]})})
         await _save_lineup_and_tactics(s,m['id'],m['home_club_id'],home,ht); await _save_lineup_and_tactics(s,m['id'],m['away_club_id'],away,at)
         home_ids={p.name:p.id for p in home}; away_ids={p.name:p.id for p in away}
         for e in events:
@@ -932,7 +972,7 @@ async def queue_notification(s, user_id, category, title, body, dedupe_key=None,
     enabled=(await s.execute(text(f'SELECT {pref} FROM notification_settings WHERE user_id=:u'), {'u':user_id})).scalar_one()
     if not enabled: return None
     row=(await s.execute(text('''INSERT INTO notifications(user_id,category,title,body,dedupe_key,deliver_at)
-        VALUES(:u,:c,:t,:b,:d,COALESCE(:at,now()))
+        VALUES(:u,:c,:t,:b,:d,COALESCE(CAST(:at AS timestamptz),now()))
         ON CONFLICT(user_id,dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
         RETURNING id'''), {'u':user_id,'c':category,'t':title,'b':body,'d':dedupe_key,'at':deliver_at})).first()
     return row.id if row else None
