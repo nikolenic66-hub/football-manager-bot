@@ -530,7 +530,7 @@ async def cmd_fixturesview(m:Message, from_user=None):
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         if not league:return await m.answer('Вы пока не участвуете в лиге.')
-        rows=(await s.execute(text("SELECT m.round,h.name home,a.name away,m.home_score,m.away_score,m.status FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.league_id=:l ORDER BY m.round,m.id"),{'l':league['id']})).mappings().all()
+        rows=(await s.execute(text("SELECT m.round,m.scheduled_at,h.name home,a.name away,m.home_score,m.away_score,m.status FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.league_id=:l ORDER BY m.round,m.id"),{'l':league['id']})).mappings().all()
     path=fixtures_screen(league['name'],rows)
     await m.answer_photo(FSInputFile(path),caption=f'📅 <b>{league["name"]}</b> · календарь',reply_markup=back_keyboard('menu:main'))
 
@@ -2540,7 +2540,7 @@ async def cmd_matchreplay(m:Message):
             LEFT JOIN players p ON p.id=e.player_id
             LEFT JOIN players sp ON sp.id=e.secondary_player_id
             WHERE e.match_id=:m AND e.event_type IN ('PASS','CARRY','PRESSURE','TACKLE','INTERCEPTION','SHOT','GOAL')
-            ORDER BY minute,id'''),{'m':row['id']})).mappings().all() if row else []
+            ORDER BY e.minute,e.id'''),{'m':row['id']})).mappings().all() if row else []
     if not row: return await m.answer('Матчей пока нет.')
     key_events=[dict(r) for r in raw if (r.get('metadata') or {}).get('visual_type')]
     if not key_events: return await m.answer('В этом матче ещё нет визуализируемых событий.')

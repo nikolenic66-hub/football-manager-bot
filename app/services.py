@@ -88,7 +88,7 @@ async def start_league(s, user_id):
                 'Подготовьтесь к матчу. Отдельного уведомления о стартовом свистке не будет.',
                 f'match-start-10:{league["id"]}:{f.round_no}:{cid}',kickoff-timedelta(minutes=10))
     total=max(f.round_no for f in fixtures)
-    await s.execute(text("UPDATE leagues SET status='ACTIVE',current_round=1,total_rounds=:r,started_at=:started WHERE id=:l"),
+    await s.execute(text("UPDATE leagues SET status='ACTIVE',current_round=1,total_rounds=:r,started_at=CAST(:started AS timestamptz) WHERE id=:l"),
                      {'r':total,'started':season_start,'l':league['id']})
     return league['id'],len(fixtures),total
 
@@ -481,7 +481,7 @@ async def start_round_halftime(s, league_id, round_no):
         hs,as_,events=simulate_first_half(home,away,ht,at,m['seed']*2+1,hc,ac,hb,ab)
         kickoff=m.get('scheduled_at') or now
         phase_start=min(kickoff, now)
-        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=:hx,away_xg=:ax,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=:phase_start,halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,:phase_start),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'hx':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[0]*0.48),2),'ax':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[1]*0.48),2),'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots]})})
+        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=:hx,away_xg=:ax,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=CAST(:phase_start AS timestamptz),halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,CAST(:phase_start AS timestamptz)),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'hx':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[0]*0.48),2),'ax':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[1]*0.48),2),'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots]})})
         await _save_lineup_and_tactics(s,m['id'],m['home_club_id'],home,ht); await _save_lineup_and_tactics(s,m['id'],m['away_club_id'],away,at)
         home_ids={p.name:p.id for p in home}; away_ids={p.name:p.id for p in away}
         for e in events:
@@ -561,7 +561,7 @@ async def _prepare_second_half_live(s, match, phase_start_at=None):
     hx,ax=expected_goals(home,away,ht,at)
     phase_start_at = phase_start_at or datetime.now(timezone.utc)
     await s.execute(text("""UPDATE matches SET current_minute=45,live_phase='SECOND_HALF',halftime_locked=FALSE,
-        second_half_started_at=:start_at,phase_started_at=:start_at,halftime_ends_at=NULL,second_half_data=:data,
+        second_half_started_at=CAST(:start_at AS timestamptz),phase_started_at=CAST(:start_at AS timestamptz),halftime_ends_at=NULL,second_half_data=:data,
         home_xg=ROUND((COALESCE(home_xg,0)+:hx*0.52)::numeric,2),
         away_xg=ROUND((COALESCE(away_xg,0)+:ax*0.52)::numeric,2) WHERE id=:m"""),
         {'m':match['id'],'hs':int(match['home_halftime_score'] or 0),'as_':int(match['away_halftime_score'] or 0),'hx':hx,'ax':ax,'data':json.dumps(data),'start_at':phase_start_at})
@@ -668,7 +668,7 @@ async def advance_live_matches(s, league_id=None):
             if elapsed>=LIVE_FIRST_HALF_SECONDS:
                 first_half_end=phase_start+timedelta(seconds=LIVE_FIRST_HALF_SECONDS)
                 end=first_half_end+timedelta(seconds=LIVE_HALFTIME_SECONDS)
-                await s.execute(text("UPDATE matches SET current_minute=45,live_phase='HALFTIME',halftime_locked=TRUE,halftime_ends_at=:end,phase_started_at=:phase WHERE id=:m"),{'end':end,'phase':first_half_end,'m':match['id']})
+                await s.execute(text("UPDATE matches SET current_minute=45,live_phase='HALFTIME',halftime_locked=TRUE,halftime_ends_at=CAST(:end AS timestamptz),phase_started_at=CAST(:phase AS timestamptz) WHERE id=:m"),{'end':end,'phase':first_half_end,'m':match['id']})
                 transitions.append((match['id'],'HALFTIME'))
         elif phase=='HALFTIME':
             end=match.get('halftime_ends_at')

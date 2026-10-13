@@ -434,11 +434,19 @@ def fixtures_screen(league_name, rows, out=None, size=(1300,900)):
         fill=(30,45,60) if status!='FINISHED' else (22,54,46)
         rounded(d,(40,y,1260,y+42),12,fill=fill,outline=(45,80,110),w=1)
         d.text((58,y+9),f"R{r.get('round')}" ,font=font(16,True),fill=(110,170,215))
-        d.text((125,y+9),str(r.get('home',''))[:27],font=font(17,True),fill=(240,245,250))
+        scheduled=r.get('scheduled_at')
+        if hasattr(scheduled,'strftime'):
+            schedule_text=scheduled.strftime('%d.%m %H:%M')
+        elif scheduled:
+            schedule_text=str(scheduled)[:16]
+        else:
+            schedule_text='дата не назначена'
+        d.text((115,y+9),schedule_text,font=font(13,True),fill=(165,185,205))
+        d.text((255,y+9),str(r.get('home',''))[:22],font=font(17,True),fill=(240,245,250))
         score=f"{r.get('home_score')} : {r.get('away_score')}" if status=='FINISHED' else '—'
-        text_center(d,(650,y+21),score,font(17,True),(255,215,90) if status=='FINISHED' else (140,165,190))
-        d.text((750,y+9),str(r.get('away',''))[:27],font=font(17,True),fill=(240,245,250))
-        d.text((1130,y+9),status,font=font(13,True),fill=(110,185,155) if status=='FINISHED' else (130,155,180))
+        text_center(d,(730,y+21),score,font(17,True),(255,215,90) if status=='FINISHED' else (140,165,190))
+        d.text((825,y+9),str(r.get('away',''))[:22],font=font(17,True),fill=(240,245,250))
+        d.text((1135,y+9),status,font=font(13,True),fill=(110,185,155) if status=='FINISHED' else (130,155,180))
     if out is None: out=ASSET/'fixtures_screen.png'
     im.save(out,optimize=True); return out
 
