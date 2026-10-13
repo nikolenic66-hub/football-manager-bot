@@ -1,5 +1,7 @@
 """Download and normalize approved Wikimedia Commons portrait sources."""
 from pathlib import Path
+from urllib.parse import urlparse
+import hashlib
 import asyncio, json, io, logging
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -15,9 +17,15 @@ logger=logging.getLogger(__name__)
 
 
 def download_bytes(url):
+    parsed=urlparse(url)
+    if parsed.scheme != 'https' or parsed.netloc != 'upload.wikimedia.org':
+        raise ValueError('portrait URL must use https://upload.wikimedia.org')
     req=Request(url,headers={'User-Agent':UA})
     with urlopen(req,timeout=8) as r:
-        return r.read()
+        data=r.read()
+    if len(data) <= 5 * 1024:
+        raise ValueError(f'portrait file is too small: {len(data)} bytes')
+    return data
 
 
 def normalize(data):
@@ -39,20 +47,19 @@ async def main():
             for item in manifest:
                 pid=int(item['player_id']); url=item.get('url')
                 path=OUT/f'{pid}_real.png'
-                if path.exists():
-                    if url:
-                        await s.execute(text('''UPDATE players SET portrait_url=:url,portrait_source=:source,portrait_license=:license WHERE id=:id'''),{
-                            'url':str(path.relative_to(ROOT)),'source':item.get('source') or 'wikimedia_commons','license':item.get('license') or 'verify-on-source','id':pid})
-                        await s.commit()
-                    skipped+=1; continue
                 if not url:
+                    skipped+=1; continue
+                url_hash=hashlib.sha256(url.encode('utf-8')).hexdigest()
+                row=(await s.execute(text('SELECT portrait_url_hash FROM players WHERE id=:id'),{'id':pid})).first()
+                stored_hash=row[0] if row else None
+                if path.exists() and stored_hash == url_hash:
                     skipped+=1; continue
                 try:
                     data=await asyncio.to_thread(download_bytes,url)
                     image=normalize(data)
                     image.save(path,format='PNG',optimize=True)
-                    await s.execute(text('''UPDATE players SET portrait_url=:url,portrait_source=:source,portrait_license=:license WHERE id=:id'''),{
-                        'url':str(path.relative_to(ROOT)),'source':item.get('source') or 'wikimedia_commons','license':item.get('license') or 'verify-on-source','id':pid})
+                    await s.execute(text('''UPDATE players SET portrait_url=:url,portrait_source=:source,portrait_license=:license,portrait_url_hash=:url_hash WHERE id=:id'''),{
+                        'url':str(path.relative_to(ROOT)),'source':item.get('source') or 'wikimedia_commons','license':item.get('license') or 'verify-on-source','url_hash':url_hash,'id':pid})
                     await s.commit()
                     downloaded+=1
                     logger.info('Portrait real downloaded: player_id=%s name=%s',pid,item.get('name'))

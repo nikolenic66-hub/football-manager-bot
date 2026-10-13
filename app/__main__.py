@@ -8,7 +8,7 @@ logger=logging.getLogger(__name__)
 
 async def _portrait_warmup():
     # Run outside the polling loop so cold-start image preparation never blocks the bot.
-    for module in ('scripts.build_portraits','scripts.load_real_portraits'):
+    for module in ('scripts.build_portraits','scripts.load_real_portraits','scripts.build_crests'):
         logger.info('Portrait warmup starting: %s',module)
         try:
             proc=await asyncio.create_subprocess_exec(sys.executable,'-m',module)

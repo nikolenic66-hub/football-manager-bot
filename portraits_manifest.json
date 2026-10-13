@@ -82,10 +82,11 @@
   {
     "player_id": 11,
     "name": "Didier Drogba",
-    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b7/Didier_Drogba_(2019).jpg",
+    "url": "https://upload.wikimedia.org/wikipedia/commons/0/0a/Drogba_chelsea.jpg",
     "source": "wikimedia_commons",
-    "license": "CC-BY-SA-4.0",
-    "check": true
+    "license": "CC-BY-2.0",
+    "check": true,
+    "refresh": true
   },
   {
     "player_id": 12,

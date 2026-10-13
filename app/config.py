@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     bot_token: str
     database_url: str
     log_level: str = 'INFO'
+    admin_id: int = 6521319127
 
     @field_validator('bot_token')
     @classmethod

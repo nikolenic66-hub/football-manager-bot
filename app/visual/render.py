@@ -7,8 +7,8 @@ from app.game.ratings import player_rating
 
 ROOT=Path(__file__).resolve().parents[2]
 ASSET=ROOT/'assets'/'visual'
-CARD_DIR=ASSET/'cards'; FORM_DIR=ASSET/'formations'; CLUB_DIR=ASSET/'clubs'
-for p in (CARD_DIR,FORM_DIR,CLUB_DIR): p.mkdir(parents=True,exist_ok=True)
+CARD_DIR=ASSET/'cards'; FORM_DIR=ASSET/'formations'; CLUB_DIR=ASSET/'clubs'; CREST_DIR=ASSET/'crests'
+for p in (CARD_DIR,FORM_DIR,CLUB_DIR,CREST_DIR): p.mkdir(parents=True,exist_ok=True)
 FONT='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 FONT_B='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
 RARITY={'BASE':((45,55,68),(120,135,150)),'RARE':((15,72,42),(75,220,120)),'EPIC':((58,24,86),(205,95,255)),'LEGENDARY':((76,53,12),(255,215,80))}
@@ -51,6 +51,16 @@ def player_card(player,out=None,size=(620,860)):
                 portrait_path=candidate
                 break
 
+    crest_path = player.get('crest_path')
+    if crest_path is None and player.get('club_id') is not None:
+        crest_path = CREST_DIR / f"{int(player.get('club_id'))}.png"
+    if crest_path:
+        crest_path = Path(crest_path)
+        if not crest_path.is_absolute():
+            crest_path = ROOT / crest_path
+        if not crest_path.exists():
+            crest_path = None
+
     overall=player.get('overall')
     if overall is None:
         attrs={k:int(player.get(k) or 0) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
@@ -73,7 +83,11 @@ def player_card(player,out=None,size=(620,860)):
         player.get('nationality'),rarity,overall_text,
         player.get('pace'),player.get('shooting'),player.get('passing'),player.get('dribbling'),
         player.get('defending'),player.get('physical'),player.get('stamina'),player.get('mental'),
-        portrait_signature,size,
+        portrait_signature,
+        str(crest_path),
+        (crest_path.stat().st_mtime_ns,crest_path.stat().st_size)
+        if crest_path and crest_path.exists() else None,
+        size,
     )).encode()).hexdigest()
     cache_meta=out.with_suffix(out.suffix+'.sha256')
     if out.exists() and cache_meta.exists() and cache_meta.read_text(encoding='ascii')==fingerprint:
@@ -162,6 +176,15 @@ def player_card(player,out=None,size=(620,860)):
 
     ment=int(player.get('mental') or 0)
     text_center(d,(W//2,748),f'MENT  {ment}',font(17,True),accent)
+
+    # Club crest is optional: missing assets are intentionally left blank.
+    if crest_path:
+        try:
+            cr=Image.open(crest_path).convert('RGBA')
+            cr.thumbnail((74,74),Image.Resampling.LANCZOS)
+            im.paste(cr,(W-112,H-100),cr)
+        except Exception:
+            pass
 
     im.save(out,format='PNG',optimize=True)
     cache_meta.write_text(fingerprint,encoding='ascii')
@@ -324,6 +347,13 @@ def league_table_screen(league_name, rows, out=None, size=(1200,800)):
         y=145+(i-1)*50
         if i==1: rounded(d,(35,y-7,1165,y+35),12,fill=(44,48,26),outline=(175,145,50),w=1)
         d.text((xs[0],y),str(i),font=font(19,True),fill=(245,245,245))
+        crest_path=CREST_DIR/f"{int(r['club_id'])}.png" if r.get('club_id') is not None else None
+        if crest_path and crest_path.exists():
+            try:
+                cr=Image.open(crest_path).convert('RGBA'); cr.thumbnail((30,30),Image.Resampling.LANCZOS)
+                im.paste(cr,(xs[1]-38,y-5),cr)
+            except Exception:
+                pass
         d.text((xs[1],y),str(r['name'])[:30],font=font(18,True),fill=(240,245,250))
         vals=[r['played'],r['wins'],r['draws'],r['losses'],r['goals_for'],r['goals_against'],r['points']]
         for x,v in zip(xs[2:],vals): d.text((x,y),str(v),font=font(18,True),fill=(205,220,235))
@@ -334,8 +364,7 @@ def league_table_screen(league_name, rows, out=None, size=(1200,800)):
 def club_dashboard(club, out=None, size=(1200,760)):
     im=Image.new('RGB',size,(4,10,22)); d=ImageDraw.Draw(im)
     rounded(d,(18,18,size[0]-18,size[1]-18),30,fill=(8,21,39),outline=(36,133,215),w=3)
-    crest_path=CLUB_DIR/f"club_{club.get('id',0)}.png"
-    if not crest_path.exists(): club_crest(club.get('name','CLUB'),club.get('id',0),crest_path)
+    crest_path=CREST_DIR/f"{int(club.get('id',0))}.png"
     try:
         cr=Image.open(crest_path).convert('RGBA').resize((250,250)); im.paste(cr,(70,95),cr)
     except Exception: pass
