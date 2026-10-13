@@ -115,3 +115,37 @@ def test_kickoff_cancels_stale_ten_minute_reminders():
     block=source[start:end]
     assert 'UPDATE notifications SET cancelled_at=COALESCE(cancelled_at,now())' in block
     assert "match-start-10:{league_id}:{round_no}:%" in block
+
+
+def test_start_round_halftime_has_no_telegram_user_lookup_dependency():
+    source=(ROOT/'app'/'services.py').read_text(encoding='utf-8')
+    start=source.index('async def start_round_halftime')
+    end=source.index('async def change_halftime_tactics', start)
+    block=source[start:end]
+    assert 'current_club(' not in block
+    assert 'club_by_tg(' not in block
+    assert "m['home_club_id']" in block
+    assert "m['away_club_id']" in block
+
+
+def test_playround_callback_passes_real_telegram_user():
+    source=(ROOT/'app'/'bot.py').read_text(encoding='utf-8')
+    block=source[source.index("@router.callback_query(F.data=='league:play')"):]
+    block=block[:block.index("@router.callback_query", 10)]
+    assert 'await cmd_playround(c.message, from_user=c.from_user)' in block
+
+
+def test_live_worker_logs_due_started_and_failed_counts():
+    source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    assert 'due_matches=%s started_rounds=%s failed_rounds=%s' in source
+    assert 'logger.exception(\'Failed to start due match round' in source
+
+
+
+def test_finance_helper_resolves_club_by_telegram_id():
+    source=(ROOT/'app'/'bot.py').read_text(encoding='utf-8')
+    start=source.index('async def _show_finance')
+    end=source.index('def _finance_keyboard', start) if 'def _finance_keyboard' in source[start:] else start+700
+    block=source[start:end]
+    assert 'club_by_tg(s,telegram_id)' in block
+    assert 'current_club(s,telegram_id)' not in block

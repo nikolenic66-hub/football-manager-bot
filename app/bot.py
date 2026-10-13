@@ -350,9 +350,9 @@ async def cmd_join(m:Message):
     await m.answer(f'✅ Вы вступили в лигу <b>{league.name}</b>.')
 
 @router.message(Command('startleague'))
-async def cmd_startleague(m:Message):
+async def cmd_startleague(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         lt=(await s.execute(text('''SELECT l.id,l.name,l.creator_user_id FROM leagues l JOIN league_teams t ON t.league_id=l.id
             WHERE t.club_id=:c AND l.status='WAITING' ORDER BY l.id DESC LIMIT 1'''),{'c':c['id']})).first() if c else None
         if not lt:return await m.answer('Не найдена ожидающая лига.')
@@ -365,9 +365,9 @@ async def cmd_startleague(m:Message):
     await m.answer(f'🚦 Сезон <b>{lt.name}</b> начался! Теперь можно использовать /playround.')
 
 @router.message(Command('playround'))
-async def cmd_playround(m:Message):
+async def cmd_playround(m:Message, from_user=None):
     async with SessionLocal() as s:
-        uid=await current_user(s,m); c=await current_club(s,uid)
+        uid=await current_user(s,m,from_user); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         if not league or league['status']!='ACTIVE':return await m.answer('У клуба нет активной лиги.')
@@ -944,9 +944,9 @@ def _finance_stadium_keyboard():
     return k.as_markup()
 
 
-async def _show_finance(message, uid):
+async def _show_finance(message, telegram_id):
     async with SessionLocal() as s:
-        c=await current_club(s,uid)
+        c=await club_by_tg(s,telegram_id)
         if not c:return await message.answer('Сначала создайте клуб.')
         league=await active_league(s,c['id'])
         summary,recent=await financial_report(s,c['id'],league['id'] if league else None)
@@ -2086,13 +2086,13 @@ async def league_join_code(m:Message, state:FSMContext):
 @router.callback_query(F.data=='league:start')
 async def cb_league_start(c:CallbackQuery):
     await c.answer()
-    await cmd_startleague(c.message)
+    await cmd_startleague(c.message, from_user=c.from_user)
 
 
 @router.callback_query(F.data=='league:play')
 async def cb_league_play(c:CallbackQuery):
     await c.answer()
-    await cmd_playround(c.message)
+    await cmd_playround(c.message, from_user=c.from_user)
 
 
 @router.callback_query(F.data=='league:table')

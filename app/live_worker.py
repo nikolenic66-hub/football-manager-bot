@@ -10,23 +10,32 @@ IMPORTANT_LIVE_EVENTS={'GOAL','ASSIST','SHOT','YELLOW','RED','INJURY','SUBSTITUT
 DANGEROUS_SHOT_RESULTS={'GOAL','SAVED','BLOCKED'}
 
 async def start_due_rounds(s):
-    rows=(await s.execute(text("""SELECT id,league_id,round
-        FROM matches WHERE status='SCHEDULED' AND scheduled_at IS NOT NULL AND scheduled_at<=now()
-        ORDER BY league_id,round,id FOR UPDATE SKIP LOCKED"""))).mappings().all()
+    rows=(await s.execute(text("""SELECT m.id,m.league_id,m.round
+        FROM matches m
+        WHERE m.status='SCHEDULED'
+          AND m.scheduled_at IS NOT NULL
+          AND m.scheduled_at<=now()
+        ORDER BY m.league_id,m.round,m.id
+        FOR UPDATE OF m SKIP LOCKED"""))).mappings().all()
     started=[]
+    failed=0
     seen=set()
     for row in rows:
         key=(row['league_id'],row['round'])
         if key in seen: continue
         seen.add(key)
         try:
-            data=await start_round_halftime(s,row['league_id'],row['round'])
+            async with s.begin_nested():
+                data=await start_round_halftime(s,row['league_id'],row['round'])
             started.append((row['league_id'],row['round'],data))
-        except ValueError:
-            continue
-    if started:
-        logger.info('Started %s due match rounds: %s', len(started), [(x[0], x[1]) for x in started])
-    return started
+        except ValueError as exc:
+            failed += 1
+            logger.warning('Could not start due match round league=%s round=%s: %s', row['league_id'], row['round'], exc)
+        except Exception:
+            failed += 1
+            logger.exception('Failed to start due match round league=%s round=%s', row['league_id'], row['round'])
+    logger.info('Live kickoff check: due_matches=%s started_rounds=%s failed_rounds=%s', len(rows), len(started), failed)
+    return started,len(started),len(rows),failed
 
 async def queue_live_event_notifications(s, match_id):
     row=(await s.execute(text('''SELECT m.id,m.current_minute,m.home_score,m.away_score,
@@ -117,15 +126,17 @@ async def live_worker(bot):
             await lock_conn.close()
             return
         due_check_at=0.0
+        due_count=started_count=due_failed=0
         loop=asyncio.get_running_loop()
         while True:
             try:
                 async with SessionLocal() as s:
                     now_mono=loop.time()
                     if now_mono >= due_check_at:
-                        await start_due_rounds(s)
+                        _, started_count, due_count, due_failed = await start_due_rounds(s)
                         due_check_at=now_mono+30.0
                     transitions,finished=await advance_live_matches(s)
+                    logger.info('Live worker iteration: due_matches=%s started_rounds=%s failed_rounds=%s live_transitions=%s finished=%s', due_count, started_count, due_failed, len(transitions), len(finished))
                     live_ids=(await s.execute(text("SELECT id FROM matches WHERE status='LIVE' ORDER BY id LIMIT 25"))).scalars().all()
                     for mid in live_ids:
                         await queue_live_event_notifications(s,mid)
