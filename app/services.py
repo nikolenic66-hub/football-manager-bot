@@ -1,5 +1,6 @@
 from secrets import token_urlsafe
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 from app.game.engine import simulate_match, expected_goals
@@ -10,6 +11,12 @@ from app.models import Player
 from app.game.economy import calculate_match_economy, sponsor_income, wage_bill, prize_money, stadium_capacity, TICKET_MIN, TICKET_MAX
 
 PLAYER_FIELDS='id,first_name,last_name,position,age,pace,shooting,passing,dribbling,defending,physical,stamina,mental,talents'
+
+_SUFFIX_RE = re.compile(r'\s+\d{4}$')
+
+
+def clean_display_name(name: str) -> str:
+    return _SUFFIX_RE.sub('', name or '')
 
 
 def row_player(r):
