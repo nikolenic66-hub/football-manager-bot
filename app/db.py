@@ -15,6 +15,110 @@ engine = create_async_engine(
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split PostgreSQL SQL without breaking quoted strings or dollar blocks.
+
+    Migrations may contain ordinary semicolon-separated statements as well as
+    PL/pgSQL blocks such as DO $$ ... END $$;. SQLAlchemy's asyncpg prepared
+    execution path accepts one statement at a time, so keep the splitter here
+    instead of relying on driver-specific multi-statement behavior.
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+    quote: str | None = None
+    dollar_tag: str | None = None
+    line_comment = False
+    block_comment = False
+
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ''
+
+        if line_comment:
+            buf.append(ch)
+            if ch == '\n':
+                line_comment = False
+            i += 1
+            continue
+
+        if block_comment:
+            buf.append(ch)
+            if ch == '*' and nxt == '/':
+                buf.append(nxt)
+                i += 2
+                block_comment = False
+                continue
+            i += 1
+            continue
+
+        if dollar_tag is not None:
+            if sql.startswith(dollar_tag, i):
+                buf.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+            else:
+                buf.append(ch)
+                i += 1
+            continue
+
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                if nxt == quote:
+                    buf.append(nxt)
+                    i += 2
+                    continue
+                quote = None
+            elif ch == '\\' and quote == "'" and i + 1 < n:
+                buf.append(nxt)
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if ch == '-' and nxt == '-':
+            buf.extend((ch, nxt))
+            i += 2
+            line_comment = True
+            continue
+        if ch == '/' and nxt == '*':
+            buf.extend((ch, nxt))
+            i += 2
+            block_comment = True
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '$':
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] == '_'):
+                j += 1
+            if j < n and sql[j] == '$':
+                dollar_tag = sql[i:j + 1]
+                buf.append(dollar_tag)
+                i = j + 1
+                continue
+        if ch == ';':
+            statement = ''.join(buf).strip()
+            if statement:
+                statements.append(statement)
+            buf.clear()
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    statement = ''.join(buf).strip()
+    if statement:
+        statements.append(statement)
+    return statements
+
+
 async def init_db():
     """Apply versioned SQL migrations once.
 
@@ -51,7 +155,9 @@ async def init_db():
             version = int(migration.stem.split('_', 1)[0])
             if version in applied:
                 continue
-            await conn.exec_driver_sql(migration.read_text(encoding='utf-8'))
+            sql = migration.read_text(encoding='utf-8')
+            for statement in _split_sql_statements(sql):
+                await conn.execute(text(statement))
             await conn.execute(
                 text('INSERT INTO schema_migrations(version,filename) VALUES(:v,:f)'),
                 {'v': version, 'f': migration.name},
