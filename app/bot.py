@@ -458,7 +458,7 @@ async def cmd_matchimage(m:Message):
         row=(await s.execute(text("""SELECT m.id,m.home_score,m.away_score,m.home_xg,m.away_xg,h.name home,a.name away
             FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
             WHERE m.status='FINISHED' AND (m.home_club_id=:c OR m.away_club_id=:c) ORDER BY m.id DESC LIMIT 1"""),{'c':c['id']})).mappings().first()
-        events=(await s.execute(text('SELECT minute,event_type,description,metadata FROM match_events WHERE match_id=:m ORDER BY minute,id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
+        events=(await s.execute(text('SELECT e.minute,e.event_type,e.description,e.metadata FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
     if not row:return await m.answer('Завершённых матчей пока нет.')
     path=match_center(row['home'],row['away'],row['home_score'] or 0,row['away_score'] or 0,float(row['home_xg'] or 0),float(row['away_xg'] or 0),events)
     await m.answer_photo(FSInputFile(path),caption=f'📺 <b>{row["home"]} {row["home_score"]}:{row["away_score"]} {row["away"]}</b>')
@@ -689,7 +689,7 @@ async def cmd_matchcenter(m:Message, from_user=None):
                         FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.id=:m'''),{'m':row['id']})).mappings().first()
                 except ValueError:
                     await s.rollback()
-        events=(await s.execute(text('SELECT minute,description FROM match_events WHERE match_id=:m ORDER BY minute,id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
+        events=(await s.execute(text('SELECT e.minute,e.description FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
     if not row:return await m.answer('Матчей пока нет.')
     path=match_center(row['home'],row['away'],row['home_score'] or 0,row['away_score'] or 0,float(row['home_xg'] or 0),float(row['away_xg'] or 0),events)
     state='LIVE' if row['status']=='LIVE' else row['status']
@@ -2506,7 +2506,7 @@ async def cmd_dynamicmatch(m:Message):
             LEFT JOIN match_tactics th ON th.match_id=m.id AND th.club_id=m.home_club_id
             LEFT JOIN match_tactics ta ON ta.match_id=m.id AND ta.club_id=m.away_club_id
             WHERE m.home_club_id=:c OR m.away_club_id=:c ORDER BY m.id DESC LIMIT 1"""),{'c':c['id']})).mappings().first()
-        events=(await s.execute(text('SELECT minute,event_type,description,metadata FROM match_events WHERE match_id=:m ORDER BY minute,id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
+        events=(await s.execute(text('SELECT e.minute,e.event_type,e.description,e.metadata FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
     if not row: return await m.answer('Матчей пока нет.')
     hp=row['home_pressing'] or 50; ap=row['away_pressing'] or 50
     phase='PRESSING' if hp-ap>=12 else ('COUNTER' if ap-hp>=12 else 'POSSESSION')
@@ -2564,7 +2564,7 @@ async def cmd_matchmap(m:Message):
             LEFT JOIN match_tactics th ON th.match_id=m.id AND th.club_id=m.home_club_id
             LEFT JOIN match_tactics ta ON ta.match_id=m.id AND ta.club_id=m.away_club_id
             WHERE m.home_club_id=:c OR m.away_club_id=:c ORDER BY CASE WHEN m.status='LIVE' THEN 0 ELSE 1 END,m.id DESC LIMIT 1"""),{'c':c['id']})).mappings().first()
-        events=(await s.execute(text('SELECT minute,description FROM match_events WHERE match_id=:m ORDER BY minute,id LIMIT 20'),{'m':row['id']})).mappings().all() if row else []
+        events=(await s.execute(text('SELECT e.minute,e.description FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id LIMIT 20'),{'m':row['id']})).mappings().all() if row else []
     if not row:
         return await m.answer('Матчей пока нет.')
     home_control=.5

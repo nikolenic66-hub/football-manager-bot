@@ -10,7 +10,7 @@ from app.game.positions import POSITION_LABELS_RU
 from app.models import Player
 from app.game.economy import calculate_match_economy, sponsor_income, wage_bill, prize_money, stadium_capacity, TICKET_MIN, TICKET_MAX
 
-PLAYER_FIELDS='id,first_name,last_name,position,age,pace,shooting,passing,dribbling,defending,physical,stamina,mental,talents'
+PLAYER_FIELDS='p.id,p.first_name,p.last_name,p.position,p.age,p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental,p.talents'
 
 
 def row_player(r):
@@ -612,7 +612,7 @@ async def _finish_live_match(s, match):
             await s.execute(text('UPDATE club_players SET suspension_matches=GREATEST(suspension_matches,1) WHERE club_id=:c AND player_id=:p'),{'c':e['club_id'],'p':e['player_id']})
             await queue_club_notification(s,e['club_id'],'DISCIPLINE','🟥 Удаление',f'{pname} получил красную карточку и пропустит следующий матч.',f'red:{match["id"]}:{e["player_id"]}')
     # Persist live player ratings/MOTM inputs before the match becomes FINISHED.
-    events=(await s.execute(text('SELECT minute,player_id,secondary_player_id,event_type FROM match_events WHERE match_id=:m ORDER BY id'), {'m':match['id']})).mappings().all()
+    events=(await s.execute(text('SELECT e.minute,e.player_id,e.secondary_player_id,e.event_type FROM match_events e WHERE e.match_id=:m ORDER BY e.id'), {'m':match['id']})).mappings().all()
     home_ids=set(data.get('home_players',[])); away_ids=set(data.get('away_players',[]))
     for minute,off_id,on_id,team in data.get('substitutions',[]):
         (home_ids if team=='HOME' else away_ids).add(int(on_id))
@@ -620,7 +620,7 @@ async def _finish_live_match(s, match):
     motm_player_id=None
     motm_rating=-1.0
     if player_ids:
-        prs=(await s.execute(text(f"SELECT {PLAYER_FIELDS} FROM players WHERE id=ANY(:ids)"), {'ids':list(player_ids)})).mappings().all()
+        prs=(await s.execute(text(f"SELECT {PLAYER_FIELDS} FROM players p WHERE p.id=ANY(:ids)"), {'ids':list(player_ids)})).mappings().all()
         for pr in prs:
             p_obj=row_player(pr)
             goals=sum(1 for e in events if e['player_id']==p_obj.id and e['event_type']=='GOAL')

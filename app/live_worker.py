@@ -10,20 +10,35 @@ IMPORTANT_LIVE_EVENTS={'GOAL','ASSIST','SHOT','YELLOW','RED','INJURY','SUBSTITUT
 DANGEROUS_SHOT_RESULTS={'GOAL','SAVED','BLOCKED'}
 
 async def start_due_rounds(s):
-    rows=(await s.execute(text("""SELECT m.id,m.league_id,m.round
+    # `leagues.current_round` is the next round that is allowed to start.
+    # Later rounds may already be overdue in the calendar, but they must wait
+    # until the current round is finished and finalize_live_round advances it.
+    rows=(await s.execute(text("""SELECT m.id,m.league_id,m.round,l.current_round
         FROM matches m
+        JOIN leagues l ON l.id=m.league_id
         WHERE m.status='SCHEDULED'
           AND m.scheduled_at IS NOT NULL
           AND m.scheduled_at<=now()
+          AND l.status='ACTIVE'
         ORDER BY m.league_id,m.round,m.id
         FOR UPDATE OF m SKIP LOCKED"""))).mappings().all()
     started=[]
     failed=0
+    skipped=0
     seen=set()
     for row in rows:
         key=(row['league_id'],row['round'])
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key)
+        expected=row['current_round']
+        if row['round'] != expected:
+            skipped += 1
+            logger.info(
+                'Skipping due match round league=%s round=%s: waiting for round %s',
+                row['league_id'],row['round'],expected
+            )
+            continue
         try:
             async with s.begin_nested():
                 data=await start_round_halftime(s,row['league_id'],row['round'])
@@ -34,7 +49,10 @@ async def start_due_rounds(s):
         except Exception:
             failed += 1
             logger.exception('Failed to start due match round league=%s round=%s', row['league_id'], row['round'])
-    logger.info('Live kickoff check: due_matches=%s started_rounds=%s failed_rounds=%s', len(rows), len(started), failed)
+    logger.info(
+        'Live kickoff check: due_matches=%s started_rounds=%s failed_rounds=%s skipped_rounds=%s',
+        len(rows),len(started),failed,skipped
+    )
     return started,len(started),len(rows),failed
 
 async def queue_live_event_notifications(s, match_id):
@@ -44,8 +62,8 @@ async def queue_live_event_notifications(s, match_id):
         FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
         WHERE m.id=:m FOR UPDATE'''),{'m':match_id})).mappings().first()
     if not row: return
-    events=(await s.execute(text('''SELECT id,minute,event_type,description,club_id,player_id,secondary_player_id,metadata
-        FROM match_events WHERE match_id=:m AND id>:cursor AND minute<=:minute ORDER BY id'''),
+    events=(await s.execute(text('''SELECT e.id,e.minute,e.event_type,e.description,e.club_id,e.player_id,e.secondary_player_id,e.metadata
+        FROM match_events e WHERE e.match_id=:m AND e.id>:cursor AND e.minute<=:minute ORDER BY e.id'''),
         {'m':match_id,'cursor':row['live_event_cursor'],'minute':row['current_minute']})).mappings().all()
     if not events: return
     player_ids={x['secondary_player_id'] for x in events if x['secondary_player_id']}
@@ -56,8 +74,8 @@ async def queue_live_event_notifications(s, match_id):
     # Load the goal history once per worker tick; do not issue one SQL query per
     # Telegram event. This keeps live rounds cheap even with several matches.
     max_event_id=max(e['id'] for e in events)
-    goal_rows=(await s.execute(text('''SELECT id,club_id FROM match_events
-        WHERE match_id=:m AND event_type='GOAL' AND id<=:id AND minute<=:minute ORDER BY id'''),
+    goal_rows=(await s.execute(text('''SELECT e.id,e.club_id FROM match_events e
+        WHERE e.match_id=:m AND e.event_type='GOAL' AND e.id<=:id AND e.minute<=:minute ORDER BY e.id'''),
         {'m':match_id,'id':max_event_id,'minute':row['current_minute']})).mappings().all()
     goal_prefix={}
     gh=ga=0; gi=0
