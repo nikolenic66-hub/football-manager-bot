@@ -18,6 +18,7 @@ from .db import SessionLocal
 from .repositories import get_or_create_user, create_club
 from .services import create_league, join_league, start_league, start_round_halftime, schedule_round, change_halftime_tactics, market_players, buy_player, sell_player, set_player_instruction, get_tactical_board, set_starting_lineup, plan_substitution, scout_opponent, next_opponent, set_counterplan, set_ticket_price, upgrade_stadium, financial_report, set_training_plan, train_squad, renew_contract, set_player_expectation, list_player_for_transfer, cancel_transfer_listing, make_transfer_offer, accept_transfer_offer, player_management_report, notification_list, notification_unread_count, mark_notifications_read, set_notification_preference, notification_preferences, build_starting_lineup
 from .game.ratings import player_rating
+from .game.tactics import Tactics, Style, STYLE_SLIDERS
 from .game.economy import STADIUM_CAPACITY_STEP
 from .game.board import FORMATION_SLOTS
 from .handlers.admin import admin_router

@@ -149,3 +149,31 @@ def test_finance_helper_resolves_club_by_telegram_id():
     block=source[start:end]
     assert 'club_by_tg(s,telegram_id)' in block
     assert 'current_club(s,telegram_id)' not in block
+
+
+def test_live_match_rating_import_is_present():
+    source=(ROOT/'app'/'services.py').read_text(encoding='utf-8')
+    assert 'from app.game.ratings import player_rating' in source
+    start=source.index('async def _finish_live_match')
+    end=source.index('async def advance_live_matches', start)
+    block=source[start:end]
+    assert 'player_rating(p_obj)' in block
+
+
+def test_bot_imports_style_sliders_used_by_style_handlers():
+    source=(ROOT/'app'/'bot.py').read_text(encoding='utf-8')
+    assert 'from .game.tactics import Tactics, Style, STYLE_SLIDERS' in source
+    assert 'STYLE_SLIDERS[style_enum]' in source
+    assert 'STYLE_SLIDERS[style]' in source
+
+
+def test_live_worker_has_failure_backoff_and_recovery():
+    source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    assert 'consecutive_failures=0' in source
+    assert 'last_failure_signature=None' in source
+    assert "signature=f'{type(exc).__name__}:{exc}'" in source
+    assert 'if consecutive_failures < 3:' in source
+    assert 'sleep_for=60.0 if consecutive_failures == 3 else 120.0' in source
+    assert 'now_mono-last_failure_log_at >= 60.0' in source
+    assert 'consecutive_failures=0' in source
+    assert 'Live worker recovered after %s consecutive failures.' in source

@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 from app.game.engine import simulate_match, expected_goals
+from app.game.ratings import player_rating
 from app.game.tactics import Tactics, Style
 from app.game.league import round_robin
 from app.game.board import FORMATION_SLOTS

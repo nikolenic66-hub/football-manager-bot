@@ -145,8 +145,12 @@ async def live_worker(bot):
             return
         due_check_at=0.0
         due_count=started_count=due_failed=0
+        consecutive_failures=0
+        last_failure_signature=None
+        last_failure_log_at=0.0
         loop=asyncio.get_running_loop()
         while True:
+            sleep_for=1.0
             try:
                 async with SessionLocal() as s:
                     now_mono=loop.time()
@@ -165,11 +169,36 @@ async def live_worker(bot):
                     await s.commit()
                 async with SessionLocal() as delivery_session:
                     await deliver_due_notifications(bot,delivery_session)
+                if consecutive_failures:
+                    logger.info('Live worker recovered after %s consecutive failures.', consecutive_failures)
+                consecutive_failures=0
+                last_failure_signature=None
+                last_failure_log_at=0.0
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception('Live worker iteration failed')
-            await asyncio.sleep(1)
+            except Exception as exc:
+                signature=f'{type(exc).__name__}:{exc}'
+                if signature == last_failure_signature:
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures=1
+                    last_failure_signature=signature
+                    last_failure_log_at=0.0
+                now_mono=loop.time()
+                if consecutive_failures < 3:
+                    if consecutive_failures == 1:
+                        logger.exception('Live worker iteration failed')
+                    else:
+                        logger.warning('Live worker iteration failed (%s/%s): %s', consecutive_failures, 3, exc)
+                    sleep_for=5.0
+                else:
+                    sleep_for=60.0 if consecutive_failures == 3 else 120.0
+                    if last_failure_log_at == 0.0 or now_mono-last_failure_log_at >= 60.0:
+                        logger.exception('Live worker iteration failed repeatedly (consecutive_failures=%s): %s', consecutive_failures, exc)
+                        last_failure_log_at=now_mono
+                    else:
+                        logger.warning('Live worker backoff active: consecutive_failures=%s sleep=%ss', consecutive_failures, int(sleep_for))
+            await asyncio.sleep(sleep_for)
     finally:
         try:
             await lock_conn.execute(text("SELECT pg_advisory_unlock(hashtext('football-manager-live-worker'))"))
