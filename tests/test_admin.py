@@ -37,3 +37,29 @@ def test_admin_destructive_callbacks_require_matching_confirmation_state():
     assert "AdminStates.league_delete_confirm.state" in source
     assert "AdminStates.training_all_confirm.state" in source
     assert "Подтверждение устарело. Начните заново." in source
+
+
+def test_admin_player_create_uses_single_transaction_and_reports_db_errors():
+    source = (ROOT / 'app' / 'handlers' / 'admin.py').read_text()
+    start = source.index('async def apc_pot')
+    end = source.index('# ---------------- clubs ----------------', start)
+    block = source[start:end]
+    assert 'async with SessionLocal() as s:' in block
+    assert "INSERT INTO admin_actions_log" in block
+    assert 'await s.commit()' in block
+    assert "logger.exception('Admin player create failed')" in block
+    assert 'Не удалось создать игрока' in block
+    assert 'await log_action(' not in block
+
+
+def test_admin_player_create_uses_single_transaction_and_reports_db_errors():
+    source = (ROOT / 'app' / 'handlers' / 'admin.py').read_text()
+    start = source.index('async def apc_pot')
+    end = source.index('# ---------------- clubs ----------------', start)
+    block = source[start:end]
+    assert 'async with SessionLocal() as s:' in block
+    assert 'INSERT INTO admin_actions_log' in block
+    assert 'await s.commit()' in block
+    assert "logger.exception('Admin player create failed')" in block
+    assert 'Не удалось создать игрока' in block
+    assert 'await log_action(' not in block

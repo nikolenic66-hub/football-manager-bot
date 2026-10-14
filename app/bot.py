@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import json
 from collections import defaultdict
 from aiogram import BaseMiddleware
 from aiogram import Bot, Dispatcher, Router, F
@@ -1805,8 +1806,10 @@ async def _refresh_contract_item(cq,pid):
 _LIVE_SCREENS: dict[int, asyncio.Task] = {}
 _LIVE_SCREEN_SIGNATURES: dict[tuple[int,int], str] = {}
 
-def _live_watch_keyboard(match_id, finished=False):
+def _live_watch_keyboard(match_id, finished=False, halftime=False):
     k=InlineKeyboardBuilder()
+    # Both controls mutate the live second-half state; they remain available
+    # during the second half so managers can react to the match in progress.
     if not finished:
         k.button(text='🎛 Тактика',callback_data=f'match:watch:tactics:{match_id}')
         k.button(text='🔄 Замена',callback_data=f'match:watch:sub:{match_id}')
@@ -1821,7 +1824,7 @@ def _live_event_icon(event_type):
     return {'GOAL':'⚽','SHOT':'🎯','YELLOW':'🟨','RED':'🟥','INJURY':'🩹','SUBSTITUTION':'🔄','ASSIST':'🅰️'}.get(str(event_type or '').upper(),'•')
 
 async def _load_live_view(s, match_id):
-    row=(await s.execute(text("""SELECT m.id,m.status,m.current_minute,m.home_score,m.away_score,
+    row=(await s.execute(text("""SELECT m.id,m.status,m.current_minute,m.halftime_locked,m.home_score,m.away_score,
         m.home_xg,m.away_xg,m.home_possession,m.away_possession,m.home_shots,m.away_shots,
         m.home_shots_on_target,m.away_shots_on_target,m.home_corners,m.away_corners,
         m.motm_player_id,m.home_club_id,m.away_club_id,h.name home,a.name away
@@ -1833,14 +1836,25 @@ async def _load_live_view(s, match_id):
         FROM match_events e LEFT JOIN players p ON p.id=e.player_id
         WHERE e.match_id=:m ORDER BY e.minute DESC,e.id DESC LIMIT 10"""),{'m':match_id})).mappings().all()
     events=list(reversed(events))
-    # Reconstruct the score at each goal from the existing live-score helper,
-    # rather than attaching the current/final score to every goal.
+    # Fetch the goal timeline once. The previous implementation called the
+    # score helper separately for every visible goal, which made opening LIVE
+    # slower as the event list grew. Reconstruct all visible goal scores in
+    # memory from one query instead.
+    goals=(await s.execute(text("""SELECT e.minute,e.club_id
+        FROM match_events e WHERE e.match_id=:m AND e.event_type='GOAL'
+        ORDER BY e.minute,e.id"""),{'m':match_id})).mappings().all()
+    score_at=[]; gh=ga=0
+    for goal in goals:
+        if int(goal['club_id'])==int(row['home_club_id']): gh+=1
+        elif int(goal['club_id'])==int(row['away_club_id']): ga+=1
+        score_at.append((int(goal['minute']),gh,ga))
     for event in events:
         if str(event.get('event_type') or '').upper() == 'GOAL':
-            event['_score_at_event']=await _live_score_at_minute(
-                s, match_id, int(event.get('minute') or 0),
-                row['home_club_id'], row['away_club_id']
-            )
+            minute=int(event.get('minute') or 0)
+            candidates=[item for item in score_at if item[0] <= minute]
+            if candidates:
+                _,eh,ea=candidates[-1]
+                event['_score_at_event']=(eh,ea)
     motm=None
     if row['motm_player_id']:
         motm=(await s.execute(text("""SELECT p.first_name,p.last_name,ps.rating
@@ -1884,7 +1898,7 @@ async def _render_live_screen(message,user_id,match_id,force=False):
     signature=repr((row['status'],row['current_minute'],row['home_score'],row['away_score'],row['home_xg'],row['away_xg'],row['home_possession'],row['away_possession'],[(e['minute'],e['event_type'],e['description'],e.get('_score_at_event')) for e in events],motm['rating'] if motm else None))
     key=(user_id,match_id)
     if not force and _LIVE_SCREEN_SIGNATURES.get(key)==signature: return True,row['status']=='FINISHED'
-    ok=await _edit_live_message(message,text_value,_live_watch_keyboard(match_id,row['status']=='FINISHED'))
+    ok=await _edit_live_message(message,text_value,_live_watch_keyboard(match_id,row['status']=='FINISHED',bool(row.get('halftime_locked'))))
     if ok:
         _LIVE_SCREEN_SIGNATURES[key]=signature; logger.info('Live screen updated: user_id=%s match_id=%s minute=%s status=%s',user_id,match_id,row['current_minute'],row['status'])
     return ok,row['status']=='FINISHED'
@@ -1918,7 +1932,7 @@ async def _open_live_screen(cq,match_id):
         return False
     row,events,motm=loaded
     text_value=_live_watch_text(row,events,motm)
-    markup=_live_watch_keyboard(match_id,row['status']=='FINISHED')
+    markup=_live_watch_keyboard(match_id,row['status']=='FINISHED',bool(row.get('halftime_locked')))
     try:
         # The viewer is a separate message, leaving the match-center message intact.
         # Use the bot API directly instead of Message.answer(): this also works
@@ -1986,7 +2000,7 @@ async def cb_match_watch_lineups(cq:CallbackQuery):
             pr=type('P',(),dict(p,fitness=int(p.get('fitness') or 100),form=0,morale=70,position=p['position']))()
             cols.append(f'{display_player_name(p["first_name"],p["last_name"])} · OVR {int(round(float(player_rating(pr))))} · {p["position"]} · FIT {int(p.get("fitness") or 100)}')
         out.append(f'{cols[0]}  |  {cols[1]}')
-    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
+    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:live:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
     await _edit_live_message(cq.message,'\n'.join(out),k.as_markup()); await cq.answer()
 
 @router.callback_query(F.data.startswith('match:watch:stats:'))
@@ -2002,7 +2016,7 @@ async def cb_match_watch_stats(cq:CallbackQuery):
     counts={(int(c),str(t)):int(n) for c,t,n in event_counts}; hc,ac=row['home_club_id'],row['away_club_id']
     lines=['📊 <b>СТАТИСТИКА МАТЧА</b>',f'<b>{row["home"]} {row["home_score"] or 0}:{row["away_score"] or 0} {row["away"]}</b>','',f'🎯 Владение: {float(row["home_possession"] or 50):.0f}% — {float(row["away_possession"] or 50):.0f}%',f'🎯 Удары: {row["home_shots"] or 0} ({row["home_shots_on_target"] or 0}) — {row["away_shots"] or 0} ({row["away_shots_on_target"] or 0})',f'🚩 Угловые: {row["home_corners"] or 0} — {row["away_corners"] or 0}',f'🟨 Жёлтые: {counts.get((hc,"YELLOW"),0)} — {counts.get((ac,"YELLOW"),0)}',f'🟥 Красные: {counts.get((hc,"RED"),0)} — {counts.get((ac,"RED"),0)}',f'⚠️ Фолы: {counts.get((hc,"FOUL"),0)} — {counts.get((ac,"FOUL"),0)}',f'📊 xG: {float(row["home_xg"] or 0):.2f} — {float(row["away_xg"] or 0):.2f}','','⭐ <b>Лучшие игроки по рейтингу</b>']
     lines += [f'• {display_player_name(x["first_name"],x["last_name"])} — {float(x["rating"]):.1f}' for x in stats] or ['• Рейтинг появится после завершения матча']
-    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
+    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:live:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
     await _edit_live_message(cq.message,'\n'.join(lines),k.as_markup()); await cq.answer()
 
 @router.callback_query(F.data.startswith('match:watch:report:'))
@@ -2041,12 +2055,242 @@ async def cb_match_watch_report(cq:CallbackQuery):
         out.append(f'<b>{label}</b>')
         players=[x for x in lineups if x['club_id']==cid]
         out += [f'• {display_player_name(x["first_name"],x["last_name"])} · {x["position"]}' for x in players] or ['• Нет данных']
-    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
+    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:live:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
     await _edit_live_message(cq.message,'\n'.join(out),k.as_markup()); await cq.answer()
 
-@router.callback_query(F.data.startswith('match:watch:tactics:') | F.data.startswith('match:watch:sub:'))
-async def cb_match_watch_controls(cq:CallbackQuery):
-    await cq.answer('🎛 Управление доступно через существующие меню тактики/замен.',show_alert=True)
+_LIVE_SUB_SELECTIONS: dict[int, tuple[int,int,int]] = {}
+
+async def _live_control_match(s, telegram_id, match_id):
+    club=await club_by_tg(s,telegram_id)
+    if not club:
+        raise ValueError('Сначала создайте клуб.')
+    row=(await s.execute(text('''SELECT m.id,m.status,m.current_minute,m.halftime_locked,m.home_club_id,m.away_club_id,
+        h.name home,a.name away
+        FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
+        WHERE m.id=:m'''),{'m':match_id})).mappings().first()
+    if not row: raise ValueError('Матч не найден.')
+    if int(club['id']) not in (int(row['home_club_id']),int(row['away_club_id'])):
+        raise ValueError('Управление доступно только участнику этого матча.')
+    return club,row
+
+async def _show_live_tactics(cq:CallbackQuery, match_id):
+    async with SessionLocal() as s:
+        try:
+            club,row=await _live_control_match(s,cq.from_user.id,match_id)
+        except ValueError as exc:
+            return await cq.answer(str(exc),show_alert=True)
+        if row['status']!='LIVE':
+            return await cq.answer('Матч уже завершён.',show_alert=True)
+        t=(await s.execute(text('SELECT formation,style,tempo,pressing,width,defensive_line,aggression FROM club_tactics WHERE club_id=:c'),{'c':club['id']})).mappings().first()
+    if not t: return await cq.answer('Тактика клуба не найдена.',show_alert=True)
+    k=InlineKeyboardBuilder()
+    for f in ('4-3-3','4-2-3-1','4-4-2','3-5-2','5-3-2'):
+        k.button(text=('✓ ' if f==t['formation'] else '')+f,callback_data=f'match:watch:tactic:f:{match_id}:{f}')
+    labels={'BALANCE':'Баланс','ATTACK':'Атака','COUNTER':'Контратака','DEFENSE':'Защита','POSSESSION':'Владение'}
+    for st in ('BALANCE','ATTACK','COUNTER','DEFENSE','POSSESSION'):
+        k.button(text=('✓ ' if st==t['style'] else '')+labels[st],callback_data=f'match:watch:tactic:s:{match_id}:{st}')
+    k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:live:{match_id}')
+    k.adjust(3,2,2,2,1)
+    await _edit_live_message(cq.message,
+        f'🎛 <b>ТАКТИКА LIVE</b>\n{row["home"]} — {row["away"]}\n\n'
+        f'Формация: <b>{t["formation"]}</b>\nСтиль: <b>{labels.get(t["style"],t["style"])}</b>\n'
+        f'Темп {t["tempo"]} · прессинг {t["pressing"]} · ширина {t["width"]} · линия {t["defensive_line"]} · агрессия {t["aggression"]}',
+        k.as_markup())
+    await cq.answer()
+
+async def _show_live_substitutions(cq:CallbackQuery, match_id):
+    async with SessionLocal() as s:
+        try:
+            club,row=await _live_control_match(s,cq.from_user.id,match_id)
+        except ValueError as exc:
+            return await cq.answer(str(exc),show_alert=True)
+        if row['status']!='LIVE':
+            return await cq.answer('Матч уже завершён.',show_alert=True)
+        lineup=(await s.execute(text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),{'c':club['id']})).scalar_one_or_none() or []
+        lineup=[int(x) for x in lineup]
+        phase_data=(await s.execute(text('SELECT second_half_data FROM matches WHERE id=:m'),{'m':match_id})).scalar_one_or_none() or {}
+        used_off={int(x[1]) for x in (phase_data.get('substitutions') or [])}
+        used_on={int(x[2]) for x in (phase_data.get('substitutions') or [])}
+        players=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.position,cp.is_injured,cp.suspension_matches
+            FROM club_players cp JOIN players p ON p.id=cp.player_id
+            WHERE cp.club_id=:c AND cp.is_injured=false AND cp.suspension_matches=0
+            ORDER BY p.position,p.potential DESC,p.id'''),{'c':club['id']})).mappings().all()
+        exited=set((await s.execute(text('''SELECT player_id FROM match_events
+            WHERE match_id=:m AND event_type IN ('RED','INJURY') AND minute<=45 AND player_id IS NOT NULL'''),{'m':match_id})).scalars().all())
+    starters=[p for p in players if int(p['id']) in lineup and int(p['id']) not in exited and int(p['id']) not in used_off]
+    bench=[p for p in players if int(p['id']) not in lineup and int(p['id']) not in used_on][:7]
+    if not starters or not bench:
+        return await cq.answer('Для замены сейчас недостаточно игроков.',show_alert=True)
+    k=InlineKeyboardBuilder()
+    for p in starters:
+        k.button(text=f'⬇️ {display_player_name(p["first_name"],p["last_name"])}',callback_data=f'match:watch:suboff:{match_id}:{p["id"]}')
+    k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:live:{match_id}')
+    k.adjust(1)
+    await _edit_live_message(cq.message,'🔄 <b>ЗАМЕНА</b>\n\nВыберите игрока, которого заменить:',k.as_markup())
+    await cq.answer()
+
+@router.callback_query(F.data.startswith('match:watch:live:'))
+async def cb_match_watch_live(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    await _cancel_live_screen(cq.from_user.id)
+    ok,finished=await _render_live_screen(cq.message,cq.from_user.id,mid,force=True)
+    if ok and not finished:
+        _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(_live_screen_loop(cq.message,cq.from_user.id,mid),name=f'live-screen-{cq.from_user.id}-{mid}')
+    await cq.answer('📺 Live-экран' if ok else 'Матч недоступен.',show_alert=not ok)
+
+@router.callback_query(F.data.startswith('match:watch:tactics:'))
+async def cb_match_watch_tactics(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    await _cancel_live_screen(cq.from_user.id)
+    await _show_live_tactics(cq,mid)
+
+@router.callback_query(F.data.startswith('match:watch:sub:'))
+async def cb_match_watch_sub(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    await _cancel_live_screen(cq.from_user.id)
+    await _show_live_substitutions(cq,mid)
+
+@router.callback_query(F.data.startswith('match:watch:suboff:'))
+async def cb_match_watch_suboff(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=5 or not parts[3].isdigit() or not parts[4].isdigit():
+        return await cq.answer('Некорректная замена.',show_alert=True)
+    mid,off_id=int(parts[3]),int(parts[4])
+    async with SessionLocal() as s:
+        try:
+            club,row=await _live_control_match(s,cq.from_user.id,mid)
+        except ValueError as exc:
+            return await cq.answer(str(exc),show_alert=True)
+        if row['status']!='LIVE':
+            return await cq.answer('Матч уже завершён.',show_alert=True)
+        lineup=(await s.execute(text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),{'c':club['id']})).scalar_one_or_none() or []
+        bench=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.position
+            FROM club_players cp JOIN players p ON p.id=cp.player_id
+            WHERE cp.club_id=:c AND cp.is_injured=false AND cp.suspension_matches=0 AND NOT (p.id=ANY(:ids))
+            ORDER BY p.potential DESC,p.id LIMIT 7'''),{'c':club['id'],'ids':[int(x) for x in lineup] or [0]})).mappings().all()
+    if not bench:
+        return await cq.answer('На скамейке нет доступных игроков.',show_alert=True)
+    _LIVE_SUB_SELECTIONS[cq.from_user.id]=(mid,off_id,0)
+    k=InlineKeyboardBuilder()
+    for p in bench:
+        k.button(text=f'⬆️ {display_player_name(p["first_name"],p["last_name"])}',callback_data=f'match:watch:subon:{mid}:{off_id}:{p["id"]}')
+    k.button(text='⬅️ Назад',callback_data=f'match:watch:sub:{mid}')
+    k.adjust(1)
+    await _edit_live_message(cq.message,'🔄 <b>ЗАМЕНА</b>\n\nКого выпустить на поле?',k.as_markup())
+    await cq.answer()
+
+@router.callback_query(F.data.startswith('match:watch:subon:'))
+async def cb_match_watch_subon(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=6 or not all(x.isdigit() for x in parts[3:6]):
+        return await cq.answer('Некорректная замена.',show_alert=True)
+    mid,off_id,on_id=map(int,parts[3:6])
+    async with SessionLocal() as s:
+        try:
+            _club,row=await _live_control_match(s,cq.from_user.id,mid)
+        except ValueError as exc:
+            return await cq.answer(str(exc),show_alert=True)
+        if row['status']!='LIVE':
+            return await cq.answer('Матч уже завершён.',show_alert=True)
+        current=int(row['current_minute'] or 45)
+    _LIVE_SUB_SELECTIONS[cq.from_user.id]=(mid,off_id,on_id)
+    k=InlineKeyboardBuilder()
+    minute_candidates=[m for m in (46,50,55,60,65,70,75,80,85) if m>current]
+    for minute in minute_candidates[:6]:
+        k.button(text=f'{minute}′',callback_data=f'match:watch:subapply:{mid}:{off_id}:{on_id}:{minute}')
+    k.button(text='⬅️ Назад',callback_data=f'match:watch:sub:{mid}')
+    k.adjust(2,2,1)
+    await _edit_live_message(cq.message,'🔄 <b>ЗАМЕНА</b>\n\nВыберите минуту выхода:',k.as_markup())
+    await cq.answer()
+
+@router.callback_query(F.data.startswith('match:watch:subapply:'))
+async def cb_match_watch_subapply(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=7 or not all(x.isdigit() for x in parts[3:7]):
+        return await cq.answer('Некорректная замена.',show_alert=True)
+    mid,off_id,on_id,minute=map(int,parts[3:7])
+    async with SessionLocal() as s:
+        try:
+            club,row=await _live_control_match(s,cq.from_user.id,mid)
+            if row['status']!='LIVE':
+                raise ValueError('Матч уже завершён.')
+            current=int(row['current_minute'] or 45)
+            if minute<=current or minute>90:
+                raise ValueError(f'Минута замены должна быть после текущей ({current}′) и не позже 90′.')
+            # Validate the player pair against the normal substitution rules.
+            await plan_substitution(s,int(club['id']),minute,off_id,on_id)
+            data=dict(row.get('second_half_data') or {})
+            substitutions=[list(x) for x in (data.get('substitutions') or [])]
+            team='HOME' if int(club['id'])==int(row['home_club_id']) else 'AWAY'
+            if sum(1 for x in substitutions if str(x[3])==team)>=5:
+                raise ValueError('Достигнут лимит в 5 замен.')
+            if any(int(x[1])==off_id for x in substitutions):
+                raise ValueError('Этот игрок уже запланирован на замену.')
+            if any(int(x[2])==on_id for x in substitutions):
+                raise ValueError('Этот игрок уже выпущен по плану замены.')
+            substitutions.append([minute,off_id,on_id,team])
+            substitutions.sort(key=lambda x:(int(x[0]),int(x[1])))
+            data['substitutions']=substitutions
+            await s.execute(text('UPDATE matches SET second_half_data=:data WHERE id=:m'),{'data':json.dumps(data),'m':mid})
+            await s.commit()
+        except ValueError as exc:
+            await s.rollback()
+            return await cq.answer(str(exc),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Live substitution planning failed: match_id=%s',mid)
+            return await cq.answer('❌ Не удалось запланировать замену.',show_alert=True)
+    _LIVE_SUB_SELECTIONS.pop(cq.from_user.id,None)
+    await cq.answer(f'🔄 Замена запланирована на {minute}′.')
+    await _cancel_live_screen(cq.from_user.id)
+    ok,finished=await _render_live_screen(cq.message,cq.from_user.id,mid,force=True)
+    if ok and not finished:
+        _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(_live_screen_loop(cq.message,cq.from_user.id,mid),name=f'live-screen-{cq.from_user.id}-{mid}')
+
+@router.callback_query(F.data.startswith('match:watch:tactic:'))
+async def cb_match_watch_tactic_choice(cq:CallbackQuery):
+    parts=cq.data.split(':')
+    if len(parts)!=6 or parts[3] not in {'f','s'} or not parts[4].isdigit():
+        return await cq.answer('Некорректная тактика.',show_alert=True)
+    kind=parts[3]; mid=int(parts[4]); value=parts[5]
+    async with SessionLocal() as s:
+        try:
+            club,row=await _live_control_match(s,cq.from_user.id,mid)
+            if row['status']!='LIVE':
+                raise ValueError('Матч уже завершён.')
+            t=(await s.execute(text('SELECT * FROM club_tactics WHERE club_id=:c'),{'c':club['id']})).mappings().first()
+            if not t: raise ValueError('Тактика клуба не найдена.')
+            if kind=='f' and value not in {'4-3-3','4-2-3-1','4-4-2','3-5-2','5-3-2'}:
+                raise ValueError('Неизвестная формация.')
+            formation=value if kind=='f' else t['formation']
+            try:
+                style=Style(value) if kind=='s' else Style(t['style'])
+            except ValueError:
+                raise ValueError('Неизвестный стиль.')
+            sliders=STYLE_SLIDERS[style] if kind=='s' else (t['tempo'],t['pressing'],t['width'],t['defensive_line'],t['aggression'])
+            tactics=Tactics(formation=formation,style=style,tempo=int(sliders[0]),pressing=int(sliders[1]),width=int(sliders[2]),defensive_line=int(sliders[3]),aggression=int(sliders[4]))
+            if row['halftime_locked']:
+                await change_halftime_tactics(s,row['id'],club['id'],tactics)
+            else:
+                data=dict((await s.execute(text('SELECT second_half_data FROM matches WHERE id=:m'),{'m':mid})).scalar_one_or_none() or {})
+                side='home_tactics' if int(club['id'])==int(row['home_club_id']) else 'away_tactics'
+                data[side]={
+                    'formation':tactics.formation,'style':tactics.style.value,'tempo':tactics.tempo,
+                    'pressing':tactics.pressing,'width':tactics.width,'defensive_line':tactics.defensive_line,
+                    'aggression':tactics.aggression,
+                }
+                await s.execute(text('''UPDATE club_tactics SET formation=:f,style=:s,tempo=:t,pressing=:p,width=:w,defensive_line=:d,aggression=:a WHERE club_id=:c'''),
+                    {'f':tactics.formation,'s':tactics.style.value,'t':tactics.tempo,'p':tactics.pressing,'w':tactics.width,'d':tactics.defensive_line,'a':tactics.aggression,'c':club['id']})
+                await s.execute(text('UPDATE matches SET second_half_data=:data WHERE id=:m'),{'data':json.dumps(data),'m':mid})
+            await s.commit()
+        except ValueError as exc:
+            await s.rollback(); return await cq.answer(str(exc),show_alert=True)
+        except Exception:
+            await s.rollback(); logger.exception('Live tactic update failed: match_id=%s',mid)
+            return await cq.answer('❌ Не удалось изменить тактику.',show_alert=True)
+    await _show_live_tactics(cq,mid)
 
 @router.callback_query(F.data.startswith('match:watch:back:'))
 async def cb_match_watch_back(cq:CallbackQuery):

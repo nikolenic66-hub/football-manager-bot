@@ -49,7 +49,7 @@ def test_live_screen_lineups_uses_match_lineups_and_player_rating():
 
 
 def test_live_screen_stats_exposes_required_match_statistics():
-    block=_block("async def cb_match_watch_stats", "@router.callback_query(F.data.startswith('match:watch:tactics:') | F.data.startswith('match:watch:sub:'))")
+    block=_block("async def cb_match_watch_stats", "_LIVE_SUB_SELECTIONS: dict[int, tuple[int,int,int]] = {}")
     for field in ('home_possession','away_possession','home_shots','away_shots','home_shots_on_target','away_shots_on_target','home_corners','away_corners','home_xg','away_xg'):
         assert field in block
     assert 'YELLOW' in block
@@ -82,7 +82,8 @@ def test_back_cancels_live_task_and_logs_close():
 def test_live_goal_events_use_score_at_event_not_current_score():
     block=_block("async def _load_live_view", "def _live_event_lines")
     assert "_score_at_event" in block
-    assert "_live_score_at_minute" in block
+    assert "SELECT e.minute,e.club_id" in block
+    assert "event['_score_at_event']" in block
     lines=_block("def _live_event_lines", "def _live_watch_text")
     assert "event_score=e.get('_score_at_event')" in lines
     assert "event_score[0]}:{event_score[1]}" in lines
@@ -119,3 +120,42 @@ def test_live_watch_uses_direct_bot_send_message_and_acknowledges_callback_first
     open_block = bot[open_start:open_end]
     assert "await cq.bot.send_message(" in open_block
     assert "cq.message.answer(" not in open_block
+
+
+def test_live_controls_are_real_handlers_not_placeholder_alert():
+    bot=BOT
+    start=bot.index("async def _show_live_tactics")
+    end=bot.index("@router.callback_query(F.data.startswith('match:watch:live:'))",start)
+    block=bot[start:end]
+    assert "change_halftime_tactics" not in block  # applied by the choice handler below
+    assert "match:watch:tactic:f:" in block
+    assert "match:watch:tactic:s:" in block
+    assert "match:watch:suboff:" in bot
+    assert "match:watch:subapply:" in bot
+    assert "Управление доступно через существующие меню" not in bot
+
+
+def test_live_tactics_and_substitution_choices_apply_during_match():
+    tactic=_block("async def cb_match_watch_tactic_choice", "@router.callback_query(F.data.startswith('match:watch:back:'))")
+    assert "change_halftime_tactics" in tactic
+    assert "second_half_data" in tactic
+    assert "STYLE_SLIDERS" in tactic
+    sub=_block("async def cb_match_watch_subapply", "@router.callback_query(F.data.startswith('match:watch:tactic:'))")
+    assert "plan_substitution" in sub
+    assert "second_half_data" in sub
+    assert "substitutions.append" in sub
+    assert "await s.commit()" in sub
+
+
+def test_live_control_buttons_remain_visible_but_enforce_halftime():
+    block=_block("def _live_watch_keyboard", "def _live_event_icon")
+    assert "match:watch:tactics:{match_id}" in block
+    assert "match:watch:sub:{match_id}" in block
+    assert "halftime" in block
+
+
+def test_live_return_route_reuses_existing_viewer_message():
+    block=_block("async def cb_match_watch_live", "@router.callback_query(F.data.startswith('match:watch:tactics:'))")
+    assert "_edit_live_message" not in block  # render helper edits the same message
+    assert "_render_live_screen(cq.message" in block
+    assert "_live_screen_loop(cq.message" in block

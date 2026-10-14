@@ -290,18 +290,69 @@ async def apc_ovr(m,state):
     except: return await m.answer('Введите Overall 1–100.')
     await state.update_data(ovr=v); await state.set_state(AdminStates.player_create_potential); await m.answer('Potential 1–100:')
 @admin_router.message(AdminStates.player_create_potential)
-async def apc_pot(m,state):
-    try: pot=int(m.text); assert 1<=pot<=100
-    except: return await m.answer('Введите Potential 1–100.')
-    d=await state.get_data(); base=d['ovr']; rng=random.Random((d['first']+d['last']).__hash__() & 0xffffffff)
-    vals={k:max(1,min(100,base+rng.randint(-6,6))) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
-    market=max(0,int((base/60)**6*180_000)); salary=max(15_000,market//35)
-    async with SessionLocal() as s:
-        row=await s.execute(text('''INSERT INTO players(first_name,last_name,nationality,age,position,pace,shooting,passing,dribbling,defending,physical,stamina,mental,market_value,salary,potential,rarity,card_version,real_player,preferred_foot,secondary_positions,talents,tactical_archetype,data_source)
-        VALUES(:f,:l,:n,:age,:pos,:pace,:shooting,:passing,:dribbling,:defending,:physical,:stamina,:mental,:mv,:sal,:pot,'BASE','STANDARD',FALSE,'R','{}','[]','BALANCED','generated') RETURNING id'''),dict(f=d['first'],l=d['last'],n=d['nat'][:3],age=d['age'],pos=d['pos'],**vals,mv=market,sal=salary,pot=pot)).scalar_one()
-        await s.commit()
-    await log_action(m.from_user.id,'player_create','player',row,d)
-    await state.clear(); await m.answer(f'✅ Игрок создан, ID={row}',reply_markup=back('admin:players'))
+async def apc_pot(m: Message, state: FSMContext):
+    try:
+        pot = int((m.text or '').strip())
+        if not 1 <= pot <= 100:
+            raise ValueError
+    except (TypeError, ValueError):
+        return await m.answer('Введите Potential 1–100.')
+
+    d = await state.get_data()
+    try:
+        base = int(d['ovr'])
+        seed = f"{d['first']}:{d['last']}"
+        rng = random.Random(seed)
+        vals = {
+            k: max(1, min(100, base + rng.randint(-6, 6)))
+            for k in ('pace', 'shooting', 'passing', 'dribbling', 'defending', 'physical', 'stamina', 'mental')
+        }
+        market = max(0, int((base / 60) ** 6 * 180_000))
+        salary = max(15_000, market // 35)
+        payload = dict(
+            f=d['first'], l=d['last'], n=d['nat'][:3], age=d['age'], pos=d['pos'],
+            **vals, mv=market, sal=salary, pot=pot,
+        )
+
+        async with SessionLocal() as s:
+            row = (await s.execute(text('''
+                INSERT INTO players(
+                    first_name,last_name,nationality,age,position,
+                    pace,shooting,passing,dribbling,defending,physical,stamina,mental,
+                    market_value,salary,potential,rarity,card_version,real_player,
+                    preferred_foot,secondary_positions,talents,tactical_archetype,data_source
+                )
+                VALUES(
+                    :f,:l,:n,:age,:pos,
+                    :pace,:shooting,:passing,:dribbling,:defending,:physical,:stamina,:mental,
+                    :mv,:sal,:pot,'BASE','STANDARD',FALSE,
+                    'R','{}','[]','BALANCED','generated'
+                )
+                RETURNING id
+            '''), payload)).scalar_one()
+
+            # Keep creation and audit in one transaction. This avoids opening
+            # a second Neon connection immediately after the INSERT.
+            await s.execute(text('''
+                INSERT INTO admin_actions_log
+                    (admin_user_id, action, target_type, target_id, payload)
+                VALUES (:u, :a, :t, :i, :p)
+            '''), {
+                'u': m.from_user.id,
+                'a': 'player_create',
+                't': 'player',
+                'i': row,
+                'p': json.dumps(d | {'potential': pot}, ensure_ascii=False),
+            })
+            await s.commit()
+    except Exception:
+        logger.exception('Admin player create failed')
+        return await m.answer(
+            '❌ Не удалось создать игрока. Попробуйте ещё раз или проверьте соединение с БД.'
+        )
+
+    await state.clear()
+    await m.answer(f'✅ Игрок создан, ID={row}', reply_markup=back('admin:players'))
 
 
 # ---------------- clubs ----------------
