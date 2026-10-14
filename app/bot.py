@@ -127,8 +127,8 @@ def squad_keyboard(players, page=0, prefix='squad'):
     end=min(start+page_size,len(players))
     for i in range(start,end):
         p=players[i]
-        last=clean_display_name(p.get('last_name') or p.get('name') or 'Игрок')[:10]
-        k.button(text=f'{i+1}. {last}',callback_data=f'{prefix}:item:{i}')
+        last=display_player_name(p.get('first_name'),p.get('last_name'))[:10]
+        k.button(text=f'{i+1}. {last}',callback_data=f'{prefix}:item:{int(p.get("id", 0))}')
     for code,label in (('GK','🧤 Вратари'),('DEF','🛡 Защита'),('MID','⚙ Полузащита'),('ATT','⚡ Атака')):
         k.button(text=label,callback_data=f'{prefix}:filter:{code}')
     nav=[]
@@ -152,7 +152,7 @@ def tactic_keyboard(players, filter_code, page=0, selected=None, page_size=8):
     end=min(start+page_size,len(players))
     for r in players[start:end]:
         pid=int(r['id'])
-        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
+        last=display_player_name(r.get('first_name'),r.get('last_name'))[:12]
         mark='✓ ' if pid in selected else ''
         k.button(text=f'{mark}{last}',callback_data=f'tactic:item:{pid}:{filter_code}:{page}')
     k.adjust(2)
@@ -268,8 +268,8 @@ def _market_keyboard(data):
     for i,r in enumerate(data[:10]):
         name=display_player_name(r.get('first_name'),r.get('last_name'))
         price=r.get('asking_price') if r.get('listing_id') else r.get('market_value',0)
-        label=f"{name.split()[-1] if name else 'Игрок'} · {r.get('position','')} · €{int(price):,}"
-        k.button(text=label[:30],callback_data=f'market:item:{i}')
+        label=f"{name.split()[-1] if name else 'Player'} · {r.get('position','')} · €{int(price):,}"
+        k.button(text=label[:30],callback_data=f'market:item:{int(r["id"])}')
     k.adjust(5)
     for code,label in (('ATT','⚽ Нападающие'),('MID','🎯 Полузащита'),('DEF','🛡 Защита'),('GK','🧤 Вратари')):
         k.button(text=label,callback_data=f'market:filter:{code}')
@@ -281,8 +281,8 @@ def _market_keyboard(data):
 def _contract_keyboard(rows):
     k=InlineKeyboardBuilder()
     for i,r in enumerate(rows):
-        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
-        k.button(text=f'{i+1}. {last}',callback_data=f'contract:item:{i}')
+        last=display_player_name(r.get('first_name'),r.get('last_name'))[:12]
+        k.button(text=f'{i+1}. {last}',callback_data=f'contract:item:{int(r["id"])}')
     k.adjust(6)
     k.button(text='⬅ Назад',callback_data='menu')
     k.adjust(6,1)
@@ -308,7 +308,8 @@ def tactics_keyboard(formation):
     return k.as_markup()
 
 @router.message(CommandStart())
-async def start(m:Message):
+async def start(m:Message, state:FSMContext):
+    await state.clear()
     async with SessionLocal() as s:
         uid=await current_user(s,m); c=await current_club(s,uid); await s.commit()
     if c:
@@ -851,7 +852,7 @@ async def _scout_search(s, club_id, filters, page=0):
 def _scout_results_keyboard(rows, total, page):
     k=InlineKeyboardBuilder()
     for i,r in enumerate(rows):
-        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:16]
+        last=display_player_name(r.get('first_name'),r.get('last_name'))[:16]
         k.button(text=f'{i+1}. {last}',callback_data=f'scout:item:{r["id"]}')
     k.adjust(2)
     pages=max(1,(total+7)//8)
@@ -1654,16 +1655,16 @@ async def cb_market_filter(cq:CallbackQuery):
 
 @router.callback_query(F.data.startswith('market:item:'))
 async def cb_market_item(cq:CallbackQuery):
-    try:index=int(cq.data.rsplit(':',1)[1])
+    try: pid=int(cq.data.rsplit(':',1)[1])
     except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
     data=_MARKET_VIEWS.get(cq.from_user.id)
     if data is None:
         async with SessionLocal() as s:
             data=_market_data(await market_players(s,10))
         _MARKET_VIEWS[cq.from_user.id]=data
-    if index<0 or index>=len(data):
-        return await cq.answer('Игрок не найден.',show_alert=True)
-    r=data[index]
+    r=next((row for row in data if int(row['id'])==pid),None)
+    if r is None:
+        return await cq.answer('Игрок уже недоступен.',show_alert=True)
     card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'market_player_{r["id"]}.png')
     caption=(f'🃏 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b>\n'
              f'{r["position"]} · рейтинг <b>{r.get("overall","—")}</b> · €{int(r.get("asking_price") or r.get("market_value") or 0):,} · POT {r.get("potential","—")}')
@@ -1716,14 +1717,15 @@ _CONTRACT_VIEWS={}
 
 @router.callback_query(F.data.startswith('contract:item:'))
 async def cb_contract_item(cq:CallbackQuery):
-    try:index=int(cq.data.rsplit(':',1)[1])
+    try: pid=int(cq.data.rsplit(':',1)[1])
     except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
     async with SessionLocal() as s:
         c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
         rows=await player_management_report(s,c['id'])
-    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
-    r=dict(rows[index]); _CONTRACT_VIEWS[cq.from_user.id]=r
+    r=next((dict(row) for row in rows if int(row['id'])==pid),None)
+    if r is None:return await cq.answer('Игрок не найден.',show_alert=True)
+    _CONTRACT_VIEWS[cq.from_user.id]=r
     card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'contract_player_{r["id"]}.png')
     caption=(f'📝 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b> · {r["position"]}\n'
              f'Зарплата: €{int(r.get("contract_salary") or 0):,}\n'
@@ -2784,12 +2786,13 @@ async def _show_squad(message,telegram_id,filter_code=None,page=0):
 
 @router.callback_query(F.data.startswith('squad:item:'))
 async def cb_squad_item(cq:CallbackQuery):
-    try:index=int(cq.data.rsplit(':',1)[1])
+    try: pid=int(cq.data.rsplit(':',1)[1])
     except ValueError:return await cq.answer('Некорректный игрок.',show_alert=True)
     c,rows=await _load_squad_rows(cq.from_user.id)
     if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)
-    if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
-    r=rows[index]; _SELECTED_SQUAD_PLAYERS[cq.from_user.id]=int(r['id'])
+    r=next((row for row in rows if int(row['id'])==pid),None)
+    if r is None:return await cq.answer('Игрок не найден.',show_alert=True)
+    _SELECTED_SQUAD_PLAYERS[cq.from_user.id]=pid
     talents=r.get('talents') or []
     if isinstance(talents,str):
         import json; talents=json.loads(talents)
@@ -3001,17 +3004,20 @@ async def cb_tactic_filter(cq:CallbackQuery):
 @router.callback_query(F.data.startswith('tactic:item:'))
 async def cb_tactic_item(cq:CallbackQuery):
     parts=cq.data.split(':')
-    try: pid=int(parts[2]); code=parts[3]; page=int(parts[4])
-    except (ValueError,IndexError):return await cq.answer('Некорректный игрок.',show_alert=True)
-    if code not in {'GK','DEF','MID','ATT'}:return await cq.answer('Неизвестная линия.',show_alert=True)
+    if len(parts)!=5:
+        return await cq.answer('Устаревшая кнопка. Откройте Тактику заново.',show_alert=True)
+    try:
+        pid=int(parts[2]); code=parts[3]; page=int(parts[4])
+    except (ValueError,IndexError):
+        return await cq.answer('Устаревшая кнопка. Откройте Тактику заново.',show_alert=True)
+    if code not in {'GK','DEF','MID','ATT'} or page<0:
+        return await cq.answer('Устаревшая кнопка. Откройте Тактику заново.',show_alert=True)
     c,rows=await _load_squad_rows(cq.from_user.id,code)
     if not c:
         return await cq.answer('Сначала создайте клуб.',show_alert=True)
-    page_size=8
-    page=max(0,page)
-    page_rows=rows[page*page_size:(page+1)*page_size]
-    if not any(int(r['id'])==pid for r in page_rows):
-        return await cq.answer('Устаревшая кнопка. Откройте Тактику заново.',show_alert=True)
+    # The callback contains the real player id. Never map it back through a list index.
+    if not any(int(r['id'])==pid for r in rows):
+        return await cq.answer('Игрок недоступен в этой линии.',show_alert=True)
     async with SessionLocal() as s:
         c=await club_by_tg(s,cq.from_user.id)
         if not c:return await cq.answer('Сначала создайте клуб.',show_alert=True)

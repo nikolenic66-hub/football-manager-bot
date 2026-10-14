@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from aiogram import BaseMiddleware, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -84,6 +84,19 @@ def back(cb='admin:menu'):
     return kb([('⬅️ Назад', cb), ('🏠 Главное меню', 'menu:main')])
 
 
+def player_create_cancel_keyboard():
+    b=InlineKeyboardBuilder()
+    b.button(text='⬅️ Отмена', callback_data='admin:player:create:cancel')
+    return b.as_markup()
+
+
+@admin_router.callback_query(F.data == 'admin:player:create:cancel')
+async def admin_player_create_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.answer('Отменено.', reply_markup=back('admin:players'))
+    await c.answer('Отменено.')
+
+
 async def log_action(admin_id, action, target_type=None, target_id=None, payload=None):
     async with SessionLocal() as s:
         await s.execute(text('''INSERT INTO admin_actions_log
@@ -116,6 +129,18 @@ def player_card_text(p):
             f"Stats: {stats}\n"
             f"Market value: {p['market_value']:,} · Salary: {p['salary']:,}\n"
             f"Talents: {', '.join(talents) if talents else '—'}")
+
+
+@admin_router.message(CommandStart())
+async def admin_start_reset(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer('FSM сброшен. Выберите действие:', reply_markup=admin_menu())
+
+
+@admin_router.message(Command('cancel'))
+async def admin_cancel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer('Отменено.', reply_markup=admin_menu())
 
 
 @admin_router.message(Command('admin'))
@@ -264,32 +289,32 @@ async def admin_player_delete(c: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data == 'admin:player:create')
 async def admin_player_create(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.player_create_first); await c.message.answer('Имя:'); await c.answer()
+    await state.set_state(AdminStates.player_create_first); await c.message.answer('Имя:', reply_markup=player_create_cancel_keyboard()); await c.answer()
 
 @admin_router.message(AdminStates.player_create_first)
-async def apc_first(m,state): await state.update_data(first=m.text.strip()); await state.set_state(AdminStates.player_create_last); await m.answer('Фамилия:')
+async def apc_first(m,state): await state.update_data(first=m.text.strip()); await state.set_state(AdminStates.player_create_last); await m.answer('Фамилия:', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_last)
-async def apc_last(m,state): await state.update_data(last=m.text.strip()); await state.set_state(AdminStates.player_create_nat); await m.answer('Страна, 3 буквы:')
+async def apc_last(m,state): await state.update_data(last=m.text.strip()); await state.set_state(AdminStates.player_create_nat); await m.answer('Страна, 3 буквы:', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_nat)
 async def apc_nat(m,state):
     nat=m.text.strip().upper()
-    if len(nat)!=3 or not nat.isalpha(): return await m.answer('Введите ровно 3 буквы страны.')
-    await state.update_data(nat=nat); await state.set_state(AdminStates.player_create_age); await m.answer('Возраст 16–40:')
+    if len(nat)!=3 or not nat.isalpha(): return await m.answer('Введите ровно 3 буквы страны.', reply_markup=player_create_cancel_keyboard())
+    await state.update_data(nat=nat); await state.set_state(AdminStates.player_create_age); await m.answer('Возраст 16–40:', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_age)
 async def apc_age(m,state):
     try: v=int(m.text); assert 16<=v<=40
-    except: return await m.answer('Введите число 16–40.')
-    await state.update_data(age=v); await state.set_state(AdminStates.player_create_pos); await m.answer('Позиция: GK/CB/LB/RB/DM/CM/AM/LW/RW/ST')
+    except: return await m.answer('Введите число 16–40.', reply_markup=player_create_cancel_keyboard())
+    await state.update_data(age=v); await state.set_state(AdminStates.player_create_pos); await m.answer('Позиция: GK/CB/LB/RB/DM/CM/AM/LW/RW/ST', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_pos)
 async def apc_pos(m,state):
     v=m.text.strip().upper()
-    if v not in {'GK','CB','LB','RB','DM','CM','AM','LW','RW','ST'}: return await m.answer('Некорректная позиция.')
-    await state.update_data(pos=v); await state.set_state(AdminStates.player_create_overall); await m.answer('Overall 1–100:')
+    if v not in {'GK','CB','LB','RB','DM','CM','AM','LW','RW','ST'}: return await m.answer('Некорректная позиция.', reply_markup=player_create_cancel_keyboard())
+    await state.update_data(pos=v); await state.set_state(AdminStates.player_create_overall); await m.answer('Overall 1–100:', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_overall)
 async def apc_ovr(m,state):
     try: v=int(m.text); assert 1<=v<=100
-    except: return await m.answer('Введите Overall 1–100.')
-    await state.update_data(ovr=v); await state.set_state(AdminStates.player_create_potential); await m.answer('Potential 1–100:')
+    except: return await m.answer('Введите Overall 1–100.', reply_markup=player_create_cancel_keyboard())
+    await state.update_data(ovr=v); await state.set_state(AdminStates.player_create_potential); await m.answer('Potential 1–100:', reply_markup=player_create_cancel_keyboard())
 @admin_router.message(AdminStates.player_create_potential)
 async def apc_pot(m: Message, state: FSMContext):
     try:
@@ -297,60 +322,46 @@ async def apc_pot(m: Message, state: FSMContext):
         if not 1 <= pot <= 100:
             raise ValueError
     except (TypeError, ValueError):
-        return await m.answer('Введите Potential 1–100.')
+        return await m.answer('Введите Potential 1–100.', reply_markup=player_create_cancel_keyboard())
 
     d = await state.get_data()
     try:
         base = int(d['ovr'])
         seed = f"{d['first']}:{d['last']}"
         rng = random.Random(seed)
-        vals = {
-            k: max(1, min(100, base + rng.randint(-6, 6)))
-            for k in ('pace', 'shooting', 'passing', 'dribbling', 'defending', 'physical', 'stamina', 'mental')
-        }
+        vals = {k: max(1, min(100, base + rng.randint(-6, 6))) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
         market = max(0, int((base / 60) ** 6 * 180_000))
         salary = max(15_000, market // 35)
-        payload = dict(
-            f=d['first'], l=d['last'], n=d['nat'][:3], age=d['age'], pos=d['pos'],
-            **vals, mv=market, sal=salary, pot=pot,
-        )
+        payload = dict(f=d['first'], l=d['last'], n=d['nat'][:3], age=d['age'], pos=d['pos'], **vals, mv=market, sal=salary, pot=pot, ovr=base)
 
         async with SessionLocal() as s:
-            row = (await s.execute(text('''
-                INSERT INTO players(
-                    first_name,last_name,nationality,age,position,
-                    pace,shooting,passing,dribbling,defending,physical,stamina,mental,
-                    market_value,salary,potential,rarity,card_version,real_player,
-                    preferred_foot,secondary_positions,talents,tactical_archetype,data_source
-                )
-                VALUES(
-                    :f,:l,:n,:age,:pos,
-                    :pace,:shooting,:passing,:dribbling,:defending,:physical,:stamina,:mental,
-                    :mv,:sal,:pot,'BASE','STANDARD',FALSE,
-                    'R','{}','[]','BALANCED','generated'
-                )
-                RETURNING id
-            '''), payload)).scalar_one()
+            columns = (await s.execute(text("""
+                SELECT column_name, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='players'
+            """))).mappings().all()
+            column_names = {str(r['column_name']) for r in columns}
+            required_without_default = {str(r['column_name']) for r in columns if str(r['is_nullable']) == 'NO' and r['column_default'] is None}
+            supported = {'first_name','last_name','nationality','age','position','pace','shooting','passing','dribbling','defending','physical','stamina','mental','market_value','salary','potential','rarity','card_version','real_player','preferred_foot','secondary_positions','talents','tactical_archetype','data_source','overall'}
+            unknown_required = required_without_default - supported
+            if unknown_required:
+                raise RuntimeError(f"players has unsupported required columns: {sorted(unknown_required)}")
 
-            # Keep creation and audit in one transaction. This avoids opening
-            # a second Neon connection immediately after the INSERT.
-            await s.execute(text('''
-                INSERT INTO admin_actions_log
-                    (admin_user_id, action, target_type, target_id, payload)
-                VALUES (:u, :a, :t, :i, :p)
-            '''), {
-                'u': m.from_user.id,
-                'a': 'player_create',
-                't': 'player',
-                'i': row,
-                'p': json.dumps(d | {'potential': pot}, ensure_ascii=False),
-            })
+            insert_cols = ['first_name','last_name','nationality','age','position','pace','shooting','passing','dribbling','defending','physical','stamina','mental','market_value','salary','potential','rarity','card_version','real_player','preferred_foot','secondary_positions','talents','tactical_archetype','data_source']
+            values = [':f',':l',':n',':age',':pos',':pace',':shooting',':passing',':dribbling',':defending',':physical',':stamina',':mental',':mv',':sal',':pot',"'BASE'","'STANDARD'",'FALSE',"'R'","'{}'","'[]'","'BALANCED'","'generated'"]
+            if 'overall' in column_names:
+                insert_cols.append('overall'); values.append(':ovr')
+
+            row = (await s.execute(text(f"INSERT INTO players({','.join(insert_cols)}) VALUES({','.join(values)}) RETURNING id"), payload)).scalar_one()
+            await s.execute(text("""
+                INSERT INTO admin_actions_log(admin_user_id,action,target_type,target_id,payload)
+                VALUES(:u,:a,:t,:i,CAST(:p AS jsonb))
+            """), {'u':m.from_user.id,'a':'player_create','t':'player','i':row,'p':json.dumps(d | {'potential':pot}, ensure_ascii=False)})
             await s.commit()
     except Exception:
         logger.exception('Admin player create failed')
-        return await m.answer(
-            '❌ Не удалось создать игрока. Попробуйте ещё раз или проверьте соединение с БД.'
-        )
+        await state.clear()
+        return await m.answer('❌ Не удалось создать игрока. FSM сброшен. Попробуйте ещё раз или проверьте соединение с БД.', reply_markup=back('admin:players'))
 
     await state.clear()
     await m.answer(f'✅ Игрок создан, ID={row}', reply_markup=back('admin:players'))

@@ -18,15 +18,27 @@ PLAYER_FIELDS='p.id,p.first_name,p.last_name,p.position,p.age,p.pace,p.shooting,
 
 
 def clean_display_name(name):
-    """Remove the legacy four-digit synthetic suffix from displayed names."""
+    """Remove the legacy four-digit synthetic suffix without erasing real names."""
     value=' '.join(str(name or '').split())
+    if re.fullmatch(r'\d{4}', value):
+        return ''
     return re.sub(r'\s+\d{4}$', '', value).strip()
 
 
 def display_player_name(first_name='', last_name=''):
+    raw=' '.join(str(v or '').strip() for v in (first_name,last_name) if str(v or '').strip())
     first=clean_display_name(first_name)
     last=clean_display_name(last_name)
-    return clean_display_name(f'{first} {last}') or 'Игрок'
+    cleaned=clean_display_name(f'{first} {last}')
+    if cleaned:
+        return cleaned
+    # Existing rows with only a synthetic numeric suffix are handled by the
+    # data migration; keep a deterministic non-generic fallback for bad rows.
+    if raw and not re.fullmatch(r'\d{4}', raw):
+        return raw
+    if raw:
+        return f'Игрок {raw}'
+    return 'Player'
 
 
 def row_player(r):

@@ -10,4 +10,7 @@ class Player:
     @property
     def name(self):
         value=f'{self.first_name or ""} {self.last_name or ""}'.strip()
-        return re.sub(r'\s+\d{4}$','',value).strip() or 'Игрок'
+        cleaned=re.sub(r'\s+\d{4}$','',value).strip()
+        if re.fullmatch(r'\d{4}', cleaned):
+            cleaned=''
+        return cleaned or f'Игрок {self.id}'
