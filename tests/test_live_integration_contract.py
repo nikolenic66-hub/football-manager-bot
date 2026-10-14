@@ -49,7 +49,8 @@ def test_worker_logs_failures_instead_of_silently_swallowing_them():
 def test_dangerous_shots_are_filtered_before_notification():
     source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
     assert "DANGEROUS_SHOT_RESULTS={'GOAL','SAVED','BLOCKED'}" in source
-    assert "meta.get('result') not in DANGEROUS_SHOT_RESULTS" in source
+    assert "meta.get('result') not in DANGEROUS_SHOT_RESULTS" not in source
+    assert "important=[e for e in events if e['event_type'] in {'GOAL','RED'}]" in source
 
 def test_notification_callback_validates_category():
     source=(ROOT/'app'/'bot.py').read_text(encoding='utf-8')
@@ -195,7 +196,7 @@ def test_live_events_are_materialized_only_as_minutes_are_reached():
 def test_live_event_text_normalizes_literal_newline_sequences():
     source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
     assert "replace(r'\\n','\\n')" in source
-    assert "body=f\"{e['minute']}′ {description}\\n{score}\"" in source
+    assert "body=f\"{e['minute']}′ {pname}\\n{score}\"" in source
 
 
 def test_live_event_score_is_calculated_at_event_minute_and_id():

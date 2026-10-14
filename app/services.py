@@ -817,7 +817,23 @@ async def _finish_live_match(s, match):
                 ON CONFLICT(match_id,player_id) DO UPDATE SET rating=EXCLUDED.rating,minutes=EXCLUDED.minutes,goals=EXCLUDED.goals,assists=EXCLUDED.assists'''),
                 {'m':match['id'],'c':cid,'p':p_obj.id,'r':rating,'min':minutes,'g':goals,'a':assists})
     await s.execute(text("UPDATE matches SET home_score=:h,away_score=:a,current_minute=90,motm_player_id=:motm,status='FINISHED',live_phase='FINISHED',halftime_locked=FALSE,finished_at=now() WHERE id=:m"),{'h':final_h,'a':final_a,'motm':motm_player_id,'m':match['id']})
-    result_text=f"{data.get('home_name','Home')} <b>{final_h}:{final_a}</b> {data.get('away_name','Away')}"
+    # One compact final notification per owner. Goal details and MOTM are kept
+    # here so the delivery layer can attach a single full-report button.
+    club_names={match['home_club_id']:data.get('home_name','Home'),match['away_club_id']:data.get('away_name','Away')}
+    goal_events=(await s.execute(text('''SELECT e.minute,e.club_id,e.player_id,p.first_name,p.last_name
+        FROM match_events e LEFT JOIN players p ON p.id=e.player_id
+        WHERE e.match_id=:m AND e.event_type='GOAL' ORDER BY e.minute,e.id'''),{'m':match['id']})).mappings().all()
+    goal_lines=[]
+    for e in goal_events:
+        goal_lines.append(f"• {e['minute']}′ {display_player_name(e.get('first_name'),e.get('last_name'))} ({club_names.get(e['club_id'],'Команда')})")
+    motm_text='—'
+    if motm_player_id:
+        motm_row=(await s.execute(text('SELECT p.first_name,p.last_name,ps.rating FROM players p JOIN match_player_stats ps ON ps.player_id=p.id AND ps.match_id=:m WHERE p.id=:p'),{'m':match['id'],'p':motm_player_id})).mappings().first()
+        if motm_row:
+            motm_text=f"{display_player_name(motm_row['first_name'],motm_row['last_name'])} ({float(motm_row['rating'] or 0):.1f})"
+    result_text=(f"{data.get('home_name','Home')} <b>{final_h}:{final_a}</b> {data.get('away_name','Away')}\n\n"
+                  f"⚽ <b>Голы:</b>\n{chr(10).join(goal_lines) if goal_lines else '• Нет голов'}\n\n"
+                  f"⭐ <b>MOTM:</b> {motm_text}")
     await queue_club_notification(s,match['home_club_id'],'MATCH','🏁 Матч завершён',result_text,f'match-finished:{match["id"]}')
     await queue_club_notification(s,match['away_club_id'],'MATCH','🏁 Матч завершён',result_text,f'match-finished:{match["id"]}')
     return {'match_id':match['id'],'home':data.get('home_name','Home'),'away':data.get('away_name','Away'),'home_score':final_h,'away_score':final_a}
@@ -1010,9 +1026,11 @@ async def train_squad(s, club_id):
         recent=(await s.execute(text("SELECT now() - CAST(:t AS timestamptz) < interval '20 hours'"), {'t': last_training_at})).scalar_one()
         if recent:
             remaining=(await s.execute(text("SELECT GREATEST(0, EXTRACT(EPOCH FROM (interval '20 hours' - (now() - CAST(:t AS timestamptz)))))"), {'t': last_training_at})).scalar_one()
-            return [('COOLDOWN', int(remaining or 0), False)]
+            return [('COOLDOWN', int(remaining or 0), False)], None
     rows=(await s.execute(text('''SELECT cp.*,p.* FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c FOR UPDATE'''),{'c':club_id})).mappings().all()
     changes=[]
+    # One batch id groups every per-player development row produced by this run.
+    batch_id=token_urlsafe(18)
     for r in rows:
         overall=sum(r[a] for a in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental'))/8
         tr=training_result(r['age'],r['potential'],overall,plan['focus'],plan['intensity'],r['minutes_played'],r['morale'],r['appearances'])
@@ -1023,12 +1041,25 @@ async def train_squad(s, club_id):
         if updates:
             await s.execute(text('UPDATE players SET '+','.join(f'{a}=:{a}' for a in updates)+' WHERE id=:p'),{**updates,'p':r['player_id']})
         await s.execute(text('UPDATE club_players SET morale=GREATEST(0,LEAST(100,morale+:m)),development_points=development_points+:pts,last_training_at=now() WHERE club_id=:c AND player_id=:p'),{'m':tr.morale_delta,'pts':tr.development_points,'c':club_id,'p':r['player_id']})
-        await s.execute(text('INSERT INTO player_development_log(club_id,player_id,focus,points,changes) VALUES(:c,:p,:f,:pts,:changes)'),{'c':club_id,'p':r['player_id'],'f':plan['focus'],'pts':tr.development_points,'changes':json.dumps(updates)})
+        await s.execute(text('INSERT INTO player_development_log(club_id,player_id,focus,intensity,points,changes,batch_id) VALUES(:c,:p,:f,:i,:pts,:changes,:batch)'),{'c':club_id,'p':r['player_id'],'f':plan['focus'],'i':plan['intensity'],'pts':tr.development_points,'changes':json.dumps(updates),'batch':batch_id})
         changes.append((r['player_id'],tr.development_points,updates))
-        if updates:
-            labels=', '.join(f'{a} +{b-r[a]}' for a,b in updates.items())
-            await queue_club_notification(s,club_id,'DEVELOPMENT','📈 Игрок вырос',f"{display_player_name(r.get('first_name'),r.get('last_name'))}: {labels}.",f'training-growth:{club_id}:{r["player_id"]}:{datetime.now(timezone.utc).date()}')
-    return changes
+    return changes,batch_id
+
+async def training_history(s, club_id, limit=10):
+    return (await s.execute(text('''SELECT batch_id,focus,MAX(intensity) intensity,MAX(created_at) created_at,COUNT(*) player_count,
+        COUNT(*) FILTER (WHERE changes <> '{}'::jsonb) progressed,COALESCE(SUM(points),0) points
+        FROM player_development_log
+        WHERE club_id=:c AND batch_id IS NOT NULL
+        GROUP BY batch_id,focus
+        ORDER BY MAX(created_at) DESC,batch_id DESC LIMIT :n'''),
+        {'c':club_id,'n':limit})).mappings().all()
+
+async def training_details(s, club_id, batch_id):
+    return (await s.execute(text('''SELECT l.player_id,p.first_name,p.last_name,p.position,l.focus,l.intensity,l.points,l.changes,l.created_at
+        FROM player_development_log l JOIN players p ON p.id=l.player_id
+        WHERE l.club_id=:c AND l.batch_id=:b AND l.changes <> '{}'::jsonb
+        ORDER BY l.points DESC,l.created_at,l.player_id'''),
+        {'c':club_id,'b':batch_id})).mappings().all()
 
 async def set_player_expectation(s, club_id, player_id, expectation):
     expectation=str(expectation).upper()
@@ -1089,7 +1120,7 @@ async def deliver_due_notifications(bot, s, limit=50):
     if not ids:
         return 0
 
-    rows = (await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,n.dedupe_key,u.telegram_id
+    rows = (await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,n.dedupe_key,n.created_at,u.telegram_id
         FROM notifications n JOIN users u ON u.id=n.user_id
         LEFT JOIN notification_settings ns ON ns.user_id=n.user_id
         WHERE n.id=ANY(:ids)
@@ -1118,42 +1149,78 @@ async def deliver_due_notifications(bot, s, limit=50):
             WHERE id=ANY(:ids) AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'ids': disabled_ids})
     await s.commit()
 
-    async def _send(row):
-        body=str(row['body'] or '').replace(r'\n','\n')
+    def _priority(row):
+        key=str(row.get('dedupe_key') or '')
+        category=str(row.get('category') or '')
+        return key.startswith(('match-start-10:','match-started:','match-finished:','live-event:'))
+
+    # Group non-critical notifications created in the same minute per user.
+    # Match kickoff/start/end and GOAL/RED stay as separate messages.
+    grouped=[]
+    by_bucket=defaultdict(list)
+    for row in rows:
+        created=row.get('created_at')
+        bucket=created.replace(second=0,microsecond=0) if created is not None else None
+        if _priority(row) or bucket is None:
+            grouped.append((f"row:{row['id']}",[row]))
+        else:
+            by_bucket[(row['telegram_id'],bucket)].append(row)
+    for key,bucket_rows in by_bucket.items():
+        if len(bucket_rows) < 3:
+            grouped.extend((f"row:{r['id']}",[r]) for r in bucket_rows)
+        else:
+            grouped.append((f"group:{key[0]}:{key[1].isoformat()}",bucket_rows))
+
+    async def _send(group):
+        rows_for_send=group
+        row=rows_for_send[0]
         try:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             markup=None
-            key=str(row.get('dedupe_key') or '')
-            if key.startswith('match-start-10:') or key.startswith('match-started:'):
-                parts=key.split(':')
-                mid=parts[4] if key.startswith('match-start-10:') else parts[1]
-                markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📺 Смотреть матч',callback_data=f'match:watch:{mid}')]])
-            await bot.send_message(row['telegram_id'], f"<b>{row['title']}</b>\n{body}", reply_markup=markup)
-            return row['id'],None
+            if len(rows_for_send)==1:
+                key=str(row.get('dedupe_key') or '')
+                if key.startswith('match-start-10:') or key.startswith('match-started:'):
+                    parts=key.split(':')
+                    mid=parts[4] if key.startswith('match-start-10:') else parts[1]
+                    markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📺 Смотреть матч',callback_data=f'match:watch:{mid}')]])
+                elif key.startswith('match-finished:'):
+                    mid=key.split(':',1)[1]
+                    markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📊 Полный отчёт',callback_data=f'match:watch:report:{mid}')]])
+            if len(rows_for_send)==1:
+                text_value=f"<b>{row['title']}</b>\n{str(row['body'] or '').replace(r'\n','\n')}"
+            else:
+                lines=['<b>📋 Уведомления:</b>']
+                for item in rows_for_send:
+                    body=str(item['body'] or '').replace(r'\n','\n').replace('\n',' ')
+                    lines.append(f"• {item['title']}: {body}")
+                text_value='\n'.join(lines)
+            await bot.send_message(row['telegram_id'],text_value,reply_markup=markup)
+            return [r['id'] for r in rows_for_send],None
         except Exception as exc:
-            return row['id'],exc
+            return [r['id'] for r in rows_for_send],exc
 
     # Telegram I/O is the expensive part. Run the claimed sends concurrently so
     # a burst of live events cannot serialize 20-50 network round trips.
-    results=await asyncio.gather(*(_send(row) for row in rows))
+    results=await asyncio.gather(*(_send(items) for _,items in grouped))
     delivered=0
-    for row_id,exc in results:
-        if exc is not None:
-            attempts=(await s.execute(text('SELECT delivery_attempts FROM notifications WHERE id=:id'), {'id':row_id})).scalar_one_or_none() or 1
-            delay=min(300,2 ** min(int(attempts),8))
-            if int(attempts) >= 8:
-                await s.execute(text("""UPDATE notifications
-                    SET processing_at=NULL,failed_at=now(),next_attempt_at=NULL,last_error=:err
-                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL"""), {'id':row_id,'err':str(exc)[:500]})
-            else:
-                await s.execute(text("""UPDATE notifications
-                    SET processing_at=NULL,next_attempt_at=now()+make_interval(secs=>:delay),last_error=:err
-                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'id':row_id,'delay':delay,'err':str(exc)[:500]})
-            continue
-        await s.execute(text("""UPDATE notifications
-            SET sent_at=now(),processing_at=NULL,last_error=NULL
-            WHERE id=:id AND sent_at IS NULL"""), {'id':row_id})
-        delivered+=1
+    for row_ids,exc in results:
+        for row_id in row_ids:
+            if exc is not None:
+                attempts=(await s.execute(text('SELECT delivery_attempts FROM notifications WHERE id=:id'), {'id':row_id})).scalar_one_or_none() or 1
+                delay=min(300,2 ** min(int(attempts),8))
+                if int(attempts) >= 8:
+                    await s.execute(text("""UPDATE notifications
+                        SET processing_at=NULL,failed_at=now(),next_attempt_at=NULL,last_error=:err
+                        WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL"""), {'id':row_id,'err':str(exc)[:500]})
+                else:
+                    await s.execute(text("""UPDATE notifications
+                        SET processing_at=NULL,next_attempt_at=now()+make_interval(secs=>:delay),last_error=:err
+                        WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'id':row_id,'delay':delay,'err':str(exc)[:500]})
+                continue
+            await s.execute(text("""UPDATE notifications
+                SET sent_at=now(),processing_at=NULL,last_error=NULL
+                WHERE id=:id AND sent_at IS NULL"""), {'id':row_id})
+            delivered+=1
     await s.commit()
     return delivered
 

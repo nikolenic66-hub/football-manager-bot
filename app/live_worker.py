@@ -56,7 +56,7 @@ async def start_due_rounds(s):
     return started,len(started),len(rows),failed
 
 async def queue_live_event_notifications(s, match_id):
-    # Every cursor and every event query is scoped to this exact match.
+    """Queue only important live events; routine events stay in match_events/live screen."""
     row=(await s.execute(text("""SELECT m.id,m.current_minute,m.home_score,m.away_score,
         m.home_halftime_score,m.away_halftime_score,m.live_event_cursor,
         m.home_club_id,m.away_club_id,h.name home,a.name away
@@ -66,29 +66,29 @@ async def queue_live_event_notifications(s, match_id):
     events=(await s.execute(text("""SELECT e.id,e.minute,e.event_type,e.description,e.club_id,e.player_id,e.secondary_player_id,e.metadata
         FROM match_events e
         WHERE e.match_id=:m AND e.id>:cursor AND e.minute<=:minute
-        ORDER BY e.minute,e.id LIMIT 2"""),
+        ORDER BY e.minute,e.id LIMIT 20"""),
         {'m':match_id,'cursor':row['live_event_cursor'],'minute':row['current_minute']})).mappings().all()
     if not events: return 0
 
-    player_ids={x['secondary_player_id'] for x in events if x['secondary_player_id']}
+    # Routine events are intentionally NOT notifications. They remain available
+    # in match_events and are rendered by the dedicated live screen.
+    important=[e for e in events if e['event_type'] in {'GOAL','RED'}]
+    player_ids={e['secondary_player_id'] for e in important if e['secondary_player_id']}
+    player_ids.update(e['player_id'] for e in important if e['player_id'])
     player_names={}
     if player_ids:
         prs=(await s.execute(text('SELECT id,first_name,last_name FROM players WHERE id=ANY(:ids)'),{'ids':list(player_ids)})).mappings().all()
         player_names={r['id']:display_player_name(r['first_name'],r['last_name']) for r in prs}
 
-    # Calculate the score at each event's own (minute,id) position, never from
-    # the match's current score. Thus a 24' shot after an 18' goal shows 0:1.
     goal_rows=(await s.execute(text("""SELECT e.id,e.minute,e.club_id FROM match_events e
         WHERE e.match_id=:m AND e.event_type='GOAL' AND e.minute<=:minute
         ORDER BY e.minute,e.id"""),
         {'m':match_id,'minute':row['current_minute']})).mappings().all()
-    goal_scores={}
-    gh=ga=0; gi=0
+    goal_scores={}; gh=ga=0; gi=0
     for event in events:
         while gi<len(goal_rows):
             goal=goal_rows[gi]
-            if (int(goal['minute']),int(goal['id'])) > (int(event['minute']),int(event['id'])):
-                break
+            if (int(goal['minute']),int(goal['id'])) > (int(event['minute']),int(event['id'])): break
             if goal['club_id']==row['home_club_id']: gh+=1
             elif goal['club_id']==row['away_club_id']: ga+=1
             gi+=1
@@ -96,40 +96,22 @@ async def queue_live_event_notifications(s, match_id):
 
     owner_rows=(await s.execute(text('SELECT id,owner_user_id FROM clubs WHERE id=ANY(:ids)'), {'ids':[row['home_club_id'],row['away_club_id']]})).mappings().all()
     owner_cache={r['id']:r['owner_user_id'] for r in owner_rows}
-    for e in events:
-        typ=e['event_type']
-        if typ not in IMPORTANT_LIVE_EVENTS:
-            continue
+    for e in important:
         event_home,event_away=goal_scores.get(e['id'],(0,0))
         if e['minute']>45:
             event_home+=int(row['home_halftime_score'] or 0)
             event_away+=int(row['away_halftime_score'] or 0)
         score=f"{row['home']} <b>{event_home}:{event_away}</b> {row['away']}"
         description=str(e['description'] or '').replace(r'\n','\n')
-        if typ=='GOAL':
+        pname=player_names.get(e['player_id']) or 'Игрок'
+        if e['event_type']=='GOAL':
+            body=f"{e['minute']}′ {pname}\n{score}"
             assist=player_names.get(e['secondary_player_id'])
-            body=f"{e['minute']}′ {description}\n{score}"
             if assist: body += f"\n🅰️ Ассист: {assist}"
-            for cid in (row['home_club_id'],row['away_club_id']):
-                await _queue_for_club(s,cid,'MATCH',owner_cache,'⚽ ГОЛ',body,f"live-event:{e['id']}")
-        elif typ=='ASSIST':
-            continue
-        elif typ=='SHOT':
-            meta=e['metadata'] or {}
-            if isinstance(meta,str):
-                try: meta=json.loads(meta)
-                except Exception: meta={}
-            if meta.get('result') not in DANGEROUS_SHOT_RESULTS:
-                continue
-            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔥 Опасный момент',f"{e['minute']}′ {description}\n{score}",f"live-event:{e['id']}")
-        elif typ=='YELLOW':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟨 Жёлтая карточка',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
-        elif typ=='INJURY':
-            await _queue_for_club(s,e['club_id'],'INJURY',owner_cache,'🩹 Травма',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
-        elif typ=='RED':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟥 Красная карточка',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
-        elif typ=='SUBSTITUTION':
-            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔄 Замена',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'⚽ ГОЛ',body,f"live-event:{e['id']}")
+        elif e['event_type']=='RED':
+            body=f"{e['minute']}′ {pname}\n{score}"
+            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟥 КРАСНАЯ',body,f"live-event:{e['id']}")
     await s.execute(text('UPDATE matches SET live_event_cursor=:id WHERE id=:m'),{'id':max(e['id'] for e in events),'m':match_id})
     return len(events)
 
