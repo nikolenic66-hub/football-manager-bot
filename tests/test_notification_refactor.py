@@ -51,8 +51,8 @@ def test_finished_report_callback_is_registered_and_has_stats_lineups_ratings():
 
 
 def test_report_callback_is_excluded_from_generic_live_watch_handler():
-    line=next(x for x in BOT.splitlines() if x.startswith("@router.callback_query(F.data.startswith('match:watch:')"))
-    assert "~F.data.startswith('match:watch:report:')" in line
+    assert "@router.callback_query(F.data.regexp(r'^match:watch:\\d+$'))" in BOT
+    assert "@router.callback_query(F.data.startswith('match:watch:report:'))" in BOT
 
 
 def test_other_notifications_are_grouped_by_user_and_minute_but_priority_stays_separate():

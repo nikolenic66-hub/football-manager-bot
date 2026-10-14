@@ -89,15 +89,33 @@ def test_live_goal_events_use_score_at_event_not_current_score():
 
 
 def test_live_watch_opens_a_separate_message_and_keeps_match_center_intact():
-    block=_block("async def _open_live_screen", "@router.callback_query(F.data.startswith('match:watch:')")
-    assert "live_message=await cq.message.answer" in block
+    block=_block("async def _open_live_screen", "@router.callback_query(F.data.regexp(r'^match:watch:\\d+$'))")
+    assert "live_message=await cq.bot.send_message" in block
     assert "_edit_live_message(cq.message" not in block
     assert "_live_screen_loop(live_message" in block
 
 
 def test_live_watch_initial_signature_matches_render_signature():
-    block=_block("async def _open_live_screen", "@router.callback_query(F.data.startswith('match:watch:')")
+    block=_block("async def _open_live_screen", "@router.callback_query(F.data.regexp(r'^match:watch:\\d+$'))")
     render=_block("async def _render_live_screen", "async def _live_screen_loop")
     signature_fragment="[(e['minute'],e['event_type'],e['description'],e.get('_score_at_event')) for e in events]"
     assert signature_fragment in block
     assert signature_fragment in render
+
+
+def test_live_watch_callback_matches_only_numeric_match_ids():
+    bot = BOT
+    assert "@router.callback_query(F.data.regexp(r'^match:watch:\\d+$'))" in bot
+
+
+def test_live_watch_uses_direct_bot_send_message_and_acknowledges_callback_first():
+    bot = BOT
+    start = bot.index("@router.callback_query(F.data.regexp(r'^match:watch:")
+    end = bot.index("@router.callback_query(F.data.startswith('match:watch:refresh:'))", start)
+    block = bot[start:end]
+    assert "await cq.answer('📺 Открываю live-экран…')" in block
+    open_start = bot.index("async def _open_live_screen")
+    open_end = bot.index("@router.callback_query(F.data.regexp(r'^match:watch:", open_start)
+    open_block = bot[open_start:open_end]
+    assert "await cq.bot.send_message(" in open_block
+    assert "cq.message.answer(" not in open_block

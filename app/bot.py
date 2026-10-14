@@ -1914,16 +1914,23 @@ async def _cancel_live_screen(user_id):
 async def _open_live_screen(cq,match_id):
     await _cancel_live_screen(cq.from_user.id)
     async with SessionLocal() as s: loaded=await _load_live_view(s,match_id)
-    if not loaded: return await cq.answer('Матч не найден.',show_alert=True)
+    if not loaded:
+        return False
     row,events,motm=loaded
     text_value=_live_watch_text(row,events,motm)
     markup=_live_watch_keyboard(match_id,row['status']=='FINISHED')
     try:
         # The viewer is a separate message, leaving the match-center message intact.
-        live_message=await cq.message.answer(text_value,reply_markup=markup)
+        # Use the bot API directly instead of Message.answer(): this also works
+        # reliably for callback messages originating from notification messages.
+        live_message=await cq.bot.send_message(
+            chat_id=cq.message.chat.id,
+            text=text_value,
+            reply_markup=markup,
+        )
     except Exception:
         logger.exception('Live screen message creation failed: user_id=%s match_id=%s',cq.from_user.id,match_id)
-        return await cq.answer('Не удалось открыть live-экран.',show_alert=True)
+        return False
     _LIVE_SCREEN_SIGNATURES[(cq.from_user.id,match_id)]=repr((
         row['status'],row['current_minute'],row['home_score'],row['away_score'],
         row['home_xg'],row['away_xg'],row['home_possession'],row['away_possession'],
@@ -1935,13 +1942,22 @@ async def _open_live_screen(cq,match_id):
             _live_screen_loop(live_message,cq.from_user.id,match_id),
             name=f'live-screen-{cq.from_user.id}-{match_id}'
         )
-    await cq.answer(); logger.info('Live screen opened by user: user_id=%s match_id=%s message_id=%s',cq.from_user.id,match_id,getattr(live_message,'message_id',None))
+    logger.info('Live screen opened by user: user_id=%s match_id=%s message_id=%s',cq.from_user.id,match_id,getattr(live_message,'message_id',None))
+    return True
 
-@router.callback_query(F.data.startswith('match:watch:') & ~F.data.startswith('match:watch:refresh:') & ~F.data.startswith('match:watch:lineups:') & ~F.data.startswith('match:watch:stats:') & ~F.data.startswith('match:watch:back:') & ~F.data.startswith('match:watch:tactics:') & ~F.data.startswith('match:watch:sub:') & ~F.data.startswith('match:watch:report:'))
+@router.callback_query(F.data.regexp(r'^match:watch:\d+$'))
 async def cb_match_watch(cq:CallbackQuery):
     try: mid=int(cq.data.rsplit(':',1)[1])
     except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
-    await _open_live_screen(cq,mid)
+    # Acknowledge the callback immediately so Telegram does not keep the button
+    # spinner while the database query/message creation is running.
+    await cq.answer('📺 Открываю live-экран…')
+    opened=await _open_live_screen(cq,mid)
+    if not opened:
+        try:
+            await cq.bot.send_message(cq.message.chat.id,'⚠️ Не удалось открыть live-экран. Попробуйте ещё раз.')
+        except Exception:
+            logger.exception('Could not report live screen open failure: user_id=%s match_id=%s',cq.from_user.id,mid)
 
 @router.callback_query(F.data.startswith('match:watch:refresh:'))
 async def cb_match_watch_refresh(cq:CallbackQuery):
