@@ -4,6 +4,7 @@ import hashlib, math
 from functools import lru_cache
 from app.game.economy import stadium_capacity
 from app.game.ratings import player_rating
+from app.services import clean_display_name
 
 ROOT=Path(__file__).resolve().parents[2]
 ASSET=ROOT/'assets'/'visual'
@@ -146,7 +147,7 @@ def player_card(player,out=None,size=(620,860)):
 
     # Name band.
     first=str(player.get('first_name') or '').strip().upper()
-    last=str(player.get('last_name') or '').strip().upper()
+    last=clean_display_name(player.get('last_name') or '').upper()
     name=' '.join(x for x in (first,last) if x) or 'PLAYER'
     name_y=476
     if len(name)>18 and ' ' in name:
@@ -282,11 +283,11 @@ def tactical_board_screen(formation='4-3-3', players=None, title='TACTICAL BOARD
         y=145+i*49
         accent=(70,220,165) if i==0 else (80,150,220)
         d.ellipse((985,y,1019,y+34),fill=accent)
-        text_center(d,(1002,y+17),str(i+1),font(16,True),(255,255,255))
-        nm=f"{p.get('first_name','')} {p.get('last_name','')}".strip()[:18]
+        text_center(d,(1002,y+17),str(p.get('shirt_number') or i+1),font(16,True),(255,255,255))
+        nm=clean_display_name(f"{p.get('first_name','')} {p.get('last_name','')}")[:18]
         d.text((1032,y+2),nm,font=font(17,True),fill=(242,246,250))
-        meta=f"{p.get('position','')}  {p.get('role','STARTER')}"
-        d.text((1032,y+24),meta[:28],font=font(13),fill=(145,170,195))
+        meta=f"{p.get('slot_label',p.get('position',''))}  ·  №{p.get('shirt_number') or i+1}  ·  {p.get('role','STARTER')}"
+        d.text((1032,y+24),meta[:34],font=font(13),fill=(145,170,195))
     # player markers use supplied board coordinates; fall back to formation map
     fallback=formation_positions(formation)
     for i,p in enumerate(rows):
@@ -295,8 +296,8 @@ def tactical_board_screen(formation='4-3-3', players=None, title='TACTICAL BOARD
         x=px0+(px1-px0)*float(bx)/100; y=py0+(py1-py0)*float(by)/100
         radius=28
         d.ellipse((x-radius,y-radius,x+radius,y+radius),fill=(28,125,235),outline=(255,255,255),width=3)
-        text_center(d,(x,y),str(i+1),font(17,True),(255,255,255))
-        nm=f"{p.get('first_name','')} {p.get('last_name','')}".strip().split()
+        text_center(d,(x,y),str(p.get('shirt_number') or i+1),font(17,True),(255,255,255))
+        nm=clean_display_name(f"{p.get('first_name','')} {p.get('last_name','')}").split()
         short=(nm[-1] if nm else str(i+1))[:11]
         text_center(d,(x,y+43),short,font(14,True),(255,255,255))
         instr=str(p.get('instruction','BALANCED'))
@@ -328,7 +329,7 @@ def squad_screen(club_name, players, out=None, size=(1400,900)):
         rarity=p.get('rarity','BASE'); _,accent=RARITY.get(rarity,RARITY['BASE'])
         d.ellipse((x,y,x+44,y+44),fill=(15,32,52),outline=accent,width=3)
         text_center(d,(x+22,y+22),str(p.get('shirt_number') or idx+1),font(15,True),(255,255,255))
-        nm=f"{p.get('first_name','')} {p.get('last_name','')}".strip()[:23]
+        nm=clean_display_name(f"{p.get('first_name','')} {p.get('last_name','')}")[:23]
         d.text((x+58,y+1),nm,font=font(18,True),fill=(240,244,248))
         d.text((x+58,y+27),f"{p.get('position','')} · OVR {p.get('overall','—')} · FIT {p.get('fitness',100)} · FORM {p.get('form',0):+d}",font=font(13),fill=(150,175,200))
         if p.get('is_injured'): d.text((x+520,y+12),'🩹',font=font(20),fill=(255,100,100))
@@ -416,7 +417,7 @@ def market_screen(rows, out=None, size=(1300,850)):
     for i,p in enumerate(rows[:10]):
         y=105+i*67; _,accent=RARITY.get(p.get('rarity','BASE'),RARITY['BASE'])
         rounded(d,(40,y,1260,y+54),14,fill=(10,29,50),outline=(45,80,110),w=1)
-        d.text((58,y+12),f"#{p.get('id')}  {p.get('first_name','')} {p.get('last_name','')}"[:34],font=font(17,True),fill=(240,245,250))
+        d.text((58,y+12),f"#{p.get('id')}  {clean_display_name(str(p.get('first_name',''))+' '+str(p.get('last_name','')))}"[:34],font=font(17,True),fill=(240,245,250))
         d.text((520,y+13),str(p.get('position','')),font=font(17,True),fill=accent)
         d.text((650,y+13),f"OVR {p.get('overall','—')}",font=font(16,True),fill=(180,205,225))
         d.text((820,y+13),str(p.get('rarity','BASE')),font=font(14,True),fill=accent)

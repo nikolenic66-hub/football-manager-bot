@@ -16,7 +16,7 @@ from pathlib import Path
 from .config import settings
 from .db import SessionLocal
 from .repositories import get_or_create_user, create_club
-from .services import create_league, join_league, start_league, start_round_halftime, schedule_round, change_halftime_tactics, market_players, buy_player, sell_player, set_player_instruction, get_tactical_board, set_starting_lineup, plan_substitution, scout_opponent, next_opponent, set_counterplan, set_ticket_price, upgrade_stadium, financial_report, set_training_plan, train_squad, renew_contract, set_player_expectation, list_player_for_transfer, cancel_transfer_listing, make_transfer_offer, accept_transfer_offer, player_management_report, notification_list, notification_unread_count, mark_notifications_read, set_notification_preference, notification_preferences, build_starting_lineup
+from .services import create_league, join_league, start_league, start_round_halftime, schedule_round, change_halftime_tactics, market_players, buy_player, sell_player, set_player_instruction, get_tactical_board, set_starting_lineup, plan_substitution, scout_opponent, next_opponent, set_counterplan, set_ticket_price, upgrade_stadium, financial_report, set_training_plan, train_squad, renew_contract, set_player_expectation, list_player_for_transfer, cancel_transfer_listing, make_transfer_offer, accept_transfer_offer, player_management_report, notification_list, notification_unread_count, mark_notifications_read, set_notification_preference, notification_preferences, build_starting_lineup, clean_display_name, display_player_name
 from .game.ratings import player_rating
 from .game.tactics import Tactics, Style, STYLE_SLIDERS
 from .game.economy import STADIUM_CAPACITY_STEP
@@ -121,7 +121,7 @@ def squad_keyboard(players, page=0, prefix='squad'):
     end=min(start+page_size,len(players))
     for i in range(start,end):
         p=players[i]
-        last=(p.get('last_name') or p.get('name') or 'Игрок')[:10]
+        last=clean_display_name(p.get('last_name') or p.get('name') or 'Игрок')[:10]
         k.button(text=f'{i+1}. {last}',callback_data=f'{prefix}:item:{i}')
     for code,label in (('GK','🧤 Вратари'),('DEF','🛡 Защита'),('MID','⚙ Полузащита'),('ATT','⚡ Атака')):
         k.button(text=label,callback_data=f'{prefix}:filter:{code}')
@@ -146,7 +146,7 @@ def tactic_keyboard(players, filter_code, page=0, selected=None, page_size=8):
     end=min(start+page_size,len(players))
     for r in players[start:end]:
         pid=int(r['id'])
-        last=(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
+        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
         mark='✓ ' if pid in selected else ''
         k.button(text=f'{mark}{last}',callback_data=f'tactic:item:{pid}:{filter_code}:{page}')
     k.adjust(2)
@@ -200,9 +200,9 @@ def _lineup_text(rows, formation, assignments):
         pr=_rating_player(r); base=player_rating(pr); adjusted=player_rating(pr,slot)
         if r['position'] != slot:
             penalty=round((1-adjusted/max(base,1))*100)
-            lines.append(f'{label}:  ⚠️ {r["first_name"]} {r["last_name"]} → {POSITION_LABELS_RU.get(slot,slot)} (OVR {base:.0f} → {adjusted:.0f}, −{penalty}%)')
+            lines.append(f'{label}:  ⚠️ {display_player_name(r.get('first_name'),r.get('last_name'))} → {POSITION_LABELS_RU.get(slot,slot)} (OVR {base:.0f} → {adjusted:.0f}, −{penalty}%)')
         else:
-            lines.append(f'{label}:  ✅ {r["first_name"]} {r["last_name"]} ({adjusted:.0f})')
+            lines.append(f'{label}:  ✅ {display_player_name(r.get('first_name'),r.get('last_name'))} ({adjusted:.0f})')
     return '\n'.join(lines)
 
 
@@ -229,7 +229,7 @@ def _player_picker_keyboard(rows, slot):
         pid=int(r['id'])
         pr=_rating_player(r); overall=player_rating(pr,slot)
         label=POSITION_LABELS_RU.get(r['position'],r['position'])
-        k.button(text=f'{r["first_name"]} {r["last_name"]} · {label} · {overall:.0f}',callback_data=f'tactic:player:{pid}')
+        k.button(text=f'{display_player_name(r.get('first_name'),r.get('last_name'))} · {label} · {overall:.0f}',callback_data=f'tactic:player:{pid}')
     k.adjust(1)
     k.button(text='⬜ Снять игрока',callback_data='tactic:clear')
     k.button(text='⬅️ К составу',callback_data='tactic:pick')
@@ -246,7 +246,7 @@ def _market_data(rows):
     for r in rows:
         pr=type('P',(),dict(
             r,
-            name=f"{r.get('first_name','')} {r.get('last_name','')}".strip() or 'Игрок',
+            name=display_player_name(r.get('first_name'),r.get('last_name')),
             fitness=100,
             form=0,
         ))()
@@ -260,7 +260,7 @@ def _market_data(rows):
 def _market_keyboard(data):
     k=InlineKeyboardBuilder()
     for i,r in enumerate(data[:10]):
-        name=f"{r.get('first_name','')} {r.get('last_name','')}".strip()
+        name=display_player_name(r.get('first_name'),r.get('last_name'))
         price=r.get('asking_price') if r.get('listing_id') else r.get('market_value',0)
         label=f"{name.split()[-1] if name else 'Игрок'} · {r.get('position','')} · €{int(price):,}"
         k.button(text=label[:30],callback_data=f'market:item:{i}')
@@ -275,7 +275,7 @@ def _market_keyboard(data):
 def _contract_keyboard(rows):
     k=InlineKeyboardBuilder()
     for i,r in enumerate(rows):
-        last=(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
+        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:12]
         k.button(text=f'{i+1}. {last}',callback_data=f'contract:item:{i}')
     k.adjust(6)
     k.button(text='⬅ Назад',callback_data='menu')
@@ -375,7 +375,7 @@ async def cmd_playround(m:Message, from_user=None):
         round_no=league['current_round']
         try: scheduled_at,count=await schedule_round(s,league['id'],round_no,10); await s.commit()
         except ValueError as e: await s.rollback(); return await m.answer(str(e))
-    await m.answer(f'📅 <b>Тур {round_no} запланирован</b>\n\n⚽ Ваш матч начнётся через <b>10 минут</b>.\n🔔 Отдельного уведомления о стартовом свистке не будет.\n\nПосле старта: 90 сек первый тайм → 60 сек перерыв → 90 сек второй тайм.\nВажные события и итог матча придут отдельными уведомлениями.')
+    await m.answer(f'📅 <b>Тур {round_no} запланирован</b>\n\n⚽ Ваш матч начнётся через <b>10 минут</b>.\n🔔 Отдельного уведомления о стартовом свистке не будет.\n\nПосле старта: 225 сек первый тайм → 60 сек перерыв → 225 сек второй тайм.\nВажные события и итог матча придут отдельными уведомлениями.')
 
 @router.message(Command('resume'))
 async def cmd_resume(m:Message):
@@ -426,7 +426,7 @@ async def cmd_player(m:Message):
     talents=r.get('talents') or []
     if isinstance(talents,str):
         import json; talents=json.loads(talents)
-    caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n{r["position"]} · {r["nationality"]} · {r["rarity"]}\n'
+    caption=(f'🃏 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b>\n{r["position"]} · {r["nationality"]} · {r["rarity"]}\n'
              f'⚡ PAC {r["pace"]} · SHO {r["shooting"]} · PAS {r["passing"]} · DRI {r["dribbling"]}\n'
              f'🛡 DEF {r["defending"]} · PHY {r["physical"]} · STA {r["stamina"]} · MENT {r["mental"]}\n'
              f'🎯 POT {r["potential"]} · €{r["market_value"]:,}\n✨ <b>Таланты:</b> {", ".join(talents) or "—"}')
@@ -474,9 +474,9 @@ async def cmd_squad(m:Message, from_user=None):
     if not rows:return await m.answer('Состав пуст.')
     out=[f'👥 <b>СОСТАВ — {len(rows)} игроков</b>','']
     for r in rows:
-        rating=player_rating(type('P',(),dict(r, suspended=False, name=f'{r["first_name"]} {r["last_name"]}'))())
+        rating=player_rating(type('P',(),dict(r, suspended=False, name=display_player_name(r.get('first_name'),r.get('last_name'))))())
         injury=' 🩹' if r['is_injured'] else ''
-        out.append(f'#{r["shirt_number"] or "-"} {r["first_name"]} {r["last_name"]} · {r["position"]} · <b>{rating}</b> · FIT {r["fitness"]} · FORM {r["form"]:+d}{injury}')
+        out.append(f'#{r["shirt_number"] or "-"} {display_player_name(r.get('first_name'),r.get('last_name'))} · {r["position"]} · <b>{rating}</b> · FIT {r["fitness"]} · FORM {r["form"]:+d}{injury}')
     await m.answer('\n'.join(out))
 
 @router.message(Command('squadview'))
@@ -488,7 +488,7 @@ async def cmd_squadview(m:Message):
     if not rows:return await m.answer('Состав пуст.')
     data=[]
     for r in rows:
-        pr=type('P',(),dict(r,suspended=False,name=f"{r['first_name']} {r['last_name']}"))()
+        pr=type('P',(),dict(r,suspended=False,name=display_player_name(r.get('first_name'),r.get('last_name'))))()
         data.append(dict(r,overall=player_rating(pr)))
     path=squad_screen(c['name'],data)
     await m.answer_photo(FSInputFile(path),caption=f'👥 <b>{c["name"]}</b> · {len(data)} игроков')
@@ -518,7 +518,7 @@ async def cmd_marketview(m:Message):
         rows=await market_players(s,10)
     data=[]
     for r in rows:
-        pr=type('P',(),dict(r,name=f"{r['first_name']} {r['last_name']}",fitness=100,form=0))()
+        pr=type('P',(),dict(r,name=display_player_name(r.get('first_name'),r.get('last_name')),fitness=100,form=0))()
         data.append(dict(r,overall=player_rating(pr),rarity=r.get('rarity','BASE')))
     if not data:return await m.answer('Рынок пуст.')
     path=market_screen(data)
@@ -542,6 +542,7 @@ async def cmd_tactics(m:Message, from_user=None):
         if not c:return await m.answer('Сначала создайте клуб.')
         t=(await s.execute(text('SELECT * FROM club_tactics WHERE club_id=:c'),{'c':c['id']})).mappings().first()
         rows=await get_tactical_board(s,c['id'])
+        await s.commit()
     path=tactical_board_screen(t['formation'],[dict(r) for r in rows[:11]],title=f"{c['name']} · {t['style']}")
     style_labels={'BALANCE':'Баланс','ATTACK':'Атака','COUNTER':'Контратака','DEFENSE':'Защита','POSSESSION':'Владение'}
     caption=(f'🧠 <b>ТАКТИЧЕСКАЯ ДОСКА</b>\n\nФормация: <b>{t["formation"]}</b> · стиль: <b>{style_labels.get(t["style"],t["style"])}</b>\n'
@@ -607,9 +608,10 @@ async def cmd_board(m:Message):
         uid=await current_user(s,m); c=await current_club(s,uid)
         if not c:return await m.answer('Сначала создайте клуб.')
         rows=await get_tactical_board(s,c['id'])
+        await s.commit()
     lines=['🧠 <b>ТАКТИЧЕСКАЯ ДОСКА</b>','']
     for r in rows[:11]:
-        lines.append(f'#{r["shirt_number"] or "-"} {r["first_name"]} {r["last_name"]} · {r["position"]} · {r["role"]} · {r["instruction"]} · ({r["board_x"]},{r["board_y"]})')
+        lines.append(f'#{r["shirt_number"] or "-"} {display_player_name(r.get('first_name'),r.get('last_name'))} · {r.get("slot_label",r["position"])} · {r["role"]} · {r["instruction"]} · ({r["board_x"]},{r["board_y"]})')
     lines += ['', 'Настройка: /boardset PLAYER_ID ROLE INSTRUCTION X Y', 'Пример: /boardset 123 PLAYMAKER ROAM 68 50']
     await m.answer('\n'.join(lines))
 
@@ -638,6 +640,7 @@ async def cmd_lineup(m:Message):
             uid=await current_user(s,m); c=await current_club(s,uid)
             if not c:return await m.answer('Сначала создайте клуб.')
             rows=await get_tactical_board(s,c['id'])
+            await s.commit()
             saved=(await s.execute(text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),{'c':c['id']})).scalar_one_or_none()
         ids=saved or []
         await m.answer('👥 <b>СТАРТОВЫЙ СОСТАВ</b>\n\n'+(' → '.join(str(x) for x in ids) if ids else 'Автоподбор пока используется.')+'\n\nЗадать: /lineup ID1 ID2 ... ID11')
@@ -744,7 +747,7 @@ def _scout_filter_state(uid):
 
 def _scout_menu_text(uid):
     f=_scout_filter_state(uid)
-    pos={'GK':'Вратари','DEF':'Защита','MID':'Полузащита','ATT':'Атака'}.get(f['position'],'Любая')
+    pos={'GK':'ВРТ','LB':'ЛЗ','CB':'ЦЗ','RB':'ПЗ','DM':'ОПЗ','CM':'ЦПЗ','AM':'АПЗ','LW':'ЛП','RW':'ПП','ST':'ЦФ'}.get(f['position'],'Любая')
     age={'16_19':'16-19','20_23':'20-23','24_27':'24-27','28_31':'28-31','32P':'32+'}.get(f['age'],'Любой')
     pot={'LT70':'<70','70_79':'70-79','80_89':'80-89','90P':'90+'}.get(f['pot'],'Любой')
     return (f'🕵️ <b>СКАУТИНГ</b>\n\n'
@@ -769,11 +772,15 @@ def _scout_menu_keyboard(uid):
 def _scout_position_keyboard(uid):
     value=_scout_filter_state(uid)['position']
     k=InlineKeyboardBuilder()
-    for code,label in (('GK','🧤 Вратари'),('DEF','🛡 Защита'),('MID','⚙ Полузащита'),('ATT','⚡ Атака')):
+    for code,label in (
+        ('GK','🧤 ВРТ'),('LB','🛡 ЛЗ'),('CB','🛡 ЦЗ'),('RB','🛡 ПЗ'),
+        ('DM','⚙️ ОПЗ'),('CM','⚙️ ЦПЗ'),('AM','⚙️ АПЗ'),
+        ('LW','⚡ ЛП'),('RW','⚡ ПП'),('ST','⚡ ЦФ'),
+    ):
         k.button(text=('✓ ' if value==code else '')+label,callback_data=f'scout:position:{code}')
     k.button(text=('✓ ' if value is None else '')+'Любая',callback_data='scout:position:any')
     k.button(text='⬅️ Назад',callback_data='scout')
-    k.adjust(2,2,1,1)
+    k.adjust(4,4,2,2,1,1)
     return k.as_markup()
 
 
@@ -803,10 +810,11 @@ async def _scout_search(s, club_id, filters, page=0):
     conditions=['NOT EXISTS (SELECT 1 FROM club_players cp WHERE cp.player_id=p.id)']
     params={'offset':max(0,int(page))*8}
     if filters.get('position'):
-        groups={'GK':['GK'],'DEF':['LB','CB','RB'],'MID':['DM','CM','AM'],'ATT':['LW','RW','ST']}
-        positions=groups[filters['position']]
-        conditions.append('p.position = ANY(:positions)')
-        params['positions']=positions
+        position=filters['position']
+        if position not in {'GK','LB','CB','RB','DM','CM','AM','LW','RW','ST'}:
+            raise ValueError('Unsupported scouting position.')
+        conditions.append('p.position = :pos')
+        params['pos']=position
     age=filters.get('age')
     if age=='16_19': conditions.append('p.age BETWEEN 16 AND 19')
     elif age=='20_23': conditions.append('p.age BETWEEN 20 AND 23')
@@ -828,7 +836,7 @@ async def _scout_search(s, club_id, filters, page=0):
 def _scout_results_keyboard(rows, total, page):
     k=InlineKeyboardBuilder()
     for i,r in enumerate(rows):
-        last=(r.get('last_name') or r.get('first_name') or 'Игрок')[:16]
+        last=clean_display_name(r.get('last_name') or r.get('first_name') or 'Игрок')[:16]
         k.button(text=f'{i+1}. {last}',callback_data=f'scout:item:{r["id"]}')
     k.adjust(2)
     pages=max(1,(total+7)//8)
@@ -893,9 +901,9 @@ async def cmd_market(m:Message):
     out=['🔄 <b>ТРАНСФЕРНЫЙ РЫНОК</b>','']
     for r in rows:
         if r.get('listing_id'):
-            out.append(f'#{r["id"]} {r["first_name"]} {r["last_name"]} · {r["position"]} · €{r["asking_price"]:,} · POT {r["potential"]}\n/offer {r["listing_id"]} {r["asking_price"]}')
+            out.append(f'#{r["id"]} {display_player_name(r.get('first_name'),r.get('last_name'))} · {r["position"]} · €{r["asking_price"]:,} · POT {r["potential"]}\n/offer {r["listing_id"]} {r["asking_price"]}')
         else:
-            out.append(f'#{r["id"]} {r["first_name"]} {r["last_name"]} · {r["position"]} · €{r["market_value"]:,} · POT {r["potential"]}\n/buy {r["id"]}')
+            out.append(f'#{r["id"]} {display_player_name(r.get('first_name'),r.get('last_name'))} · {r["position"]} · €{r["market_value"]:,} · POT {r["potential"]}\n/buy {r["id"]}')
     await m.answer('\n'.join(out))
 
 @router.message(Command('buy'))
@@ -910,7 +918,7 @@ async def cmd_buy(m:Message):
         except Exception:
             await s.rollback(); logger.exception('Failed to buy player via /buy: player_id=%s', int(parts[1]))
             return await m.answer('❌ Не удалось выполнить покупку. Попробуйте ещё раз позже.')
-    await m.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
+    await m.answer(f'✅ Куплен {display_player_name(player.get('first_name'),player.get('last_name'))} за €{price:,}.')
 
 @router.message(Command('sell'))
 async def cmd_sell(m:Message):
@@ -924,7 +932,7 @@ async def cmd_sell(m:Message):
         except Exception:
             await s.rollback(); logger.exception('Failed to sell player via /sell: player_id=%s', int(parts[1]))
             return await m.answer('❌ Не удалось выполнить продажу. Попробуйте ещё раз позже.')
-    await m.answer(f'✅ {row["first_name"]} {row["last_name"]} продан за €{price:,}.')
+    await m.answer(f'✅ {display_player_name(row.get('first_name'),row.get('last_name'))} продан за €{price:,}.')
 
 def _finance_keyboard():
     k=InlineKeyboardBuilder()
@@ -1068,7 +1076,7 @@ async def cb_finance_salaries(cq:CallbackQuery):
             ORDER BY salary DESC,p.id LIMIT 10'''),{'c':c['id']})).mappings().all()
     lines=[f'⚖️ <b>ЗАРПЛАТНАЯ ВЕДОМОСТЬ — {c["name"]}</b>','',f'Итого по составу: <b>€{total:,}</b> / период','', 'Топ-10 по зарплате:']
     for r in rows:
-        lines.append(f'• {r["first_name"]} {r["last_name"]} · {r["position"]} · <b>€{int(r["salary"]):,}</b>')
+        lines.append(f'• {display_player_name(r.get('first_name'),r.get('last_name'))} · {r["position"]} · <b>€{int(r["salary"]):,}</b>')
     await cq.answer()
     await cq.message.answer('\n'.join(lines),reply_markup=back_keyboard('finance'))
 
@@ -1317,7 +1325,7 @@ async def cmd_contracts(m:Message):
         rows=await player_management_report(s,c['id'])
     out=['📝 <b>КОНТРАКТЫ И СОСТОЯНИЕ СОСТАВА</b>','']
     for r in rows:
-        out.append(f'#{r["id"]} {r["first_name"]} {r["last_name"]} · €{int(r["contract_salary"] or 0):,} · morale {r["morale"]} · {r["playing_time_expectation"]} · {r["contract_until"]}')
+        out.append(f'#{r["id"]} {display_player_name(r.get('first_name'),r.get('last_name'))} · €{int(r["contract_salary"] or 0):,} · morale {r["morale"]} · {r["playing_time_expectation"]} · {r["contract_until"]}')
     await m.answer('\n'.join(out[:31]))
 
 @router.message(Command('list'))
@@ -1371,7 +1379,7 @@ async def cmd_offers(m:Message):
             FROM transfer_offers o JOIN transfer_listings l ON l.id=o.listing_id JOIN players p ON p.id=l.player_id
             WHERE l.seller_club_id=:c AND o.status='PENDING' ORDER BY o.id DESC'''),{'c':c['id']})).mappings().all()
     if not rows:return await m.answer('📨 Новых предложений нет.')
-    await m.answer('\n'.join(["📨 <b>ПРЕДЛОЖЕНИЯ</b>"]+[f'#{r["id"]} {r["first_name"]} {r["last_name"]} — €{r["amount"]:,} → /acceptoffer {r["id"]}' for r in rows]))
+    await m.answer('\n'.join(["📨 <b>ПРЕДЛОЖЕНИЯ</b>"]+[f'#{r["id"]} {display_player_name(r.get('first_name'),r.get('last_name'))} — €{r["amount"]:,} → /acceptoffer {r["id"]}' for r in rows]))
 
 @router.message(Command('fixtures'))
 async def cmd_fixtures(m:Message):
@@ -1582,7 +1590,7 @@ async def cb_market_item(cq:CallbackQuery):
         return await cq.answer('Игрок не найден.',show_alert=True)
     r=data[index]
     card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'market_player_{r["id"]}.png')
-    caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n'
+    caption=(f'🃏 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b>\n'
              f'{r["position"]} · рейтинг <b>{r.get("overall","—")}</b> · €{int(r.get("asking_price") or r.get("market_value") or 0):,} · POT {r.get("potential","—")}')
     k=InlineKeyboardBuilder()
     if r.get('listing_id'):
@@ -1609,7 +1617,7 @@ async def cb_market_buy(cq:CallbackQuery):
             await s.rollback(); logger.exception('Market buy failed: player_id=%s', pid)
             return await cq.answer('❌ Не удалось выполнить операцию.', show_alert=True)
     await cq.answer()
-    await cq.message.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
+    await cq.message.answer(f'✅ Куплен {display_player_name(player.get('first_name'),player.get('last_name'))} за €{price:,}.')
     await _show_market(cq,cq.from_user.id)
 
 @router.callback_query(F.data.startswith('market:offer:'))
@@ -1642,7 +1650,7 @@ async def cb_contract_item(cq:CallbackQuery):
     if index<0 or index>=len(rows):return await cq.answer('Игрок не найден.',show_alert=True)
     r=dict(rows[index]); _CONTRACT_VIEWS[cq.from_user.id]=r
     card=player_card(_card_player(r),out=Path('assets/visual/cards')/f'contract_player_{r["id"]}.png')
-    caption=(f'📝 <b>{r["first_name"]} {r["last_name"]}</b> · {r["position"]}\n'
+    caption=(f'📝 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b> · {r["position"]}\n'
              f'Зарплата: €{int(r.get("contract_salary") or 0):,}\n'
              f'Окончание: {r.get("contract_until") or "—"}\n'
              f'Мораль: {r.get("morale","—")} · ожидание: {r.get("playing_time_expectation") or "—"}')
@@ -1706,7 +1714,7 @@ async def _refresh_contract_item(cq,pid):
     row=next((dict(r) for r in rows if int(r['id'])==int(pid)),None)
     if not row:return
     card=player_card(_card_player(row),out=Path('assets/visual/cards')/f'contract_player_{row["id"]}.png')
-    caption=(f'📝 <b>{row["first_name"]} {row["last_name"]}</b> · {row["position"]}\n'
+    caption=(f'📝 <b>{display_player_name(row.get('first_name'),row.get('last_name'))}</b> · {row["position"]}\n'
              f'Зарплата: €{int(row.get("contract_salary") or 0):,}\n'
              f'Окончание: {row.get("contract_until") or "—"}\n'
              f'Мораль: {row.get("morale","—")} · ожидание: {row.get("playing_time_expectation") or "—"}')
@@ -1747,7 +1755,7 @@ async def cb_scout_position(c:CallbackQuery):
 @router.callback_query(F.data.startswith('scout:position:'))
 async def cb_scout_position_pick(c:CallbackQuery):
     code=c.data.rsplit(':',1)[1]
-    if code not in {'GK','DEF','MID','ATT','any'}: return await c.answer('Неизвестная позиция.',show_alert=True)
+    if code not in {'GK','LB','CB','RB','DM','CM','AM','LW','RW','ST','any'}: return await c.answer('Неизвестная позиция.',show_alert=True)
     _scout_filter_state(c.from_user.id)['position']=None if code=='any' else code
     await c.answer()
     await c.message.edit_text(_scout_menu_text(c.from_user.id),reply_markup=_scout_menu_keyboard(c.from_user.id))
@@ -1822,7 +1830,7 @@ async def cb_scout_item(c:CallbackQuery):
     if not row:return await c.answer('Игрок уже недоступен для покупки.',show_alert=True)
     data=_card_player(row)
     card=player_card(data,out=Path('assets/visual/cards')/f'scout_player_{pid}.png')
-    caption=(f'🃏 <b>{row["first_name"]} {row["last_name"]}</b>\n'
+    caption=(f'🃏 <b>{display_player_name(row.get('first_name'),row.get('last_name'))}</b>\n'
              f'{row["position"]} · {row.get("nationality") or "—"} · рейтинг <b>{data.get("overall","—")}</b>\n'
              f'⚡ PAC {row["pace"]} · SHO {row["shooting"]} · PAS {row["passing"]} · DRI {row["dribbling"]}\n'
              f'🛡 DEF {row["defending"]} · PHY {row["physical"]} · STA {row["stamina"]} · MENT {row["mental"]}\n'
@@ -1850,7 +1858,7 @@ async def cb_scout_buy(c:CallbackQuery):
             await s.rollback(); logger.exception('Scout buy failed: player_id=%s', pid)
             return await c.answer('❌ Не удалось выполнить операцию.', show_alert=True)
     await c.answer()
-    await c.message.answer(f'✅ Куплен {player["first_name"]} {player["last_name"]} за €{price:,}.')
+    await c.message.answer(f'✅ Куплен {display_player_name(player.get('first_name'),player.get('last_name'))} за €{price:,}.')
     await c.message.answer(_scout_menu_text(c.from_user.id),reply_markup=_scout_menu_keyboard(c.from_user.id))
 def league_menu_keyboard():
     k=InlineKeyboardBuilder()
@@ -2178,7 +2186,7 @@ async def _show_squad(message,telegram_id,filter_code=None,page=0):
     if not rows:return await message.answer('Состав пуст.')
     data=[]
     for r in rows:
-        pr=type('P',(),dict(r,suspended=False,name=f"{r['first_name']} {r['last_name']}"))()
+        pr=type('P',(),dict(r,suspended=False,name=display_player_name(r.get('first_name'),r.get('last_name'))))()
         data.append(dict(r,overall=player_rating(pr)))
     path=squad_screen(c['name'],data)
     caption=f'👥 <b>{c["name"]}</b> · {len(data)} игроков'
@@ -2196,7 +2204,7 @@ async def cb_squad_item(cq:CallbackQuery):
     talents=r.get('talents') or []
     if isinstance(talents,str):
         import json; talents=json.loads(talents)
-    caption=(f'🃏 <b>{r["first_name"]} {r["last_name"]}</b>\n{r["position"]} · {r["nationality"]} · {r["rarity"]}\n'
+    caption=(f'🃏 <b>{display_player_name(r.get('first_name'),r.get('last_name'))}</b>\n{r["position"]} · {r["nationality"]} · {r["rarity"]}\n'
              f'⚡ PAC {r["pace"]} · SHO {r["shooting"]} · PAS {r["passing"]} · DRI {r["dribbling"]}\n'
              f'🛡 DEF {r["defending"]} · PHY {r["physical"]} · STA {r["stamina"]} · MENT {r["mental"]}\n'
              f'🎯 POT {r["potential"]} · €{r["market_value"]:,}\n✨ <b>Таланты:</b> {", ".join(talents) or "—"}')
@@ -2262,7 +2270,7 @@ async def cb_squad_sell(cq:CallbackQuery):
         except Exception:
             await s.rollback(); logger.exception('Squad sell failed: player_id=%s', pid)
             return await cq.answer('❌ Не удалось выполнить операцию.',show_alert=True)
-    await cq.answer('Игрок продан.'); await cq.message.answer(f'💸 {row["first_name"]} {row["last_name"]} продан за <b>€{price:,}</b>.',reply_markup=squad_keyboard([]))
+    await cq.answer('Игрок продан.'); await cq.message.answer(f'💸 {display_player_name(row.get('first_name'),row.get('last_name'))} продан за <b>€{price:,}</b>.',reply_markup=squad_keyboard([]))
 
 
 @router.callback_query(F.data=='squad:transfer')
@@ -2450,7 +2458,7 @@ async def cb_visual_squad(cq:CallbackQuery):
         rows=(await s.execute(text("SELECT p.*,cp.shirt_number,cp.fitness,cp.form,cp.is_injured FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c ORDER BY p.position,p.potential DESC,p.id"),{'c':c['id']})).mappings().all()
     data=[]
     for r in rows:
-        pr=type('P',(),dict(r,suspended=False,name=f"{r['first_name']} {r['last_name']}"))()
+        pr=type('P',(),dict(r,suspended=False,name=display_player_name(r.get('first_name'),r.get('last_name'))))()
         data.append(dict(r,overall=player_rating(pr)))
     path=squad_screen(c['name'],data)
     await cq.message.answer_photo(FSInputFile(path),caption=f'👥 <b>{c["name"]}</b> · {len(data)} игроков'); await cq.answer()

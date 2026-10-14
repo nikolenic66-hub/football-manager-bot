@@ -73,8 +73,9 @@ def test_notification_delivery_rechecks_current_category_preference():
 def test_live_goal_notification_score_uses_complete_event_history():
     source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
     assert 'FROM match_events' in source
-    assert "id<=:id" in source
-    assert 'prior_home=max(0,prior_home-int(row[\'home_halftime_score\'] or 0))' in source
+    assert 'ORDER BY e.minute,e.id' in source
+    assert "goal_scores[event['id']]=(gh,ga)" in source
+    assert "event_home+=int(row['home_halftime_score'] or 0)" in source
 
 
 def test_second_half_excludes_first_half_red_cards_and_injuries():
@@ -177,3 +178,46 @@ def test_live_worker_has_failure_backoff_and_recovery():
     assert 'now_mono-last_failure_log_at >= 60.0' in source
     assert 'consecutive_failures=0' in source
     assert 'Live worker recovered after %s consecutive failures.' in source
+
+
+def test_live_events_are_materialized_only_as_minutes_are_reached():
+    source=(ROOT/'app'/'services.py').read_text(encoding='utf-8')
+    start=source.index('async def start_round_halftime')
+    end=source.index('async def change_halftime_tactics',start)
+    kickoff=source[start:end]
+    advance=source[source.index('async def advance_live_matches'):source.index('# --- Club management expansion')]
+    assert 'halftime_data=:data' in kickoff
+    assert 'INSERT INTO match_events' not in kickoff
+    assert '_materialize_live_events(s,match,phase_data,minute)' in advance
+    assert 'current+min(3,max(0,wall_target-current))' in advance
+
+
+def test_live_event_text_normalizes_literal_newline_sequences():
+    source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    assert "replace(r'\\n','\\n')" in source
+    assert "body=f\"{e['minute']}′ {description}\\n{score}\"" in source
+
+
+def test_live_event_score_is_calculated_at_event_minute_and_id():
+    source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    assert 'ORDER BY e.minute,e.id' in source
+    assert "if (int(goal['minute']),int(goal['id'])) > (int(event['minute']),int(event['id']))" in source
+    assert "goal_scores[event['id']]=(gh,ga)" in source
+
+
+def test_live_event_notifications_are_scoped_to_one_match_and_cursor():
+    source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    start=source.index('async def queue_live_event_notifications')
+    end=source.index('async def _queue_for_club',start)
+    block=source[start:end]
+    assert 'WHERE m.id=:m FOR UPDATE' in block
+    assert 'WHERE e.match_id=:m AND e.id>:cursor' in block
+    assert 'UPDATE matches SET live_event_cursor=:id WHERE id=:m' in block
+
+
+def test_live_notifications_are_batched_and_sent_concurrently():
+    worker=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
+    services=(ROOT/'app'/'services.py').read_text(encoding='utf-8')
+    assert 'ORDER BY e.minute,e.id LIMIT 2' in worker
+    assert 'results=await asyncio.gather' in services
+    assert 'send them concurrently' in services

@@ -1,6 +1,9 @@
 from secrets import token_urlsafe
+import asyncio
 import json
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+import re
 from sqlalchemy import text
 from app.game.engine import simulate_match, expected_goals
 from app.game.ratings import player_rating
@@ -12,6 +15,18 @@ from app.models import Player
 from app.game.economy import calculate_match_economy, sponsor_income, wage_bill, prize_money, stadium_capacity, TICKET_MIN, TICKET_MAX
 
 PLAYER_FIELDS='p.id,p.first_name,p.last_name,p.position,p.age,p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental,p.talents'
+
+
+def clean_display_name(name):
+    """Remove the legacy four-digit synthetic suffix from displayed names."""
+    value=' '.join(str(name or '').split())
+    return re.sub(r'\s+\d{4}$', '', value).strip()
+
+
+def display_player_name(first_name='', last_name=''):
+    first=clean_display_name(first_name)
+    last=clean_display_name(last_name)
+    return clean_display_name(f'{first} {last}') or 'Игрок'
 
 
 def row_player(r):
@@ -76,7 +91,7 @@ async def start_league(s, user_id):
     fixtures=round_robin(clubs,True)
     # The calendar is the single source of truth for kickoff times.
     # Round 1 starts in 10 minutes; subsequent rounds are spaced by 10 minutes,
-    # leaving a buffer after the ~4-minute live match.
+    # leaving a buffer after the ~8.5-minute live match.
     season_start=datetime.now(timezone.utc)+timedelta(minutes=10)
     for f in fixtures:
         seed=f.round_no*1_000_003+f.home_club_id*1009+f.away_club_id
@@ -157,15 +172,25 @@ async def _starting_players(s,club_id):
     slots=[slot for slot,_,_ in FORMATION_SLOTS[tactics.formation]]
     saved=(await s.execute(text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),{'c':club_id})).scalar_one_or_none()
     if saved:
-        chosen=[]
+        chosen=[]; seen=set()
         for pid in saved:
-            if pid in by_id and pid not in {p.id for p in chosen}: chosen.append(by_id[pid])
+            pid=int(pid)
+            if pid in by_id and pid not in seen:
+                chosen.append(by_id[pid]); seen.add(pid)
             if len(chosen)==11: break
         if len(chosen)==11:
             return chosen
+
+    # A missing/invalid saved lineup is repaired once and persisted. This makes
+    # club_lineups the single source of truth for the board and starting XI.
     rows_by_id={r['id']:r for r in rows}
     lineup_rows=build_starting_lineup(list(rows_by_id.values()), slots)
-    return [by_id[r['id']] for r in lineup_rows]
+    player_ids=[int(r['id']) for r in lineup_rows]
+    await s.execute(text('''INSERT INTO club_lineups(club_id,player_ids)
+        VALUES(:c,:ids)
+        ON CONFLICT(club_id) DO UPDATE SET player_ids=EXCLUDED.player_ids'''),
+        {'c':club_id,'ids':player_ids})
+    return [by_id[pid] for pid in player_ids]
 
 async def _bench_players(s,club_id,starting_ids=None):
     ids=list(starting_ids or []) or [0]
@@ -211,15 +236,55 @@ async def _save_lineup_and_tactics(s, match_id, club_id, players, tactics):
          'w':tactics.width,'d':tactics.defensive_line,'a':tactics.aggression})
 
 
-async def _club_board(s, club_id, players, formation):
+async def _club_board(s, club_id, players=None, formation=None):
     from app.game.board import TacticalBoard
-    rows=(await s.execute(text("SELECT player_id,role,instruction,board_x,board_y FROM club_player_instructions WHERE club_id=:c"),{"c":club_id})).mappings().all()
-    by={r["player_id"]:r for r in rows}
+    if formation is None:
+        formation=(await _club_tactics(s,club_id)).formation
+
+    saved=(await s.execute(
+        text('SELECT player_ids FROM club_lineups WHERE club_id=:c'),
+        {'c':club_id}
+    )).scalar_one_or_none()
+
+    # club_lineups.player_ids is the authoritative XI/slot order. A lineup
+    # is considered valid only when all eleven saved players are currently
+    # available in this club. This prevents stale/injured/deleted IDs from
+    # shifting the board to a different squad.
+    if not saved or len(saved) != 11 or len(set(map(int,saved))) != 11:
+        players=await _starting_players(s,club_id)
+        saved=[int(p.id) for p in players]
+    else:
+        saved=[int(pid) for pid in saved]
+        rows=(await s.execute(text(
+            f"SELECT {PLAYER_FIELDS},cp.fitness,cp.form,cp.morale,cp.is_injured,cp.injury_matches,cp.suspension_matches,p.secondary_positions"
+            " FROM club_players cp JOIN players p ON p.id=cp.player_id"
+            " WHERE cp.club_id=:c AND p.id=ANY(:ids)"
+        ), {'c':club_id,'ids':saved})).mappings().all()
+        by_id={int(r['id']):row_player(r) for r in rows}
+        if len(by_id) != 11 or any(by_id[pid].suspended for pid in saved if pid in by_id):
+            players=await _starting_players(s,club_id)
+            saved=[int(p.id) for p in players]
+        else:
+            # Rebuild from saved IDs, never from OVR/shirt-number order.
+            players=[by_id[pid] for pid in saved]
+
+    rows=(await s.execute(text(
+        "SELECT player_id,role,instruction,board_x,board_y "
+        "FROM club_player_instructions WHERE club_id=:c"
+    ), {"c":club_id})).mappings().all()
+    by={int(r['player_id']):r for r in rows}
     board=TacticalBoard(formation)
-    for i,p in enumerate(players):
-        r=by.get(p.id)
+
+    # Index == formation slot. Never sort by OVR/shirt number here.
+    for index,pid in enumerate(saved[:11]):
+        p=next((player for player in players if int(player.id)==pid),None)
+        if p is None:
+            continue
+        r=by.get(pid)
         if r:
-            board=board.assign(i,r["role"],r["instruction"]).reposition(i,r["board_x"],r["board_y"])
+            board=board.assign(index,r['role'],r['instruction'])
+            if r['board_x'] is not None and r['board_y'] is not None:
+                board=board.reposition(index,int(r['board_x']),int(r['board_y']))
     return board
 
 async def set_player_instruction(s, club_id, player_id, role, instruction, x=50, y=50):
@@ -233,12 +298,40 @@ async def set_player_instruction(s, club_id, player_id, role, instruction, x=50,
         {"c":club_id,"p":player_id,"r":role,"i":instruction,"x":x,"y":y})
 
 async def get_tactical_board(s, club_id):
-    return (await s.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,cp.shirt_number,
+    tactics=await _club_tactics(s,club_id)
+    players=await _starting_players(s,club_id)
+    player_ids=[int(p.id) for p in players]
+    if not player_ids:
+        return []
+    rows=(await s.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,cp.shirt_number,
         COALESCE(i.role,'STARTER') role,COALESCE(i.instruction,'BALANCED') instruction,
-i.board_x board_x,i.board_y board_y
+        i.board_x board_x,i.board_y board_y
         FROM club_players cp JOIN players p ON p.id=cp.player_id
         LEFT JOIN club_player_instructions i ON i.club_id=cp.club_id AND i.player_id=cp.player_id
-        WHERE cp.club_id=:c ORDER BY cp.shirt_number NULLS LAST,p.id"""),{"c":club_id})).mappings().all()
+        WHERE cp.club_id=:c AND p.id=ANY(:ids)"""),{'c':club_id,'ids':player_ids})).mappings().all()
+    by_id={int(r['id']):dict(r) for r in rows}
+    slots=FORMATION_SLOTS[tactics.formation]
+    counts=defaultdict(int)
+    total_by_slot=defaultdict(int)
+    for slot,_,_ in slots:
+        total_by_slot[slot]+=1
+    out=[]
+    for index,p in enumerate(players[:11]):
+        r=by_id.get(int(p.id))
+        if r is None:
+            continue
+        slot,x,y=slots[index]
+        counts[slot]+=1
+        suffix=''
+        if total_by_slot[slot]>1:
+            suffix={1:'₁',2:'₂',3:'₃',4:'₄'}[counts[slot]]
+        r['slot_index']=index
+        r['slot_position']=slot
+        r['slot_label']=POSITION_LABELS_RU.get(slot,slot)+suffix
+        r['board_x']=x if r.get('board_x') is None else r['board_x']
+        r['board_y']=y if r.get('board_y') is None else r['board_y']
+        out.append(r)
+    return out
 
 
 async def _ensure_same_league(s, club_id, opponent_club_id):
@@ -293,7 +386,7 @@ async def scout_opponent(s, club_id, opponent_club_id, limit=5):
         ev=(await s.execute(text('''SELECT p.first_name,p.last_name,count(*) n FROM match_events e JOIN players p ON p.id=e.player_id
             WHERE e.club_id=:c AND e.match_id=ANY(:ids) AND e.event_type IN ('GOAL','ASSIST')
             GROUP BY p.id,p.first_name,p.last_name ORDER BY n DESC,p.last_name LIMIT 10'''),{'c':opponent_club_id,'ids':match_ids})).mappings().all()
-        events={f"{r['first_name']} {r['last_name']}":r['n'] for r in ev}
+        events={display_player_name(r.get('first_name'),r.get('last_name')):r['n'] for r in ev}
     return build_scout_report(opponent_club_id,opponent['name'],matches,events)
 
 async def next_opponent(s, club_id, league_id):
@@ -418,7 +511,7 @@ async def buy_player(s, club_id, player_id):
     if not club: raise ValueError('Club not found.')
     price=int(player['market_value'])
     if club['budget']<price: raise ValueError(f'Not enough budget. Need €{price:,}.')
-    await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {player["first_name"]} {player["last_name"]} за €{price:,}')
+    await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {display_player_name(player.get("first_name"),player.get("last_name"))} за €{price:,}')
     await s.execute(text('INSERT INTO club_players(club_id,player_id) VALUES(:c,:p)'),{'c':club_id,'p':player_id})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,NULL,:c,:price)'),{'p':player_id,'c':club_id,'price':price})
     return player,price
@@ -432,7 +525,7 @@ async def sell_player(s, club_id, player_id):
     if count<=18: raise ValueError('You must keep at least 18 players in the squad.')
     price=max(50_000,int(row['market_value']*0.70))
     await s.execute(text('DELETE FROM club_players WHERE club_id=:c AND player_id=:p'),{'c':club_id,'p':player_id})
-    await record_financial_transaction(s,club_id,'TRANSFER_IN',price,f'Продажа {row["first_name"]} {row["last_name"]} за €{price:,}')
+    await record_financial_transaction(s,club_id,'TRANSFER_IN',price,f'Продажа {display_player_name(row.get("first_name"),row.get("last_name"))} за €{price:,}')
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,:c,NULL,:price)'),{'p':player_id,'c':club_id,'price':price})
     return row,price
 
@@ -482,13 +575,14 @@ async def start_round_halftime(s, league_id, round_no):
         hs,as_,events=simulate_first_half(home,away,ht,at,m['seed']*2+1,hc,ac,hb,ab)
         kickoff=m.get('scheduled_at') or now
         phase_start=min(kickoff, now)
-        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=:hx,away_xg=:ax,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=CAST(:phase_start AS timestamptz),halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,CAST(:phase_start AS timestamptz)),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'hx':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[0]*0.48),2),'ax':round((expected_goals(home,away,ht,at,hb,ab,hc,ac)[1]*0.48),2),'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots]})})
+        full_hx,full_ax=expected_goals(home,away,ht,at,hb,ab,hc,ac)
+        first_hx,first_ax=round(full_hx*.48,2),round(full_ax*.48,2)
+        await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=0,away_xg=0,home_possession=50,away_possession=50,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=CAST(:phase_start AS timestamptz),halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,CAST(:phase_start AS timestamptz)),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots], 'home_players':[p.id for p in home], 'away_players':[p.id for p in away], 'first_half_xg':[first_hx,first_ax], 'full_xg':[round(full_hx,2),round(full_ax,2)]})})
         await _save_lineup_and_tactics(s,m['id'],m['home_club_id'],home,ht); await _save_lineup_and_tactics(s,m['id'],m['away_club_id'],away,at)
-        home_ids={p.name:p.id for p in home}; away_ids={p.name:p.id for p in away}
-        for e in events:
-            pool=home_ids if e.team=='HOME' else away_ids; cid=m['home_club_id'] if e.team=='HOME' else m['away_club_id']
-            await s.execute(text('INSERT INTO match_events(match_id,minute,event_type,club_id,player_id,secondary_player_id,description,metadata) VALUES(:m,:min,:t,:c,:p,:sp,:d,:meta)'),{'m':m['id'],'min':e.minute,'t':e.type,'c':cid,'p':pool.get(e.player),'sp':pool.get(e.secondary_player),'d':e.text,'meta':json.dumps(e.metadata)})
-        out.append({'match_id':m['id'],'home':m['home_club_id'],'away':m['away_club_id'],'home_score':hs,'away_score':as_,'events':events})
+        # The engine generates the deterministic half up front, but future
+        # events stay in match state until the live clock reaches their minute.
+        # This prevents a finished-looking event burst at kickoff.
+        out.append({'match_id':m['id'],'home':m['home_club_id'],'away':m['away_club_id'],'home_score':0,'away_score':0,'events':[]})
     return out
 
 async def change_halftime_tactics(s, match_id, club_id, tactics):
@@ -503,7 +597,7 @@ async def change_halftime_tactics(s, match_id, club_id, tactics):
 
 
 # --- Real-time live match lifecycle ---
-LIVE_SECONDS_PER_MINUTE = 2
+LIVE_SECONDS_PER_MINUTE = 5
 LIVE_HALFTIME_SECONDS = 60
 LIVE_FIRST_HALF_SECONDS = 45 * LIVE_SECONDS_PER_MINUTE
 LIVE_SECOND_HALF_SECONDS = 45 * LIVE_SECONDS_PER_MINUTE
@@ -546,12 +640,8 @@ async def _prepare_second_half_live(s, match, phase_start_at=None):
     hs,as_,events=simulate_second_half(home,away,ht,at,match['seed']*2+2,substitutions,hc,ac,hb,ab)
     hname=(await s.execute(text('SELECT name FROM clubs WHERE id=:c'),{'c':match['home_club_id']})).scalar_one()
     aname=(await s.execute(text('SELECT name FROM clubs WHERE id=:c'),{'c':match['away_club_id']})).scalar_one()
-    home_all=home + await _bench_players(s,match['home_club_id'],[x.id for x in home]); away_all=away + await _bench_players(s,match['away_club_id'],[x.id for x in away])
-    home_by_name={p.name:p for p in home_all}; away_by_name={p.name:p for p in away_all}
-    for e in events:
-        pool=home_by_name if e.team=='HOME' else away_by_name; cid=match['home_club_id'] if e.team=='HOME' else match['away_club_id']
-        pid=pool.get(e.player).id if e.player in pool else None; sp=pool.get(e.secondary_player).id if e.secondary_player in pool else None
-        await s.execute(text('INSERT INTO match_events(match_id,minute,event_type,club_id,player_id,secondary_player_id,description,metadata) VALUES(:m,:min,:t,:c,:p,:sp,:d,:meta)'),{'m':match['id'],'min':e.minute,'t':e.type,'c':cid,'p':pid,'sp':sp,'d':e.text,'meta':json.dumps(e.metadata)})
+    # As in the first half, keep the generated event timeline in phase state
+    # and materialize only reached minutes in advance_live_matches().
     final_h=(match['home_halftime_score'] or 0)+hs; final_a=(match['away_halftime_score'] or 0)+as_
     data={'home':match['home_club_id'],'away':match['away_club_id'],'home_name':hname,'away_name':aname,'final_h':final_h,'final_a':final_a,
           'home_players':[p.id for p in original_home],'away_players':[p.id for p in original_away],
@@ -560,18 +650,90 @@ async def _prepare_second_half_live(s, match, phase_start_at=None):
           'events':[e.__dict__ for e in events],
           'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at)}
     hx,ax=expected_goals(home,away,ht,at)
+    first_half_xg=[float(x) for x in (match.get('halftime_data') or {}).get('first_half_xg',[0,0])]
+    data['second_half_xg']=[round(hx*.52,2),round(ax*.52,2)]
+    data['full_xg']=[round(first_half_xg[0]+hx*.52,2),round(first_half_xg[1]+ax*.52,2)]
     phase_start_at = phase_start_at or datetime.now(timezone.utc)
     await s.execute(text("""UPDATE matches SET current_minute=45,live_phase='SECOND_HALF',halftime_locked=FALSE,
         second_half_started_at=CAST(:start_at AS timestamptz),phase_started_at=CAST(:start_at AS timestamptz),halftime_ends_at=NULL,second_half_data=:data,
-        home_xg=ROUND((COALESCE(home_xg,0)+:hx*0.52)::numeric,2),
-        away_xg=ROUND((COALESCE(away_xg,0)+:ax*0.52)::numeric,2) WHERE id=:m"""),
-        {'m':match['id'],'hs':int(match['home_halftime_score'] or 0),'as_':int(match['away_halftime_score'] or 0),'hx':hx,'ax':ax,'data':json.dumps(data),'start_at':phase_start_at})
+        home_xg=:hx,away_xg=:ax WHERE id=:m"""),
+        {'m':match['id'],'hx':round(first_half_xg[0],2),'ax':round(first_half_xg[1],2),'data':json.dumps(data),'start_at':phase_start_at})
     return data
+
+async def _materialize_live_events(s, match, phase_data, upto_minute):
+    """Persist only events whose match minute has actually been reached."""
+    if not phase_data or upto_minute <= 0:
+        return 0
+    events=phase_data.get('events') or []
+    if not events:
+        return 0
+    existing=(await s.execute(text('''SELECT minute,event_type,club_id,player_id,secondary_player_id,description
+        FROM match_events WHERE match_id=:m'''),{'m':match['id']})).mappings().all()
+    existing_keys={(int(r['minute']),r['event_type'],r['club_id'],r['player_id'],r['secondary_player_id'],r['description']) for r in existing}
+    player_names={'HOME':{},'AWAY':{}}
+    prs=(await s.execute(text('''SELECT cp.club_id,p.id,p.first_name,p.last_name
+        FROM club_players cp JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id IN (:home,:away)'''),
+        {'home':match['home_club_id'],'away':match['away_club_id']})).mappings().all()
+    for r in prs:
+        team='HOME' if r['club_id']==match['home_club_id'] else 'AWAY'
+        player_names[team][display_player_name(r.get('first_name'),r.get('last_name'))]=r['id']
+    inserted=0
+    for raw in sorted(events,key=lambda e:(int(e.get('minute',0)),str(e.get('type','')),str(e.get('player','')))):
+        minute=int(raw.get('minute',0))
+        if minute<=0 or minute>int(upto_minute):
+            continue
+        team=raw.get('team')
+        cid=match['home_club_id'] if team=='HOME' else match['away_club_id']
+        # Player ids are already resolved in the phase snapshot when possible.
+        # Fall back to the active XI by name for old snapshots.
+        player_id=None; secondary_id=None
+        player_name=raw.get('player')
+        secondary_name=raw.get('secondary_player')
+        team_names=player_names.get(team,{})
+        if player_name or secondary_name:
+            player_id=team_names.get(player_name) if player_name else None
+            secondary_id=team_names.get(secondary_name) if secondary_name else None
+        description=str(raw.get('text') or raw.get('description') or '').replace('\\n','\n')
+        metadata=raw.get('metadata') or {}
+        key=(minute,raw.get('type'),cid,player_id,secondary_id,description)
+        if key in existing_keys:
+            continue
+        await s.execute(text('''INSERT INTO match_events(match_id,minute,event_type,club_id,player_id,secondary_player_id,description,metadata)
+            VALUES(:m,:min,:t,:c,:p,:sp,:d,:meta)'''),
+            {'m':match['id'],'min':minute,'t':raw.get('type'),'c':cid,'p':player_id,'sp':secondary_id,'d':description,'meta':json.dumps(metadata)})
+        existing_keys.add(key)
+        inserted+=1
+    return inserted
+
+
+async def _live_score_at_minute(s, match_id, minute, home_club_id, away_club_id):
+    rows=(await s.execute(text('''SELECT club_id,count(*) n FROM match_events
+        WHERE match_id=:m AND event_type='GOAL' AND minute<=:minute GROUP BY club_id'''),
+        {'m':match_id,'minute':minute})).mappings().all()
+    home=next((int(r['n']) for r in rows if r['club_id']==home_club_id),0)
+    away=next((int(r['n']) for r in rows if r['club_id']==away_club_id),0)
+    return home,away
+
+
+def _live_possession(phase_data, minute):
+    home_t=_tactics_from_json(phase_data.get('home_tactics') or {})
+    away_t=_tactics_from_json(phase_data.get('away_tactics') or {})
+    reached=[e for e in (phase_data.get('events') or []) if int(e.get('minute',0))<=int(minute)]
+    home_actions=sum(1 for e in reached if e.get('team')=='HOME' and e.get('type') in {'PASS','CARRY','INTERCEPTION'})
+    away_actions=sum(1 for e in reached if e.get('team')=='AWAY' and e.get('type') in {'PASS','CARRY','INTERCEPTION'})
+    tactical=(home_t.tempo-away_t.tempo)*0.06+(home_t.pressing-away_t.pressing)*0.035
+    flow=(home_actions-away_actions)*0.35
+    home=max(35.0,min(65.0,50.0+tactical+flow))
+    return round(home,2),round(100.0-home,2)
+
 
 async def _finish_live_match(s, match):
     data=match['second_half_data'] or {}
     if not data: raise ValueError('Second-half state is missing.')
-    final_h=int(data['final_h']); final_a=int(data['final_a'])
+    second_h,second_a=await _live_score_at_minute(s,match['id'],90,match['home_club_id'],match['away_club_id'])
+    final_h=int(match['home_halftime_score'] or 0)+second_h
+    final_a=int(match['away_halftime_score'] or 0)+second_a
     for cid,ids in ((match['home_club_id'],data.get('home_players',[])),(match['away_club_id'],data.get('away_players',[]))):
         if ids:
             result='WIN' if (cid==match['home_club_id'] and final_h>final_a) or (cid==match['away_club_id'] and final_a>final_h) else ('LOSS' if (cid==match['home_club_id'] and final_h<final_a) or (cid==match['away_club_id'] and final_a<final_h) else 'DRAW')
@@ -597,15 +759,16 @@ async def _finish_live_match(s, match):
         for rr in recovering:
             if int(rr['injury_matches'] or 0)==1:
                 await queue_club_notification(s,cid,'INJURY','💚 Игрок восстановился',
-                    f"{rr['first_name']} {rr['last_name']} полностью восстановился и снова доступен.",
+                    f"{display_player_name(rr.get('first_name'),rr.get('last_name'))} полностью восстановился и снова доступен.",
                     f'injury-recovered:{cid}:{rr["player_id"]}:{match["id"]}')
             if int(rr['suspension_matches'] or 0)==1:
                 await queue_club_notification(s,cid,'DISCIPLINE','✅ Дисквалификация закончилась',
-                    f"{rr['first_name']} {rr['last_name']} снова доступен после дисквалификации.",
+                    f"{display_player_name(rr.get('first_name'),rr.get('last_name'))} снова доступен после дисквалификации.",
                     f'suspension-ended:{cid}:{rr["player_id"]}:{match["id"]}')
     discipline=(await s.execute(text("SELECT club_id,player_id,event_type FROM match_events WHERE match_id=:m AND event_type IN ('INJURY','RED') AND player_id IS NOT NULL"),{'m':match['id']})).mappings().all()
     for e in discipline:
-        pname=(await s.execute(text("SELECT first_name||' '||last_name FROM players WHERE id=:p"),{'p':e['player_id']})).scalar_one_or_none() or 'Игрок'
+        pname_row=(await s.execute(text("SELECT first_name,last_name FROM players WHERE id=:p"),{'p':e['player_id']})).mappings().first()
+        pname=display_player_name(pname_row.get('first_name'),pname_row.get('last_name')) if pname_row else 'Игрок'
         if e['event_type']=='INJURY':
             await s.execute(text('UPDATE club_players SET is_injured=true,injury_matches=GREATEST(injury_matches,2) WHERE club_id=:c AND player_id=:p'),{'c':e['club_id'],'p':e['player_id']})
             await queue_club_notification(s,e['club_id'],'INJURY','🩹 Игрок получил травму',f'{pname} получил травму. Ожидаемое восстановление — минимум 2 матча.',f'injury:{match["id"]}:{e["player_id"]}')
@@ -613,7 +776,7 @@ async def _finish_live_match(s, match):
             await s.execute(text('UPDATE club_players SET suspension_matches=GREATEST(suspension_matches,1) WHERE club_id=:c AND player_id=:p'),{'c':e['club_id'],'p':e['player_id']})
             await queue_club_notification(s,e['club_id'],'DISCIPLINE','🟥 Удаление',f'{pname} получил красную карточку и пропустит следующий матч.',f'red:{match["id"]}:{e["player_id"]}')
     # Persist live player ratings/MOTM inputs before the match becomes FINISHED.
-    events=(await s.execute(text('SELECT e.minute,e.player_id,e.secondary_player_id,e.event_type FROM match_events e WHERE e.match_id=:m ORDER BY e.id'), {'m':match['id']})).mappings().all()
+    events=(await s.execute(text('SELECT e.minute,e.player_id,e.secondary_player_id,e.event_type FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id'), {'m':match['id']})).mappings().all()
     home_ids=set(data.get('home_players',[])); away_ids=set(data.get('away_players',[]))
     for minute,off_id,on_id,team in data.get('substitutions',[]):
         (home_ids if team=='HOME' else away_ids).add(int(on_id))
@@ -660,17 +823,27 @@ async def advance_live_matches(s, league_id=None):
         phase=match.get('live_phase') or ('HALFTIME' if match.get('halftime_locked') else 'FIRST_HALF')
         phase_start=match.get('phase_started_at') or match.get('started_at') or now
         elapsed=(now-phase_start).total_seconds()
+        elapsed=max(0,elapsed)
+        current=int(match.get('current_minute') or 0)
+
         if phase=='FIRST_HALF':
-            minute=min(45,int(elapsed//LIVE_SECONDS_PER_MINUTE))
-            goals=(await s.execute(text("SELECT club_id,count(*) n FROM match_events WHERE match_id=:m AND event_type='GOAL' AND minute<=:minute GROUP BY club_id"),{'m':match['id'],'minute':minute})).mappings().all()
-            hg=next((int(x['n']) for x in goals if x['club_id']==match['home_club_id']),0)
-            ag=next((int(x['n']) for x in goals if x['club_id']==match['away_club_id']),0)
-            await s.execute(text('UPDATE matches SET current_minute=:min,home_score=:hs,away_score=:as_ WHERE id=:m'),{'min':minute,'hs':hg,'as_':ag,'m':match['id']})
-            if elapsed>=LIVE_FIRST_HALF_SECONDS:
+            wall_target=min(45,int(elapsed//LIVE_SECONDS_PER_MINUTE))
+            minute=min(45,current+min(3,max(0,wall_target-current)))
+            if minute>current:
+                phase_data=match.get('halftime_data') or {}
+                await _materialize_live_events(s,match,phase_data,minute)
+                hg,ag=await _live_score_at_minute(s,match['id'],minute,match['home_club_id'],match['away_club_id'])
+                first_xg=phase_data.get('first_half_xg') or [0,0]
+                hp,ap=_live_possession(phase_data,minute)
+                await s.execute(text('UPDATE matches SET current_minute=:min,home_score=:hs,away_score=:as_,home_xg=:hx,away_xg=:ax,home_possession=:hp,away_possession=:ap WHERE id=:m'),
+                    {'min':minute,'hs':hg,'as_':ag,'hx':round(float(first_xg[0])*minute/45,2),'ax':round(float(first_xg[1])*minute/45,2),'hp':hp,'ap':ap,'m':match['id']})
+            if minute>=45:
                 first_half_end=phase_start+timedelta(seconds=LIVE_FIRST_HALF_SECONDS)
                 end=first_half_end+timedelta(seconds=LIVE_HALFTIME_SECONDS)
-                await s.execute(text("UPDATE matches SET current_minute=45,live_phase='HALFTIME',halftime_locked=TRUE,halftime_ends_at=CAST(:end AS timestamptz),phase_started_at=CAST(:phase AS timestamptz) WHERE id=:m"),{'end':end,'phase':first_half_end,'m':match['id']})
+                await s.execute(text("UPDATE matches SET current_minute=45,live_phase='HALFTIME',halftime_locked=TRUE,halftime_ends_at=CAST(:end AS timestamptz),phase_started_at=CAST(:phase AS timestamptz) WHERE id=:m"),
+                    {'end':end,'phase':first_half_end,'m':match['id']})
                 transitions.append((match['id'],'HALFTIME'))
+
         elif phase=='HALFTIME':
             end=match.get('halftime_ends_at')
             if end is not None and now>=end:
@@ -679,21 +852,26 @@ async def advance_live_matches(s, league_id=None):
                     second_start=fresh['halftime_ends_at']
                     await _prepare_second_half_live(s,fresh,second_start)
                     transitions.append((match['id'],'SECOND_HALF'))
-                    if now >= second_start+timedelta(seconds=LIVE_SECOND_HALF_SECONDS):
-                        refreshed=(await s.execute(text('SELECT * FROM matches WHERE id=:m FOR UPDATE'),{'m':match['id']})).mappings().first()
-                        if refreshed and refreshed['live_phase']=='SECOND_HALF':
-                            result=await _finish_live_match(s,refreshed)
-                            finished.append(result); transitions.append((match['id'],'FULL_TIME'))
+
         elif phase=='SECOND_HALF':
-            minute=min(90,45+int(elapsed//LIVE_SECONDS_PER_MINUTE))
-            goals=(await s.execute(text('''SELECT club_id,count(*) n FROM match_events WHERE match_id=:m AND event_type='GOAL' AND minute<=:minute GROUP BY club_id'''),{'m':match['id'],'minute':minute})).mappings().all()
-            hg=next((int(x['n']) for x in goals if x['club_id']==match['home_club_id']),0)
-            ag=next((int(x['n']) for x in goals if x['club_id']==match['away_club_id']),0)
-            await s.execute(text('UPDATE matches SET current_minute=:min,home_score=:hs,away_score=:as_ WHERE id=:m'),{'min':minute,'hs':int(match['home_halftime_score'] or 0)+hg,'as_':int(match['away_halftime_score'] or 0)+ag,'m':match['id']})
-            if elapsed>=LIVE_SECOND_HALF_SECONDS:
-                fresh=(await s.execute(text('SELECT * FROM matches WHERE id=:m FOR UPDATE'),{'m':match['id']})).mappings().first()
-                if fresh and fresh['live_phase']=='SECOND_HALF':
-                    result=await _finish_live_match(s,fresh)
+            wall_target=min(90,45+int(elapsed//LIVE_SECONDS_PER_MINUTE))
+            minute=min(90,current+min(3,max(0,wall_target-current)))
+            if minute>current:
+                phase_data=match.get('second_half_data') or {}
+                await _materialize_live_events(s,match,phase_data,minute)
+                second_h,second_a=await _live_score_at_minute(s,match['id'],minute,match['home_club_id'],match['away_club_id'])
+                home_score=int(match['home_halftime_score'] or 0)+second_h
+                away_score=int(match['away_halftime_score'] or 0)+second_a
+                first_xg=phase_data.get('full_xg') or [float(match.get('home_xg') or 0),float(match.get('away_xg') or 0)]
+                second_xg=phase_data.get('second_half_xg') or [0,0]
+                progress=max(0,min(45,minute-45))/45
+                hp,ap=_live_possession(phase_data,minute)
+                await s.execute(text('UPDATE matches SET current_minute=:min,home_score=:hs,away_score=:as_,home_xg=:hx,away_xg=:ax,home_possession=:hp,away_possession=:ap WHERE id=:m'),
+                    {'min':minute,'hs':home_score,'as_':away_score,'hx':round(float(first_xg[0])+float(second_xg[0])*progress,2),'ax':round(float(first_xg[1])+float(second_xg[1])*progress,2),'hp':hp,'ap':ap,'m':match['id']})
+            if minute>=90:
+                refreshed=(await s.execute(text('SELECT * FROM matches WHERE id=:m FOR UPDATE'),{'m':match['id']})).mappings().first()
+                if refreshed and refreshed['live_phase']=='SECOND_HALF':
+                    result=await _finish_live_match(s,refreshed)
                     finished.append(result); transitions.append((match['id'],'FULL_TIME'))
     return transitions,finished
 
@@ -744,7 +922,7 @@ async def make_transfer_offer(s, buyer_club_id, listing_id, amount):
     if not club or club['budget']<amount: raise ValueError(f'Not enough budget for €{amount:,}.')
     oid=(await s.execute(text('INSERT INTO transfer_offers(listing_id,buyer_club_id,amount) VALUES(:l,:c,:a) RETURNING id'),{'l':listing_id,'c':buyer_club_id,'a':amount})).scalar_one()
     player=(await s.execute(text('SELECT first_name,last_name FROM players WHERE id=:p'),{'p':listing['player_id']})).mappings().first()
-    await queue_club_notification(s,listing['seller_club_id'],'TRANSFER','📩 Новое трансферное предложение',f"Предложение €{amount:,} за {player['first_name']} {player['last_name']}. Решение ожидает тебя.",f'transfer-offer:{oid}')
+    await queue_club_notification(s,listing['seller_club_id'],'TRANSFER','📩 Новое трансферное предложение',f"Предложение €{amount:,} за {display_player_name(player.get('first_name'),player.get('last_name'))}. Решение ожидает тебя.",f'transfer-offer:{oid}')
     return oid
 
 async def accept_transfer_offer(s, seller_club_id, offer_id):
@@ -762,14 +940,14 @@ async def accept_transfer_offer(s, seller_club_id, offer_id):
     if count>=30: raise ValueError('Buyer squad is full.')
     budget=next(int(r['budget']) for r in locked if r['id']==buyer)
     if budget<offer['amount']: raise ValueError('Buyer no longer has enough budget.')
-    await record_financial_transaction(s,buyer,'TRANSFER_OUT',-offer['amount'],f'Трансфер: {offer["first_name"]} {offer["last_name"]}')
-    await record_financial_transaction(s,seller,'TRANSFER_IN',offer['amount'],f'Продажа: {offer["first_name"]} {offer["last_name"]}')
+    await record_financial_transaction(s,buyer,'TRANSFER_OUT',-offer['amount'],f'Трансфер: {display_player_name(offer.get("first_name"),offer.get("last_name"))}')
+    await record_financial_transaction(s,seller,'TRANSFER_IN',offer['amount'],f'Продажа: {display_player_name(offer.get("first_name"),offer.get("last_name"))}')
     await s.execute(text('DELETE FROM club_players WHERE club_id=:c AND player_id=:p'),{'c':seller,'p':offer['player_id']})
     await s.execute(text('INSERT INTO club_players(club_id,player_id,contract_salary,release_clause) VALUES(:c,:p,:sal,:clause)'),{'c':buyer,'p':offer['player_id'],'sal':max(15000,int(offer['amount'])//35),'clause':max(int(offer['amount'])*2,1000000)})
     await s.execute(text("UPDATE transfer_listings SET status='SOLD' WHERE id=:l"),{'l':offer['listing_id']})
     await s.execute(text("UPDATE transfer_offers SET status=CASE WHEN id=:o THEN 'ACCEPTED' ELSE 'REJECTED' END WHERE listing_id=:l AND status='PENDING'"),{'o':offer_id,'l':offer['listing_id']})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,:f,:t,:a)'),{'p':offer['player_id'],'f':seller,'t':buyer,'a':offer['amount']})
-    pname=f"{offer['first_name']} {offer['last_name']}"
+    pname=display_player_name(offer.get('first_name'),offer.get('last_name'))
     await queue_club_notification(s,buyer,'TRANSFER','🤝 Трансфер завершён',f'{pname} перешёл в твой клуб за €{offer["amount"]:,}.',f'transfer-complete:{offer["id"]}:buyer')
     await queue_club_notification(s,seller,'TRANSFER','💰 Игрок продан',f'{pname} продан за €{offer["amount"]:,}.',f'transfer-complete:{offer["id"]}:seller')
     return offer
@@ -782,7 +960,7 @@ async def buy_player(s, club_id, player_id):
     if not club: raise ValueError('Club not found.')
     price=int(player['market_value'])
     if club['budget']<price: raise ValueError(f'Not enough budget. Need €{price:,}.')
-    await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {player["first_name"]} {player["last_name"]} за €{price:,}')
+    await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {display_player_name(player.get("first_name"),player.get("last_name"))} за €{price:,}')
     await s.execute(text('INSERT INTO club_players(club_id,player_id,contract_salary,release_clause) VALUES(:c,:p,:sal,:clause)'),{'c':club_id,'p':player_id,'sal':max(15000,price//35),'clause':max(price*2,1000000)})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,NULL,:c,:price)'),{'p':player_id,'c':club_id,'price':price})
     return player,price
@@ -795,7 +973,7 @@ async def sell_player(s, club_id, player_id):
     price=max(50_000,int(row['market_value']*0.70))
     await s.execute(text("UPDATE transfer_listings SET status='CANCELLED' WHERE player_id=:p AND seller_club_id=:c AND status='LISTED'"),{'p':player_id,'c':club_id})
     await s.execute(text('DELETE FROM club_players WHERE club_id=:c AND player_id=:p'),{'c':club_id,'p':player_id})
-    await record_financial_transaction(s,club_id,'TRANSFER_IN',price,f'Продажа {row["first_name"]} {row["last_name"]} за €{price:,}')
+    await record_financial_transaction(s,club_id,'TRANSFER_IN',price,f'Продажа {display_player_name(row.get("first_name"),row.get("last_name"))} за €{price:,}')
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,:c,NULL,:price)'),{'p':player_id,'c':club_id,'price':price})
     return row,price
 
@@ -842,7 +1020,7 @@ async def train_squad(s, club_id):
         changes.append((r['player_id'],tr.development_points,updates))
         if updates:
             labels=', '.join(f'{a} +{b-r[a]}' for a,b in updates.items())
-            await queue_club_notification(s,club_id,'DEVELOPMENT','📈 Игрок вырос',f"{r['first_name']} {r['last_name']}: {labels}.",f'training-growth:{club_id}:{r["player_id"]}:{datetime.now(timezone.utc).date()}')
+            await queue_club_notification(s,club_id,'DEVELOPMENT','📈 Игрок вырос',f"{display_player_name(r.get('first_name'),r.get('last_name'))}: {labels}.",f'training-growth:{club_id}:{r["player_id"]}:{datetime.now(timezone.utc).date()}')
     return changes
 
 async def set_player_expectation(s, club_id, player_id, expectation):
@@ -889,7 +1067,7 @@ async def finalize_live_round(s, league_id, finished):
 
 
 async def deliver_due_notifications(bot, s, limit=50):
-    """Claim due notifications without row-locking the nullable side of an outer join."""
+    """Claim due notifications, send them concurrently, then persist results."""
     ids = (await s.execute(text("""SELECT n.id
         FROM notifications n
         WHERE n.sent_at IS NULL
@@ -933,28 +1111,36 @@ async def deliver_due_notifications(bot, s, limit=50):
             WHERE id=ANY(:ids) AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'ids': disabled_ids})
     await s.commit()
 
-    delivered=0
-    for row in rows:
+    async def _send(row):
+        body=str(row['body'] or '').replace(r'\n','\n')
         try:
-            await bot.send_message(row['telegram_id'], f"<b>{row['title']}</b>\n{row['body']}")
+            await bot.send_message(row['telegram_id'], f"<b>{row['title']}</b>\n{body}")
+            return row['id'],None
         except Exception as exc:
-            attempts=(await s.execute(text('SELECT delivery_attempts FROM notifications WHERE id=:id'), {'id':row['id']})).scalar_one_or_none() or 1
+            return row['id'],exc
+
+    # Telegram I/O is the expensive part. Run the claimed sends concurrently so
+    # a burst of live events cannot serialize 20-50 network round trips.
+    results=await asyncio.gather(*(_send(row) for row in rows))
+    delivered=0
+    for row_id,exc in results:
+        if exc is not None:
+            attempts=(await s.execute(text('SELECT delivery_attempts FROM notifications WHERE id=:id'), {'id':row_id})).scalar_one_or_none() or 1
             delay=min(300,2 ** min(int(attempts),8))
             if int(attempts) >= 8:
                 await s.execute(text("""UPDATE notifications
                     SET processing_at=NULL,failed_at=now(),next_attempt_at=NULL,last_error=:err
-                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL"""), {'id':row['id'],'err':str(exc)[:500]})
+                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL"""), {'id':row_id,'err':str(exc)[:500]})
             else:
                 await s.execute(text("""UPDATE notifications
                     SET processing_at=NULL,next_attempt_at=now()+make_interval(secs=>:delay),last_error=:err
-                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'id':row['id'],'delay':delay,'err':str(exc)[:500]})
-            await s.commit()
+                    WHERE id=:id AND sent_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL"""), {'id':row_id,'delay':delay,'err':str(exc)[:500]})
             continue
         await s.execute(text("""UPDATE notifications
             SET sent_at=now(),processing_at=NULL,last_error=NULL
-            WHERE id=:id AND sent_at IS NULL"""), {'id':row['id']})
-        await s.commit()
+            WHERE id=:id AND sent_at IS NULL"""), {'id':row_id})
         delivered+=1
+    await s.commit()
     return delivered
 
 

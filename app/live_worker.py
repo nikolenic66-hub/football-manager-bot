@@ -3,7 +3,7 @@ import json
 import logging
 from sqlalchemy import text
 from .db import SessionLocal, engine
-from .services import advance_live_matches, finalize_live_round, start_round_halftime, queue_notification, deliver_due_notifications
+from .services import advance_live_matches, finalize_live_round, start_round_halftime, queue_notification, deliver_due_notifications, display_player_name
 
 logger=logging.getLogger(__name__)
 IMPORTANT_LIVE_EVENTS={'GOAL','ASSIST','SHOT','YELLOW','RED','INJURY','SUBSTITUTION'}
@@ -56,58 +56,63 @@ async def start_due_rounds(s):
     return started,len(started),len(rows),failed
 
 async def queue_live_event_notifications(s, match_id):
-    row=(await s.execute(text('''SELECT m.id,m.current_minute,m.home_score,m.away_score,
+    # Every cursor and every event query is scoped to this exact match.
+    row=(await s.execute(text("""SELECT m.id,m.current_minute,m.home_score,m.away_score,
         m.home_halftime_score,m.away_halftime_score,m.live_event_cursor,
         m.home_club_id,m.away_club_id,h.name home,a.name away
         FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
-        WHERE m.id=:m FOR UPDATE'''),{'m':match_id})).mappings().first()
-    if not row: return
-    events=(await s.execute(text('''SELECT e.id,e.minute,e.event_type,e.description,e.club_id,e.player_id,e.secondary_player_id,e.metadata
-        FROM match_events e WHERE e.match_id=:m AND e.id>:cursor AND e.minute<=:minute ORDER BY e.id'''),
+        WHERE m.id=:m FOR UPDATE"""),{'m':match_id})).mappings().first()
+    if not row: return 0
+    events=(await s.execute(text("""SELECT e.id,e.minute,e.event_type,e.description,e.club_id,e.player_id,e.secondary_player_id,e.metadata
+        FROM match_events e
+        WHERE e.match_id=:m AND e.id>:cursor AND e.minute<=:minute
+        ORDER BY e.minute,e.id LIMIT 2"""),
         {'m':match_id,'cursor':row['live_event_cursor'],'minute':row['current_minute']})).mappings().all()
-    if not events: return
+    if not events: return 0
+
     player_ids={x['secondary_player_id'] for x in events if x['secondary_player_id']}
     player_names={}
     if player_ids:
         prs=(await s.execute(text('SELECT id,first_name,last_name FROM players WHERE id=ANY(:ids)'),{'ids':list(player_ids)})).mappings().all()
-        player_names={r['id']:f"{r['first_name']} {r['last_name']}" for r in prs}
-    # Load the goal history once per worker tick; do not issue one SQL query per
-    # Telegram event. This keeps live rounds cheap even with several matches.
-    max_event_id=max(e['id'] for e in events)
-    goal_rows=(await s.execute(text('''SELECT e.id,e.club_id FROM match_events e
-        WHERE e.match_id=:m AND e.event_type='GOAL' AND e.id<=:id AND e.minute<=:minute ORDER BY e.id'''),
-        {'m':match_id,'id':max_event_id,'minute':row['current_minute']})).mappings().all()
-    goal_prefix={}
+        player_names={r['id']:display_player_name(r['first_name'],r['last_name']) for r in prs}
+
+    # Calculate the score at each event's own (minute,id) position, never from
+    # the match's current score. Thus a 24' shot after an 18' goal shows 0:1.
+    goal_rows=(await s.execute(text("""SELECT e.id,e.minute,e.club_id FROM match_events e
+        WHERE e.match_id=:m AND e.event_type='GOAL' AND e.minute<=:minute
+        ORDER BY e.minute,e.id"""),
+        {'m':match_id,'minute':row['current_minute']})).mappings().all()
+    goal_scores={}
     gh=ga=0; gi=0
-    for e_goal in goal_rows:
-        if e_goal['club_id']==row['home_club_id']: gh+=1
-        elif e_goal['club_id']==row['away_club_id']: ga+=1
-        goal_prefix[e_goal['id']]=(gh,ga)
+    for event in events:
+        while gi<len(goal_rows):
+            goal=goal_rows[gi]
+            if (int(goal['minute']),int(goal['id'])) > (int(event['minute']),int(event['id'])):
+                break
+            if goal['club_id']==row['home_club_id']: gh+=1
+            elif goal['club_id']==row['away_club_id']: ga+=1
+            gi+=1
+        goal_scores[event['id']]=(gh,ga)
+
     owner_rows=(await s.execute(text('SELECT id,owner_user_id FROM clubs WHERE id=ANY(:ids)'), {'ids':[row['home_club_id'],row['away_club_id']]})).mappings().all()
     owner_cache={r['id']:r['owner_user_id'] for r in owner_rows}
     for e in events:
         typ=e['event_type']
         if typ not in IMPORTANT_LIVE_EVENTS:
             continue
-        if e['minute']<=45:
-            event_home_base=event_away_base=0
-        else:
-            event_home_base=int(row['home_halftime_score'] or 0)
-            event_away_base=int(row['away_halftime_score'] or 0)
-        # Use the complete goal history, not only the current cursor batch.
-        prior_home,prior_away=goal_prefix.get(e['id'],(0,0))
+        event_home,event_away=goal_scores.get(e['id'],(0,0))
         if e['minute']>45:
-            prior_home=max(0,prior_home-int(row['home_halftime_score'] or 0))
-            prior_away=max(0,prior_away-int(row['away_halftime_score'] or 0))
-        score=f"{row['home']} <b>{event_home_base+prior_home}:{event_away_base+prior_away}</b> {row['away']}"
+            event_home+=int(row['home_halftime_score'] or 0)
+            event_away+=int(row['away_halftime_score'] or 0)
+        score=f"{row['home']} <b>{event_home}:{event_away}</b> {row['away']}"
+        description=str(e['description'] or '').replace(r'\n','\n')
         if typ=='GOAL':
             assist=player_names.get(e['secondary_player_id'])
-            body=f"{e['minute']}′ {e['description']}\\n{score}"
-            if assist: body += f"\\n🅰️ Ассист: {assist}"
+            body=f"{e['minute']}′ {description}\n{score}"
+            if assist: body += f"\n🅰️ Ассист: {assist}"
             for cid in (row['home_club_id'],row['away_club_id']):
                 await _queue_for_club(s,cid,'MATCH',owner_cache,'⚽ ГОЛ',body,f"live-event:{e['id']}")
         elif typ=='ASSIST':
-            # Assist is folded into the goal notification to avoid duplicate Telegram messages.
             continue
         elif typ=='SHOT':
             meta=e['metadata'] or {}
@@ -116,16 +121,18 @@ async def queue_live_event_notifications(s, match_id):
                 except Exception: meta={}
             if meta.get('result') not in DANGEROUS_SHOT_RESULTS:
                 continue
-            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔥 Опасный момент',f"{e['minute']}′ {e['description']}\\n{score}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔥 Опасный момент',f"{e['minute']}′ {description}\n{score}",f"live-event:{e['id']}")
         elif typ=='YELLOW':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟨 Жёлтая карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟨 Жёлтая карточка',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
         elif typ=='INJURY':
-            await _queue_for_club(s,e['club_id'],'INJURY',owner_cache,'🩹 Травма',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'INJURY',owner_cache,'🩹 Травма',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
         elif typ=='RED':
-            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟥 Красная карточка',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'DISCIPLINE',owner_cache,'🟥 Красная карточка',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
         elif typ=='SUBSTITUTION':
-            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔄 Замена',f"{e['minute']}′ {e['description']}",f"live-event:{e['id']}")
+            await _queue_for_club(s,e['club_id'],'MATCH',owner_cache,'🔄 Замена',f"{e['minute']}′ {description}",f"live-event:{e['id']}")
     await s.execute(text('UPDATE matches SET live_event_cursor=:id WHERE id=:m'),{'id':max(e['id'] for e in events),'m':match_id})
+    return len(events)
+
 
 async def _queue_for_club(s, club_id, category, owner_cache, title, body, dedupe_key):
     uid=owner_cache.get(club_id) if owner_cache is not None else (await s.execute(text('SELECT owner_user_id FROM clubs WHERE id=:c'),{'c':club_id})).scalar_one_or_none()
@@ -168,7 +175,7 @@ async def live_worker(bot):
                             await finalize_live_round(s,lid,finished)
                     await s.commit()
                 async with SessionLocal() as delivery_session:
-                    await deliver_due_notifications(bot,delivery_session)
+                    await deliver_due_notifications(bot,delivery_session,limit=20)
                 if consecutive_failures:
                     logger.info('Live worker recovered after %s consecutive failures.', consecutive_failures)
                 consecutive_failures=0

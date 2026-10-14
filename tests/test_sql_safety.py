@@ -62,7 +62,7 @@ def test_live_worker_sql_is_qualified():
     assert 'SELECT m.id,m.league_id,m.round' in source
     assert 'ORDER BY m.league_id,m.round,m.id' in source
     assert 'SELECT e.id,e.minute,e.event_type' in source
-    assert 'ORDER BY e.id' in source
+    assert 'ORDER BY e.minute,e.id LIMIT 2' in source
 
 
 def test_start_round_and_live_helpers_sql_are_qualified():
@@ -76,7 +76,7 @@ def test_start_round_and_live_helpers_sql_are_qualified():
         'FROM notifications n JOIN users u ON u.id=n.user_id',
     ):
         assert needle in services
-    assert 'ORDER BY e.id' in services
+    assert 'ORDER BY e.minute,e.id' in services
 
 
 def test_match_replay_orders_event_id_with_alias():

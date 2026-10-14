@@ -15,6 +15,7 @@ from ..config import settings
 from ..db import SessionLocal
 from ..game.ratings import player_rating
 from ..services import start_league
+from app.services import clean_display_name, display_player_name
 
 admin_router = Router()
 logger = logging.getLogger(__name__)
@@ -107,7 +108,7 @@ def player_card_text(p):
         except Exception: talents = [talents]
     stats = ' / '.join(f'{k[:3].upper()} {p[k]}' for k in
                        ('pace','shooting','passing','dribbling','defending','physical','stamina','mental'))
-    return (f"👤 <b>{p['first_name']} {p['last_name']}</b>\n"
+    return (f"👤 <b>{display_player_name(p.get('first_name'),p.get('last_name'))}</b>\n"
             f"ID: <code>{p['id']}</code> · OVR: <b>{ovr(p):g}</b> · POS: <b>{p['position']}</b>\n"
             f"Возраст: {p['age']} · Страна: {p['nationality']} · Rarity: {p['rarity']}\n"
             f"Potential: {p['potential']} · Real: {p['real_player']}\n"
@@ -164,7 +165,7 @@ async def admin_player_search_input(m: Message, state: FSMContext):
     if not rows: return await m.answer('Ничего не найдено.', reply_markup=back('admin:players'))
     b = InlineKeyboardBuilder()
     for i, p in enumerate(rows, 1):
-        b.button(text=f'{i}. {p["first_name"]} {p["last_name"]} (id={p["id"]}, OVR={ovr(p):g}, {p["position"]})', callback_data=f'admin:player:{p["id"]}')
+        b.button(text=f'{i}. {display_player_name(p.get("first_name"),p.get("last_name"))} (id={p["id"]}, OVR={ovr(p):g}, {p["position"]})', callback_data=f'admin:player:{p["id"]}')
     b.button(text='⬅️ Назад', callback_data='admin:players'); b.adjust(1)
     await m.answer('Результаты:', reply_markup=b.as_markup())
 
