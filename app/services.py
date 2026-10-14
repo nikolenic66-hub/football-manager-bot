@@ -58,6 +58,31 @@ async def ensure_squad(s, club_id):
     await s.execute(text('INSERT INTO club_training(club_id) VALUES(:c) ON CONFLICT DO NOTHING'),{'c':club_id})
     return n+need
 
+async def create_test_bot_club(s, name, admin_id=None):
+    """Create an admin-only test club with a synthetic negative Telegram owner."""
+    name=' '.join(str(name or '').split())
+    if not 3 <= len(name) <= 30:
+        raise ValueError('Название клуба должно содержать 3–30 символов.')
+    await s.execute(text("SELECT pg_advisory_xact_lock(hashtext('football-manager-test-club'))"))
+    min_id=(await s.execute(text('SELECT MIN(telegram_id) FROM users WHERE telegram_id<0'))).scalar_one_or_none()
+    telegram_id=(int(min_id) if min_id is not None else 0)-1
+    owner_id=(await s.execute(text("""INSERT INTO users(telegram_id,username,first_name)
+        VALUES(:tg,:username,:first_name) RETURNING id"""),
+        {'tg':telegram_id,'username':f'bot_{telegram_id}','first_name':f'{name} Bot'})).scalar_one()
+    club_id=(await s.execute(text("""INSERT INTO clubs(owner_user_id,name,short_name,stadium_name,budget,fans,reputation,ticket_price)
+        VALUES(:u,:n,UPPER(SUBSTRING(:n FROM 1 FOR 4)),:stadium,20000000,5000,1,20)
+        RETURNING id"""),
+        {'u':owner_id,'n':name,'stadium':f'{name} Arena'})).scalar_one()
+    await ensure_squad(s,club_id)
+    await s.execute(text('INSERT INTO club_training(club_id) VALUES(:c) ON CONFLICT DO NOTHING'),{'c':club_id})
+    await s.execute(text('INSERT INTO club_tactics(club_id) VALUES(:c) ON CONFLICT DO NOTHING'),{'c':club_id})
+    await _starting_players(s,club_id)
+    if admin_id is not None:
+        await s.execute(text('''INSERT INTO admin_actions_log(admin_user_id,action,target_type,target_id,payload)
+            VALUES(:u,:a,:t,:i,:p)'''), {'u':admin_id,'a':'test_bot_club_create','t':'club','i':club_id,
+            'p':json.dumps({'name':name,'telegram_id':telegram_id},ensure_ascii=False)})
+    return club_id,telegram_id
+
 async def create_league(s, creator_user_id, name, max_teams=8):
     club=(await s.execute(text('SELECT id FROM clubs WHERE owner_user_id=:u'),{'u':creator_user_id})).scalar_one_or_none()
     if not club: raise ValueError('Create a club first.')
@@ -1073,6 +1098,85 @@ async def player_management_report(s, club_id, limit=30):
         cp.contract_until,cp.contract_salary,cp.release_clause,cp.morale,cp.playing_time_expectation,cp.appearances,cp.starts,cp.minutes_played,cp.fitness,cp.form,cp.is_injured
         FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c ORDER BY p.position,p.potential DESC,p.id LIMIT :n'''),{'c':club_id,'n':limit})).mappings().all()
 
+async def _persist_fast_match_result(s, match, home, away, ht, at, hb, ab, hc, ac, result):
+    """Persist a complete deterministic match without entering the live clock."""
+    await _save_lineup_and_tactics(s,match['id'],match['home_club_id'],home,ht)
+    await _save_lineup_and_tactics(s,match['id'],match['away_club_id'],away,at)
+    name_to_id={}
+    for p in home: name_to_id.setdefault(p.name,p.id)
+    for p in away: name_to_id.setdefault(p.name,p.id)
+    event_rows=[]
+    for ev in sorted(result.events,key=lambda e:(e.minute, e.type, e.player or '')):
+        team=ev.team
+        cid=match['home_club_id'] if team in {'HOME',match['home_name']} else match['away_club_id']
+        pid=name_to_id.get(ev.player) if ev.player else None
+        sid=name_to_id.get(ev.secondary_player) if ev.secondary_player else None
+        event_rows.append((ev.minute,ev.type,cid,pid,sid,ev.text or '',ev.metadata or {}))
+        await s.execute(text('''INSERT INTO match_events(match_id,minute,event_type,club_id,player_id,secondary_player_id,description,metadata)
+            VALUES(:m,:min,:t,:c,:p,:sp,:d,:meta)'''),
+            {'m':match['id'],'min':int(ev.minute),'t':ev.type,'c':cid,'p':pid,'sp':sid,'d':ev.text or '', 'meta':json.dumps(ev.metadata or {})})
+    goals_by_player=defaultdict(int); assists_by_player=defaultdict(int)
+    for _,typ,_,pid,_,_,_ in event_rows:
+        if typ=='GOAL' and pid: goals_by_player[pid]+=1
+        if typ=='ASSIST' and pid: assists_by_player[pid]+=1
+    motm_id=name_to_id.get(result.man_of_the_match) if result.man_of_the_match else None
+    for p in home+away:
+        rating=float(result.ratings.get(p.name,6.2))
+        await s.execute(text('''INSERT INTO match_player_stats(match_id,club_id,player_id,rating,minutes,goals,assists)
+            VALUES(:m,:c,:p,:r,90,:g,:a)
+            ON CONFLICT(match_id,player_id) DO UPDATE SET rating=EXCLUDED.rating,minutes=EXCLUDED.minutes,goals=EXCLUDED.goals,assists=EXCLUDED.assists'''),
+            {'m':match['id'],'c':match['home_club_id'] if p in home else match['away_club_id'],'p':p.id,
+             'r':rating,'g':goals_by_player.get(p.id,0),'a':assists_by_player.get(p.id,0)})
+    await s.execute(text("""UPDATE matches SET home_score=:h,away_score=:a,home_xg=:hx,away_xg=:ax,
+        home_possession=50,away_possession=50,current_minute=90,status='FINISHED',live_phase='FINISHED',
+        halftime_locked=FALSE,started_at=COALESCE(started_at,now()),finished_at=now(),motm_player_id=:motm,
+        home_halftime_score=NULL,away_halftime_score=NULL,halftime_data='{}'::jsonb,second_half_data='{}'::jsonb
+        WHERE id=:m"""),
+        {'h':int(result.home_score),'a':int(result.away_score),'hx':round(float(result.home_xg),2),'ax':round(float(result.away_xg),2),'motm':motm_id,'m':match['id']})
+    return {'match_id':match['id'],'home':match['home_name'],'away':match['away_name'],
+            'home_score':int(result.home_score),'away_score':int(result.away_score)}
+
+
+async def fast_play_round(s, league_id):
+    """Play the current league round instantly; deliberately sends no match notifications."""
+    league=(await s.execute(text('SELECT id,current_round,total_rounds,status FROM leagues WHERE id=:l FOR UPDATE'),{'l':league_id})).mappings().first()
+    if not league or league['status']!='ACTIVE': raise ValueError('Лига не активна.')
+    round_no=int(league['current_round'])
+    all_matches=(await s.execute(text('''SELECT m.*,h.name home_name,a.name away_name
+        FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
+        WHERE m.league_id=:l AND m.round=:r ORDER BY m.id FOR UPDATE'''),
+        {'l':league_id,'r':round_no})).mappings().all()
+    if not all_matches: raise ValueError(f'В текущем туре {round_no} нет матчей.')
+    if any(m['status']!='SCHEDULED' for m in all_matches):
+        raise ValueError('Тур уже начат или частично сыгран; быстрое отыгрывание доступно только для полностью SCHEDULED тура.')
+    matches=all_matches
+    results=[]
+    for m in matches:
+        home=await _starting_players(s,m['home_club_id']); away=await _starting_players(s,m['away_club_id'])
+        ht=await _club_tactics(s,m['home_club_id']); at=await _club_tactics(s,m['away_club_id'])
+        hb=await _club_board(s,m['home_club_id'],home,ht.formation); ab=await _club_board(s,m['away_club_id'],away,at.formation)
+        hc=await get_counterplan(s,m['home_club_id'],m['away_club_id']); ac=await get_counterplan(s,m['away_club_id'],m['home_club_id'])
+        result=simulate_match(m['home_name'],m['away_name'],home,away,ht,at,m['seed'],hb,ab,hc,ac)
+        results.append(await _persist_fast_match_result(s,m,home,away,ht,at,hb,ab,hc,ac,result))
+    await finalize_live_round(s,league_id,results)
+    return round_no,results
+
+
+async def fast_play_all(s, league_id):
+    """Play every remaining round sequentially without live notifications."""
+    rounds=[]
+    while True:
+        league=(await s.execute(text('SELECT current_round,total_rounds,status FROM leagues WHERE id=:l FOR UPDATE'),{'l':league_id})).mappings().first()
+        if not league or league['status']!='ACTIVE' or int(league['current_round'])>int(league['total_rounds']):
+            break
+        round_no,results=await fast_play_round(s,league_id)
+        rounds.append((round_no,results))
+        if int(league['current_round'])==int(league['total_rounds']):
+            break
+    if not rounds: raise ValueError('Нет оставшихся туров.')
+    return rounds
+
+
 async def finalize_live_round(s, league_id, finished):
     if not finished: return False
     league=(await s.execute(text('SELECT id,current_round,total_rounds,status FROM leagues WHERE id=:l FOR UPDATE'),{'l':league_id})).mappings().first()
@@ -1246,9 +1350,10 @@ async def queue_notification(s, user_id, category, title, body, dedupe_key=None,
     return row.id if row else None
 
 async def queue_club_notification(s, club_id, category, title, body, dedupe_key=None, deliver_at=None):
-    uid=(await s.execute(text('SELECT owner_user_id FROM clubs WHERE id=:c'), {'c':club_id})).scalar_one_or_none()
-    if uid is None: return None
-    return await queue_notification(s, uid, category, title, body, dedupe_key, deliver_at)
+    owner=(await s.execute(text('''SELECT u.id,u.telegram_id FROM clubs c JOIN users u ON u.id=c.owner_user_id WHERE c.id=:c'''), {'c':club_id})).mappings().first()
+    if not owner or int(owner['telegram_id']) < 0:
+        return None
+    return await queue_notification(s, owner['id'], category, title, body, dedupe_key, deliver_at)
 
 async def notification_list(s, user_id, limit=20):
     return (await s.execute(text('''SELECT id,category,title,body,created_at,read_at
