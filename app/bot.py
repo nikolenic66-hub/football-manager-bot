@@ -699,10 +699,19 @@ async def cmd_matchcenter(m:Message, from_user=None):
                 except ValueError:
                     await s.rollback()
         events=(await s.execute(text('SELECT e.minute,e.description FROM match_events e WHERE e.match_id=:m ORDER BY e.minute,e.id LIMIT 30'),{'m':row['id']})).mappings().all() if row else []
+        live_matches=(await s.execute(text('''SELECT m.id,h.name home,a.name away,m.home_score,m.away_score,m.current_minute
+            FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
+            WHERE m.status='LIVE' AND (m.home_club_id=:c OR m.away_club_id=:c) ORDER BY m.id'''),{'c':c['id']})).mappings().all()
     if not row:return await m.answer('Матчей пока нет.')
     path=match_center(row['home'],row['away'],row['home_score'] or 0,row['away_score'] or 0,float(row['home_xg'] or 0),float(row['away_xg'] or 0),events)
     state='LIVE' if row['status']=='LIVE' else row['status']
-    await m.answer_photo(FSInputFile(path),caption=f'📺 <b>{row["home"]} {row["home_score"] or 0}:{row["away_score"] or 0} {row["away"]}</b> · {state} · {row["current_minute"] or 0}′')
+    markup=None
+    if live_matches:
+        k=InlineKeyboardBuilder()
+        for live in live_matches:
+            k.button(text=f'📺 Смотреть матч · {live["home"]} {live["home_score"] or 0}:{live["away_score"] or 0} {live["away"]}',callback_data=f'match:watch:{live["id"]}')
+        k.adjust(1); markup=k.as_markup()
+    await m.answer_photo(FSInputFile(path),caption=f'📺 <b>{row["home"]} {row["home_score"] or 0}:{row["away_score"] or 0} {row["away"]}</b> · {state} · {row["current_minute"] or 0}′',reply_markup=markup)
 
 @router.message(Command('cards'))
 async def cmd_cards(m:Message):
@@ -1731,6 +1740,185 @@ async def _refresh_contract_item(cq,pid):
     k.button(text='⬅ К контрактам',callback_data='contract:list')
     k.adjust(2,2,2,1)
     await cq.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup())
+
+# --- Dedicated live match viewer -----------------------------------------
+_LIVE_SCREENS: dict[int, asyncio.Task] = {}
+_LIVE_SCREEN_SIGNATURES: dict[tuple[int,int], str] = {}
+
+def _live_watch_keyboard(match_id, finished=False):
+    k=InlineKeyboardBuilder()
+    if not finished:
+        k.button(text='🎛 Тактика',callback_data=f'match:watch:tactics:{match_id}')
+        k.button(text='🔄 Замена',callback_data=f'match:watch:sub:{match_id}')
+    k.button(text='👥 Составы',callback_data=f'match:watch:lineups:{match_id}')
+    k.button(text='📊 Статистика',callback_data=f'match:watch:stats:{match_id}')
+    if not finished: k.button(text='🔄 Обновить',callback_data=f'match:watch:refresh:{match_id}')
+    k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{match_id}')
+    k.adjust(2,2,2,1)
+    return k.as_markup()
+
+def _live_event_icon(event_type):
+    return {'GOAL':'⚽','SHOT':'🎯','YELLOW':'🟨','RED':'🟥','INJURY':'🩹','SUBSTITUTION':'🔄','ASSIST':'🅰️'}.get(str(event_type or '').upper(),'•')
+
+async def _load_live_view(s, match_id):
+    row=(await s.execute(text("""SELECT m.id,m.status,m.current_minute,m.home_score,m.away_score,
+        m.home_xg,m.away_xg,m.home_possession,m.away_possession,m.home_shots,m.away_shots,
+        m.home_shots_on_target,m.away_shots_on_target,m.home_corners,m.away_corners,
+        m.motm_player_id,m.home_club_id,m.away_club_id,h.name home,a.name away
+        FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id
+        WHERE m.id=:m"""),{'m':match_id})).mappings().first()
+    if not row: return None
+    events=(await s.execute(text("""SELECT e.minute,e.event_type,e.description,e.club_id,e.player_id,
+        p.first_name player_first,p.last_name player_last
+        FROM match_events e LEFT JOIN players p ON p.id=e.player_id
+        WHERE e.match_id=:m ORDER BY e.minute DESC,e.id DESC LIMIT 10"""),{'m':match_id})).mappings().all()
+    events=list(reversed(events))
+    motm=None
+    if row['motm_player_id']:
+        motm=(await s.execute(text("""SELECT p.first_name,p.last_name,ps.rating
+            FROM players p LEFT JOIN match_player_stats ps ON ps.player_id=p.id AND ps.match_id=:m
+            WHERE p.id=:p"""),{'m':match_id,'p':row['motm_player_id']})).mappings().first()
+    return dict(row),events,motm
+
+def _live_event_lines(row,events):
+    lines=[]; score=(int(row.get('home_score') or 0),int(row.get('away_score') or 0))
+    for e in reversed(events[-7:]):
+        name=display_player_name(e.get('player_first'),e.get('player_last')) if e.get('player_first') or e.get('player_last') else ''
+        desc=str(e.get('description') or '').replace(r'\n',' ')
+        if name and name not in desc: desc=f'{desc} ({name})'
+        extra=f' — {score[0]}:{score[1]}' if e.get('event_type')=='GOAL' else ''
+        lines.append(f'• {e.get("minute",0)}′ {_live_event_icon(e.get("event_type"))} {desc[:72]}{extra}')
+    return lines or ['• Пока нет событий']
+
+def _live_watch_text(row,events,motm=None):
+    finished=row['status']=='FINISHED'
+    out=[('🏁 <b>МАТЧ ЗАВЕРШЁН</b>' if finished else '📺 <b>LIVE</b>'),f'<b>{row["home"]} {row["home_score"] or 0} : {row["away_score"] or 0} {row["away"]}</b>']
+    if not finished: out.append(f'⏱ {row["current_minute"] or 0}′')
+    out += ['',f'📊 xG: {float(row["home_xg"] or 0):.2f} — {float(row["away_xg"] or 0):.2f}',f'🎯 Владение: {float(row["home_possession"] or 50):.0f}% — {float(row["away_possession"] or 50):.0f}%']
+    if finished and motm:
+        out += ['', '⭐ <b>ЛУЧШИЙ ИГРОК (MOTM):</b>',f'{display_player_name(motm.get("first_name"),motm.get("last_name"))} — {float(motm.get("rating") or 0):.1f}','', '📋 <b>Ключевые события:</b>']
+    else: out += ['', '📋 <b>Последние события:</b>']
+    out.extend(_live_event_lines(row,events)); return '\n'.join(out)
+
+async def _edit_live_message(message,text_value,reply_markup=None):
+    try:
+        if getattr(message,'photo',None): await message.edit_caption(caption=text_value,reply_markup=reply_markup)
+        else: await message.edit_text(text_value,reply_markup=reply_markup)
+        return True
+    except Exception as exc:
+        logger.info('Live screen message unavailable: chat=%s message=%s error=%s',getattr(message.chat,'id',None),getattr(message,'message_id',None),exc); return False
+
+async def _render_live_screen(message,user_id,match_id,force=False):
+    async with SessionLocal() as s: loaded=await _load_live_view(s,match_id)
+    if not loaded: return False,True
+    row,events,motm=loaded; text_value=_live_watch_text(row,events,motm)
+    signature=repr((row['status'],row['current_minute'],row['home_score'],row['away_score'],row['home_xg'],row['away_xg'],row['home_possession'],row['away_possession'],[(e['minute'],e['event_type'],e['description']) for e in events],motm['rating'] if motm else None))
+    key=(user_id,match_id)
+    if not force and _LIVE_SCREEN_SIGNATURES.get(key)==signature: return True,row['status']=='FINISHED'
+    ok=await _edit_live_message(message,text_value,_live_watch_keyboard(match_id,row['status']=='FINISHED'))
+    if ok:
+        _LIVE_SCREEN_SIGNATURES[key]=signature; logger.info('Live screen updated: user_id=%s match_id=%s minute=%s status=%s',user_id,match_id,row['current_minute'],row['status'])
+    return ok,row['status']=='FINISHED'
+
+async def _live_screen_loop(message,user_id,match_id):
+    logger.info('Live screen opened: user_id=%s match_id=%s',user_id,match_id); key=(user_id,match_id)
+    try:
+        while True:
+            ok,finished=await _render_live_screen(message,user_id,match_id)
+            if not ok or finished: break
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        logger.info('Live screen closed: user_id=%s match_id=%s reason=cancelled',user_id,match_id); raise
+    finally:
+        _LIVE_SCREEN_SIGNATURES.pop(key,None)
+        if _LIVE_SCREENS.get(user_id) is asyncio.current_task(): _LIVE_SCREENS.pop(user_id,None)
+        logger.info('Live screen closed: user_id=%s match_id=%s',user_id,match_id)
+
+async def _cancel_live_screen(user_id):
+    task=_LIVE_SCREENS.pop(user_id,None)
+    if task:
+        task.cancel()
+        try: await task
+        except asyncio.CancelledError: pass
+
+
+async def _open_live_screen(cq,match_id):
+    old=_LIVE_SCREENS.pop(cq.from_user.id,None)
+    if old: old.cancel()
+    async with SessionLocal() as s: loaded=await _load_live_view(s,match_id)
+    if not loaded: return await cq.answer('Матч не найден.',show_alert=True)
+    row,events,motm=loaded
+    if not await _edit_live_message(cq.message,_live_watch_text(row,events,motm),_live_watch_keyboard(match_id,row['status']=='FINISHED')):
+        return await cq.answer('Не удалось открыть live-экран.',show_alert=True)
+    _LIVE_SCREEN_SIGNATURES[(cq.from_user.id,match_id)]=repr((row['status'],row['current_minute'],row['home_score'],row['away_score']))
+    if row['status']!='FINISHED': _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(_live_screen_loop(cq.message,cq.from_user.id,match_id),name=f'live-screen-{cq.from_user.id}-{match_id}')
+    await cq.answer(); logger.info('Live screen opened by user: user_id=%s match_id=%s',cq.from_user.id,match_id)
+
+@router.callback_query(F.data.startswith('match:watch:') & ~F.data.startswith('match:watch:refresh:') & ~F.data.startswith('match:watch:lineups:') & ~F.data.startswith('match:watch:stats:') & ~F.data.startswith('match:watch:back:') & ~F.data.startswith('match:watch:tactics:') & ~F.data.startswith('match:watch:sub:'))
+async def cb_match_watch(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    await _open_live_screen(cq,mid)
+
+@router.callback_query(F.data.startswith('match:watch:refresh:'))
+async def cb_match_watch_refresh(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    ok,finished=await _render_live_screen(cq.message,cq.from_user.id,mid,force=True)
+    await cq.answer('Матч завершён.' if finished else ('🔄 Обновлено' if ok else 'Матч недоступен.'),show_alert=not ok)
+
+@router.callback_query(F.data.startswith('match:watch:lineups:'))
+async def cb_match_watch_lineups(cq:CallbackQuery):
+    await _cancel_live_screen(cq.from_user.id)
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    async with SessionLocal() as s:
+        row=(await s.execute(text('SELECT m.id,m.home_club_id,m.away_club_id,h.name home,a.name away FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.id=:m'),{'m':mid})).mappings().first()
+        if not row:return await cq.answer('Матч не найден.',show_alert=True)
+        players=(await s.execute(text("""SELECT ml.club_id,ml.position,ml.role,ml.is_starting,p.first_name,p.last_name,cp.fitness,p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental
+            FROM match_lineups ml JOIN players p ON p.id=ml.player_id LEFT JOIN club_players cp ON cp.club_id=ml.club_id AND cp.player_id=ml.player_id
+            WHERE ml.match_id=:m AND ml.is_starting=true ORDER BY ml.club_id,ml.id"""),{'m':mid})).mappings().all()
+    home=[x for x in players if x['club_id']==row['home_club_id']]; away=[x for x in players if x['club_id']==row['away_club_id']]
+    out=['👥 <b>СОСТАВЫ</b>',f'<b>{row["home"]}</b>  |  <b>{row["away"]}</b>','']
+    for i in range(max(len(home),len(away))):
+        cols=[]
+        for p in ((home[i] if i<len(home) else None),(away[i] if i<len(away) else None)):
+            if not p: cols.append('—'); continue
+            pr=type('P',(),dict(p,fitness=int(p.get('fitness') or 100),form=0,morale=70,position=p['position']))()
+            cols.append(f'{display_player_name(p["first_name"],p["last_name"])} · OVR {int(round(float(player_rating(pr))))} · {p["position"]} · FIT {int(p.get("fitness") or 100)}')
+        out.append(f'{cols[0]}  |  {cols[1]}')
+    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
+    await _edit_live_message(cq.message,'\n'.join(out),k.as_markup()); await cq.answer()
+
+@router.callback_query(F.data.startswith('match:watch:stats:'))
+async def cb_match_watch_stats(cq:CallbackQuery):
+    await _cancel_live_screen(cq.from_user.id)
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
+    async with SessionLocal() as s:
+        row=(await s.execute(text("""SELECT m.home_club_id,m.away_club_id,m.home_score,m.away_score,m.home_xg,m.away_xg,m.home_possession,m.away_possession,m.home_shots,m.away_shots,m.home_shots_on_target,m.away_shots_on_target,m.home_corners,m.away_corners,h.name home,a.name away FROM matches m JOIN clubs h ON h.id=m.home_club_id JOIN clubs a ON a.id=m.away_club_id WHERE m.id=:m"""),{'m':mid})).mappings().first()
+        stats=(await s.execute(text('SELECT ps.rating,p.first_name,p.last_name,ps.goals,ps.assists FROM match_player_stats ps JOIN players p ON p.id=ps.player_id WHERE ps.match_id=:m ORDER BY ps.rating DESC LIMIT 5'),{'m':mid})).mappings().all()
+        event_counts=(await s.execute(text('SELECT club_id,event_type,count(*) n FROM match_events WHERE match_id=:m GROUP BY club_id,event_type'),{'m':mid})).all()
+    if not row:return await cq.answer('Матч не найден.',show_alert=True)
+    counts={(int(c),str(t)):int(n) for c,t,n in event_counts}; hc,ac=row['home_club_id'],row['away_club_id']
+    lines=['📊 <b>СТАТИСТИКА МАТЧА</b>',f'<b>{row["home"]} {row["home_score"] or 0}:{row["away_score"] or 0} {row["away"]}</b>','',f'🎯 Владение: {float(row["home_possession"] or 50):.0f}% — {float(row["away_possession"] or 50):.0f}%',f'🎯 Удары: {row["home_shots"] or 0} ({row["home_shots_on_target"] or 0}) — {row["away_shots"] or 0} ({row["away_shots_on_target"] or 0})',f'🚩 Угловые: {row["home_corners"] or 0} — {row["away_corners"] or 0}',f'🟨 Жёлтые: {counts.get((hc,"YELLOW"),0)} — {counts.get((ac,"YELLOW"),0)}',f'🟥 Красные: {counts.get((hc,"RED"),0)} — {counts.get((ac,"RED"),0)}',f'⚠️ Фолы: {counts.get((hc,"FOUL"),0)} — {counts.get((ac,"FOUL"),0)}',f'📊 xG: {float(row["home_xg"] or 0):.2f} — {float(row["away_xg"] or 0):.2f}','','⭐ <b>Лучшие игроки по рейтингу</b>']
+    lines += [f'• {display_player_name(x["first_name"],x["last_name"])} — {float(x["rating"]):.1f}' for x in stats] or ['• Рейтинг появится после завершения матча']
+    k=InlineKeyboardBuilder(); k.button(text='⬅️ К live-экрану',callback_data=f'match:watch:{mid}'); k.button(text='⬅️ Назад',callback_data=f'match:watch:back:{mid}'); k.adjust(2)
+    await _edit_live_message(cq.message,'\n'.join(lines),k.as_markup()); await cq.answer()
+
+@router.callback_query(F.data.startswith('match:watch:tactics:') | F.data.startswith('match:watch:sub:'))
+async def cb_match_watch_controls(cq:CallbackQuery):
+    await cq.answer('🎛 Управление доступно через существующие меню тактики/замен.',show_alert=True)
+
+@router.callback_query(F.data.startswith('match:watch:back:'))
+async def cb_match_watch_back(cq:CallbackQuery):
+    try: mid=int(cq.data.rsplit(':',1)[1])
+    except ValueError: mid=0
+    await _cancel_live_screen(cq.from_user.id)
+    _LIVE_SCREEN_SIGNATURES.pop((cq.from_user.id,mid),None)
+    await cq.answer()
+    await _edit_live_message(cq.message,'📺 <b>Матч-центр</b>\n\nНажмите «📺 Смотреть матч» для live-просмотра.',back_keyboard('matchcenter'))
+    logger.info('Live screen closed by user: user_id=%s match_id=%s',cq.from_user.id,mid)
 
 @router.callback_query(F.data=='table')
 async def cb_table(c:CallbackQuery): await c.answer(); await cmd_tableview(c.message, c.from_user)

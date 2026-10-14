@@ -99,10 +99,13 @@ async def start_league(s, user_id):
         await s.execute(text('''INSERT INTO matches(league_id,round,home_club_id,away_club_id,seed,started_at,scheduled_at,prestart_notified_at)
             VALUES(:l,:r,:h,:a,:seed,NULL,CAST(:kickoff AS timestamptz),NULL)'''),
             {'l':league['id'],'r':f.round_no,'h':f.home_club_id,'a':f.away_club_id,'seed':seed,'kickoff':kickoff})
+        # Match ID is needed by the live-view button. Resolve it after the insert.
+        match_id=(await s.execute(text('SELECT id FROM matches WHERE league_id=:l AND round=:r AND home_club_id=:h AND away_club_id=:a ORDER BY id DESC LIMIT 1'),
+            {'l':league['id'],'r':f.round_no,'h':f.home_club_id,'a':f.away_club_id})).scalar_one()
         for cid in (f.home_club_id, f.away_club_id):
             await queue_club_notification(s,cid,'MATCH','⏰ Ваш матч начнётся через 10 минут',
-                'Подготовьтесь к матчу. Отдельного уведомления о стартовом свистке не будет.',
-                f'match-start-10:{league["id"]}:{f.round_no}:{cid}',kickoff-timedelta(minutes=10))
+                'Подготовьтесь к матчу.',
+                f'match-start-10:{league["id"]}:{f.round_no}:{cid}:{match_id}',kickoff-timedelta(minutes=10))
     total=max(f.round_no for f in fixtures)
     await s.execute(text("UPDATE leagues SET status='ACTIVE',current_round=1,total_rounds=:r,started_at=CAST(:started AS timestamptz) WHERE id=:l"),
                      {'r':total,'started':season_start,'l':league['id']})
@@ -579,6 +582,10 @@ async def start_round_halftime(s, league_id, round_no):
         first_hx,first_ax=round(full_hx*.48,2),round(full_ax*.48,2)
         await s.execute(text("UPDATE matches SET home_score=0,away_score=0,home_xg=0,away_xg=0,home_possession=50,away_possession=50,home_halftime_score=:hs,away_halftime_score=:as_,current_minute=0,status='LIVE',halftime_locked=FALSE,halftime_data=:data,second_half_data='{}'::jsonb,live_phase='FIRST_HALF',phase_started_at=CAST(:phase_start AS timestamptz),halftime_ends_at=NULL,second_half_started_at=NULL,live_event_cursor=0,started_at=COALESCE(started_at,CAST(:phase_start AS timestamptz)),finished_at=NULL WHERE id=:m"),{'hs':hs,'as_':as_,'m':m['id'],'phase_start':phase_start,'data':json.dumps({'home_tactics':_tactics_json(ht),'away_tactics':_tactics_json(at),'events':[e.__dict__ for e in events], 'home_board':[(z.x,z.y,z.role,z.instruction) for z in hb.slots], 'away_board':[(z.x,z.y,z.role,z.instruction) for z in ab.slots], 'home_players':[p.id for p in home], 'away_players':[p.id for p in away], 'first_half_xg':[first_hx,first_ax], 'full_xg':[round(full_hx,2),round(full_ax,2)]})})
         await _save_lineup_and_tactics(s,m['id'],m['home_club_id'],home,ht); await _save_lineup_and_tactics(s,m['id'],m['away_club_id'],away,at)
+        for cid in (m['home_club_id'],m['away_club_id']):
+            await queue_club_notification(s,cid,'MATCH','▶️ Матч начался',
+                'Стартовый свисток! Откройте live-просмотр матча.',
+                f'match-started:{m["id"]}')
         # The engine generates the deterministic half up front, but future
         # events stay in match state until the live clock reaches their minute.
         # This prevents a finished-looking event burst at kickoff.
@@ -1082,7 +1089,7 @@ async def deliver_due_notifications(bot, s, limit=50):
     if not ids:
         return 0
 
-    rows = (await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,u.telegram_id
+    rows = (await s.execute(text("""SELECT n.id,n.user_id,n.category,n.title,n.body,n.dedupe_key,u.telegram_id
         FROM notifications n JOIN users u ON u.id=n.user_id
         LEFT JOIN notification_settings ns ON ns.user_id=n.user_id
         WHERE n.id=ANY(:ids)
@@ -1114,7 +1121,14 @@ async def deliver_due_notifications(bot, s, limit=50):
     async def _send(row):
         body=str(row['body'] or '').replace(r'\n','\n')
         try:
-            await bot.send_message(row['telegram_id'], f"<b>{row['title']}</b>\n{body}")
+            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            markup=None
+            key=str(row.get('dedupe_key') or '')
+            if key.startswith('match-start-10:') or key.startswith('match-started:'):
+                parts=key.split(':')
+                mid=parts[4] if key.startswith('match-start-10:') else parts[1]
+                markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📺 Смотреть матч',callback_data=f'match:watch:{mid}')]])
+            await bot.send_message(row['telegram_id'], f"<b>{row['title']}</b>\n{body}", reply_markup=markup)
             return row['id'],None
         except Exception as exc:
             return row['id'],exc
