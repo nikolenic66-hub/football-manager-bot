@@ -60,3 +60,32 @@ def test_board_keeps_saved_lineup_order_as_slot_order():
     assert 'board=board.assign(index,r[\'role\'],r[\'instruction\'])' in block
     assert 'build_starting_lineup' in services
     assert 'await _starting_players(s,club_id)' in block
+
+
+def test_scout_back_callback_returns_to_results_with_current_page():
+    from pathlib import Path
+    source=Path('app/bot.py').read_text(encoding='utf-8')
+    block=source[source.index("@router.callback_query(F.data.startswith('scout:back:'))"):source.index("@router.callback_query(F.data.startswith('scout:search:'))")]
+    assert "return await _show_scout_results(c,c.from_user.id,max(0,page))" in block
+    assert "logger.exception('Scout back navigation failed" in block
+    assert "scout:back:{_scout_filter_state(c.from_user.id).get(\"page\",0)}" in source
+
+
+def test_scout_back_uses_player_id_not_result_index():
+    source=Path('app/bot.py').read_text(encoding='utf-8')
+    assert "callback_data=f'scout:item:{r[\"id\"]}'" in source
+
+
+def test_card_player_rounds_overall_to_integer():
+    from pathlib import Path
+    source=Path('app/bot.py').read_text(encoding='utf-8')
+    block=source[source.index('def _card_player'):source.index('class LeagueCreate')]
+    assert "int(round(float(data['overall'])))" in block
+    assert "int(round(float(player_rating(pr))))" in block
+
+
+def test_player_card_rounds_fallback_overall_to_integer():
+    from app.visual.render import player_card
+    source=Path('app/visual/render.py').read_text(encoding='utf-8')
+    block=source[source.index('def player_card'):source.index('def formation_positions')]
+    assert 'int(round(float(overall)))' in block

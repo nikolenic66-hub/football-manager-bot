@@ -146,7 +146,7 @@ def player_card(player,out=None,size=(620,860)):
         text_center(d,((plaque[0]+plaque[2])//2,(plaque[1]+plaque[3])//2),nation,font(18,True),light)
 
     # Name band.
-    first=str(player.get('first_name') or '').strip().upper()
+    first=clean_display_name(player.get('first_name') or '').upper()
     last=clean_display_name(player.get('last_name') or '').upper()
     name=' '.join(x for x in (first,last) if x) or 'PLAYER'
     name_y=476
@@ -192,16 +192,12 @@ def player_card(player,out=None,size=(620,860)):
     return out
 
 def formation_positions(formation):
-    """Return image coordinates derived directly from the engine's formation slots.
-
-    Engine coordinates are depth (x) + lateral (y); image coordinates are
-    lateral (x) + vertical (y), with the own goal at the bottom. Keeping one
-    source of truth prevents visual/engine formation drift.
-    """
+    """Return display coordinates from the canonical board x/y coordinates."""
     from app.game.board import FORMATION_SLOTS
     if formation not in FORMATION_SLOTS:
         raise ValueError(f'Unsupported formation: {formation}')
-    return [(slot_y, 100-slot_x) for _,slot_x,slot_y in FORMATION_SLOTS[formation]]
+    # Board y is bottom-up depth; PIL y is top-down, hence the inversion.
+    return [(slot_x, 100-slot_y) for _,slot_x,slot_y in FORMATION_SLOTS[formation]]
 
 
 def formation_board(formation='4-3-3', labels=None, out=None, size=(1000,680)):
@@ -293,7 +289,7 @@ def tactical_board_screen(formation='4-3-3', players=None, title='TACTICAL BOARD
     for i,p in enumerate(rows):
         bx=p.get('board_x'); by=p.get('board_y')
         if bx is None or by is None: bx,by=fallback[i]
-        x=px0+(px1-px0)*float(bx)/100; y=py0+(py1-py0)*float(by)/100
+        x=px0+(px1-px0)*float(bx)/100; y=py0+(py1-py0)*(100-float(by))/100
         radius=28
         d.ellipse((x-radius,y-radius,x+radius,y+radius),fill=(28,125,235),outline=(255,255,255),width=3)
         text_center(d,(x,y),str(p.get('shirt_number') or i+1),font(17,True),(255,255,255))
@@ -306,7 +302,7 @@ def tactical_board_screen(formation='4-3-3', players=None, title='TACTICAL BOARD
             # Visualize the same individual instruction used by the engine.
             if instr in {'OVERLAP','GET_FORWARD','ROAM'}:
                 ex=x+55 if bx < 50 else x-55
-                ey=y-45 if by < 50 else y+45
+                ey=y+45 if by > 50 else y-45
                 d.line((x,y,ex,ey),fill=(90,235,180),width=4)
                 d.ellipse((ex-5,ey-5,ex+5,ey+5),fill=(90,235,180))
             elif instr in {'STAY_BACK','HOLD_POSITION','MARK'}:
@@ -562,15 +558,17 @@ def dynamic_match_screen(home, away, formation_home, formation_away, phase='POSS
     def draw_team(formation,mirror,fill):
         pts=[]
         for slot,x,y in FORMATION_SLOTS[formation]:
-            sx=100-x if mirror else x
-            px=px0+(px1-px0)*sx/100; py=py0+(py1-py0)*y/100
+            sx=x
+            sy=100-y if mirror else y
+            px=px0+(px1-px0)*sx/100; py=py0+(py1-py0)*(100-sy)/100
             # small deterministic phase movement, tied to the same slot coordinates
             shift=0
             if phase in {'POSSESSION','BUILD_UP'} and slot in {'CM','DM','AM','LM','RM'}: shift=18
             elif phase in {'PRESSING'} and slot not in {'GK','CB'}: shift=14
             elif phase in {'COUNTER','TRANSITION'} and slot in {'ST','LW','RW','LM','RM'}: shift=24
-            if mirror: px=max(px0+25,px-shift)
-            else: px=min(px1-25,px+shift)
+            # Phase movement is along depth (canonical y), not across the pitch.
+            sy = max(4, min(96, sy + (-shift if mirror else shift)))
+            py=py0+(py1-py0)*(100-sy)/100
             pts.append((px,py,slot))
         for px,py,slot in pts:
             d.ellipse((px-19,py-19,px+19,py+19),fill=fill,outline=(255,255,255),width=2)
@@ -593,9 +591,9 @@ def dynamic_match_screen(home, away, formation_home, formation_away, phase='POSS
     if visual_events:
         ev=visual_events[-1]; meta=ev.get('metadata') or {}; start=meta.get('start'); end=meta.get('end')
         if isinstance(start,(list,tuple)) and len(start)>=2:
-            sx=px0+(px1-px0)*float(start[0])/100; sy=py0+(py1-py0)*float(start[1])/100
+            sx=px0+(px1-px0)*float(start[0])/100; sy=py0+(py1-py0)*(100-float(start[1]))/100
             ex=px0+(px1-px0)*float(end[0])/100 if isinstance(end,(list,tuple)) and len(end)>=2 else sx
-            ey=py0+(py1-py0)*float(end[1])/100 if isinstance(end,(list,tuple)) and len(end)>=2 else sy
+            ey=py0+(py1-py0)*(100-float(end[1]))/100 if isinstance(end,(list,tuple)) and len(end)>=2 else sy
             kind=str(meta.get('visual_type',ev.get('event_type','EVENT'))).upper()
             acol={'PASS':(95,210,255),'CARRY':(255,220,90),'SHOT':(255,245,125),'PRESSURE':(235,105,135),'TACKLE':(245,175,90),'INTERCEPTION':(175,235,180)}.get(kind,(255,255,255))
             d.line((sx,sy,ex,ey),fill=acol,width=6)
@@ -640,8 +638,9 @@ def event_replay_screen(home, away, formation_home, formation_away, event, event
     def draw_team(formation, mirror, fill):
         pts=[]
         for i,(slot,x,y) in enumerate(FORMATION_SLOTS[formation]):
-            depth=100-x if mirror else x
-            px=px0+(px1-px0)*depth/100; py=py0+(py1-py0)*y/100
+            sx=x
+            sy=100-y if mirror else y
+            px=px0+(px1-px0)*sx/100; py=py0+(py1-py0)*(100-sy)/100
             pts.append((px,py,slot,i+1))
         for px,py,slot,num in pts:
             d.ellipse((px-17,py-17,px+17,py+17),fill=fill,outline=(255,255,255),width=2)

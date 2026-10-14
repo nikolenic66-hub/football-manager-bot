@@ -3,58 +3,58 @@
     "slots": [
       {
         "position": "GK",
-        "depth": 10,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 8
       },
       {
         "position": "LB",
-        "depth": 25,
-        "lateral": 15
+        "lateral": 15,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 38
+        "lateral": 38,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 62
+        "lateral": 62,
+        "depth": 25
       },
       {
         "position": "RB",
-        "depth": 25,
-        "lateral": 85
+        "lateral": 85,
+        "depth": 25
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 30
+        "lateral": 30,
+        "depth": 48
       },
       {
         "position": "DM",
-        "depth": 45,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 45
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 70
+        "lateral": 70,
+        "depth": 48
       },
       {
         "position": "LW",
-        "depth": 72,
-        "lateral": 15
+        "lateral": 15,
+        "depth": 72
       },
       {
         "position": "ST",
-        "depth": 82,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 82
       },
       {
         "position": "RW",
-        "depth": 72,
-        "lateral": 85
+        "lateral": 85,
+        "depth": 72
       }
     ],
     "counts": {
@@ -73,58 +73,58 @@
     "slots": [
       {
         "position": "GK",
-        "depth": 10,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 8
       },
       {
         "position": "LB",
-        "depth": 25,
-        "lateral": 15
+        "lateral": 15,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 38
+        "lateral": 38,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 62
+        "lateral": 62,
+        "depth": 25
       },
       {
         "position": "RB",
-        "depth": 25,
-        "lateral": 85
+        "lateral": 85,
+        "depth": 25
       },
       {
         "position": "LM",
-        "depth": 48,
-        "lateral": 15
+        "lateral": 15,
+        "depth": 48
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 38
+        "lateral": 38,
+        "depth": 48
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 62
+        "lateral": 62,
+        "depth": 48
       },
       {
         "position": "RM",
-        "depth": 48,
-        "lateral": 85
+        "lateral": 85,
+        "depth": 48
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 40
+        "lateral": 40,
+        "depth": 80
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 60
+        "lateral": 60,
+        "depth": 80
       }
     ],
     "counts": {
@@ -142,58 +142,58 @@
     "slots": [
       {
         "position": "GK",
-        "depth": 10,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 8
       },
       {
         "position": "LB",
-        "depth": 25,
-        "lateral": 15
+        "lateral": 15,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 38
+        "lateral": 38,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 62
+        "lateral": 62,
+        "depth": 25
       },
       {
         "position": "RB",
-        "depth": 25,
-        "lateral": 85
+        "lateral": 85,
+        "depth": 25
       },
       {
         "position": "DM",
-        "depth": 45,
-        "lateral": 40
+        "lateral": 40,
+        "depth": 45
       },
       {
         "position": "DM",
-        "depth": 45,
-        "lateral": 60
+        "lateral": 60,
+        "depth": 45
       },
       {
         "position": "LW",
-        "depth": 67,
-        "lateral": 18
+        "lateral": 18,
+        "depth": 67
       },
       {
         "position": "AM",
-        "depth": 67,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 67
       },
       {
         "position": "RW",
-        "depth": 67,
-        "lateral": 82
+        "lateral": 82,
+        "depth": 67
       },
       {
         "position": "ST",
-        "depth": 82,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 82
       }
     ],
     "counts": {
@@ -212,58 +212,58 @@
     "slots": [
       {
         "position": "GK",
-        "depth": 10,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 8
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 30
+        "lateral": 30,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 70
+        "lateral": 70,
+        "depth": 25
       },
       {
         "position": "LM",
-        "depth": 48,
-        "lateral": 10
+        "lateral": 10,
+        "depth": 48
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 35
+        "lateral": 35,
+        "depth": 48
       },
       {
         "position": "DM",
-        "depth": 45,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 45
       },
       {
         "position": "CM",
-        "depth": 48,
-        "lateral": 65
+        "lateral": 65,
+        "depth": 48
       },
       {
         "position": "RM",
-        "depth": 48,
-        "lateral": 90
+        "lateral": 90,
+        "depth": 48
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 40
+        "lateral": 40,
+        "depth": 80
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 60
+        "lateral": 60,
+        "depth": 80
       }
     ],
     "counts": {
@@ -280,58 +280,58 @@
     "slots": [
       {
         "position": "GK",
-        "depth": 10,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 8
       },
       {
         "position": "LB",
-        "depth": 25,
-        "lateral": 10
+        "lateral": 10,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 30
+        "lateral": 30,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 25
       },
       {
         "position": "CB",
-        "depth": 25,
-        "lateral": 70
+        "lateral": 70,
+        "depth": 25
       },
       {
         "position": "RB",
-        "depth": 25,
-        "lateral": 90
+        "lateral": 90,
+        "depth": 25
       },
       {
         "position": "CM",
-        "depth": 50,
-        "lateral": 32
+        "lateral": 32,
+        "depth": 50
       },
       {
         "position": "DM",
-        "depth": 48,
-        "lateral": 50
+        "lateral": 50,
+        "depth": 48
       },
       {
         "position": "CM",
-        "depth": 50,
-        "lateral": 68
+        "lateral": 68,
+        "depth": 50
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 40
+        "lateral": 40,
+        "depth": 80
       },
       {
         "position": "ST",
-        "depth": 80,
-        "lateral": 60
+        "lateral": 60,
+        "depth": 80
       }
     ],
     "counts": {

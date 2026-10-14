@@ -502,7 +502,11 @@ async def admin_league_router(c,state):
     if len(parts)==3:
         async with SessionLocal() as s:r=(await s.execute(text('SELECT * FROM leagues WHERE id=:id'),{'id':lid})).mappings().first()
         if not r:return await c.answer('Лига не найдена.',show_alert=True)
-        await c.message.edit_text(f'🏆 <b>{r["name"]}</b> · {r["status"]}\ncreator={r["creator_user_id"]}',reply_markup=kb([('▶️ Стартовать',f'admin:league:{lid}:start'),('🔄 Добавить клуб',f'admin:league:{lid}:add'),('🔄 Убрать клуб',f'admin:league:{lid}:remove'),('🗑 Удалить лигу',f'admin:league:{lid}:delete'),('⬅️ Назад','admin:leagues')]));return await c.answer()
+        actions=[('▶️ Стартовать',f'admin:league:{lid}:start'),('🔄 Добавить клуб',f'admin:league:{lid}:add'),('🔄 Убрать клуб',f'admin:league:{lid}:remove')]
+        if r['status']=='FINISHED' and r['creator_user_id']==c.from_user.id:
+            actions.append(('🔄 Перезапустить лигу',f'admin:league:{lid}:restart'))
+        actions.extend([('🗑 Удалить лигу',f'admin:league:{lid}:delete'),('⬅️ Назад','admin:leagues')])
+        await c.message.edit_text(f'🏆 <b>{r["name"]}</b> · {r["status"]}\ncreator={r["creator_user_id"]}',reply_markup=kb(actions));return await c.answer()
     action=parts[3]
     if action=='start':
         try:
@@ -514,6 +518,21 @@ async def admin_league_router(c,state):
             await c.message.edit_text('▶️ Лига запущена, календарь создан.',reply_markup=back(f'admin:league:{lid}'))
         except Exception as exc:
             await c.message.answer(f'❌ Не удалось стартовать: {exc}')
+    elif action=='restart':
+        try:
+            async with SessionLocal() as s:
+                r=(await s.execute(text('SELECT id,name,status,creator_user_id FROM leagues WHERE id=:id FOR UPDATE'),{'id':lid})).mappings().first()
+                if not r or r['creator_user_id']!=c.from_user.id or r['status']!='FINISHED':
+                    return await c.answer('Перезапуск доступен только создателю завершённой лиги.',show_alert=True)
+                await s.execute(text('DELETE FROM matches WHERE league_id=:l'),{'l':lid})
+                await s.execute(text('UPDATE league_teams SET played=0,wins=0,draws=0,losses=0,goals_for=0,goals_against=0,points=0 WHERE league_id=:l'),{'l':lid})
+                await s.execute(text("UPDATE leagues SET status='WAITING',current_round=0,started_at=NULL,finished_at=NULL,total_rounds=0 WHERE id=:l"),{'l':lid})
+                await s.commit()
+            await log_action(c.from_user.id,'league_restart','league',lid)
+            await c.message.edit_text('✅ Лига перезапущена. Готова к новому сезону.',reply_markup=back(f'admin:league:{lid}'))
+        except Exception:
+            logger.exception('Admin league restart failed: league_id=%s', lid)
+            await c.answer('❌ Не удалось перезапустить лигу.',show_alert=True)
     elif action in ('add','remove'):
         await state.set_state(AdminStates.league_add_club if action=='add' else AdminStates.league_remove_club);await state.update_data(league_id=lid);await c.message.answer('Введите club_id:')
     elif action=='delete':

@@ -21,9 +21,10 @@ def _player_map(players, board, team):
     by_id={}
     for i,p in enumerate(players):
         slot=slots[i] if i<len(slots) else slots[-1]
-        # Engine depth x is mirrored for the away side so both teams attack toward x=100.
-        x=100-slot.x if team=='AWAY' else slot.x
-        by_id[p.id]=(float(x),float(slot.y))
+        # x is lateral and y is depth. Away sides mirror depth so both attack toward y=100.
+        x=float(slot.x)
+        y=100-slot.y if team=='AWAY' else slot.y
+        by_id[p.id]=(x,y)
     return by_id
 
 def _choose_player(rng, players, exclude=None, weights=None):
@@ -65,10 +66,10 @@ def _add_open_play_events(events, home, away, ht, at, home_board, away_board, se
             receiver=_choose_player(rng,pool,actor,weights=lambda p: 1.5 if p.position in {'CM','AM','LW','RW','ST'} else 1.0)
             if not receiver: continue
             end=_event_point(rng,positions.get(receiver.id,start),4)
-            events.append(MatchEvent(minute,'PASS',side,actor.name,receiver.name,f'↗️ {actor.name} → {receiver.name}',_visual_meta('PASS',start,end,zone='BUILD_UP' if start[0]<50 else 'ATTACK')))
+            events.append(MatchEvent(minute,'PASS',side,actor.name,receiver.name,f'↗️ {actor.name} → {receiver.name}',_visual_meta('PASS',start,end,zone='BUILD_UP' if start[1]<50 else 'ATTACK')))
         elif kind=='CARRY':
             direction=1 if side=='HOME' else -1
-            end=[max(3,min(97,start[0]+direction*rng.uniform(6,15))),max(4,min(96,start[1]+rng.uniform(-9,9)))]
+            end=[max(3,min(97,start[0]+rng.uniform(-9,9))),max(4,min(96,start[1]+direction*rng.uniform(6,15)))]
             events.append(MatchEvent(minute,'CARRY',side,actor.name,None,f'🏃 {actor.name} продвигает мяч',_visual_meta('CARRY',start,end,zone='TRANSITION')))
         else:
             opponent=away if side=='HOME' else home; opp_pos=ap if side=='HOME' else hp

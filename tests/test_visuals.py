@@ -104,3 +104,13 @@ def test_finance_screen_renders(tmp_path):
     recent=[{'category':'TICKETS','amount':120000,'balance_after':18500000,'description':'Домашний матч: 4800 зрителей'}]
     path=finance_screen(club,summary,recent,out=tmp_path/'finance.png')
     assert Path(path).exists() and Path(path).stat().st_size>1000
+
+
+def test_formation_positions_render_vertical_field_orientation():
+    from app.visual.render import formation_positions
+    pos=formation_positions('4-2-3-1')
+    assert pos[0] == (50,92)  # GK at own goal, bottom of image
+    assert [p[1] for p in pos[1:5]] == [75,75,75,75]
+    assert [p[1] for p in pos[5:7]] == [55,55]
+    assert [p[1] for p in pos[7:10]] == [33,33,33]
+    assert pos[10][1] == 18  # striker near opponent goal

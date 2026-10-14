@@ -33,7 +33,12 @@ def _card_player(r):
     if data.get('overall') is None:
         attrs={k:int(data.get(k) or 0) for k in ('pace','shooting','passing','dribbling','defending','physical','stamina','mental')}
         pr=type('CardPlayer',(),dict(attrs,position=str(data.get('position') or 'CM'),fitness=100,form=0,morale=70))()
-        data['overall']=player_rating(pr)
+        data['overall']=int(round(float(player_rating(pr))))
+    else:
+        try:
+            data['overall']=int(round(float(data['overall'])))
+        except (TypeError,ValueError):
+            data['overall']=None
     return data
 
 
@@ -1797,6 +1802,17 @@ async def cb_scout_search(c:CallbackQuery):
     await _show_scout_results(c,c.from_user.id,0)
 
 
+@router.callback_query(F.data.startswith('scout:back:'))
+async def cb_scout_back(c:CallbackQuery):
+    try: page=int(c.data.rsplit(':',1)[1])
+    except ValueError: page=0
+    try:
+        return await _show_scout_results(c,c.from_user.id,max(0,page))
+    except Exception:
+        logger.exception('Scout back navigation failed: user_id=%s page=%s',c.from_user.id,page)
+        return await c.answer('❌ Не удалось открыть результаты.',show_alert=True)
+
+
 @router.callback_query(F.data.startswith('scout:search:'))
 async def cb_scout_search_page(c:CallbackQuery):
     try: page=int(c.data.rsplit(':',1)[1])
@@ -1837,7 +1853,7 @@ async def cb_scout_item(c:CallbackQuery):
              f'🎯 POT {row["potential"]} · €{int(row["market_value"]):,}')
     k=InlineKeyboardBuilder()
     k.button(text=f'💰 Купить за €{int(row["market_value"]):,}',callback_data=f'scout:buy:{pid}')
-    k.button(text='⬅️ Назад к поиску',callback_data=f'scout:search:{_scout_filter_state(c.from_user.id).get("page",0)}')
+    k.button(text='⬅️ Назад к поиску',callback_data=f'scout:back:{_scout_filter_state(c.from_user.id).get("page",0)}')
     k.adjust(1)
     await c.message.answer_photo(FSInputFile(card),caption=caption,reply_markup=k.as_markup())
     await c.answer()
@@ -2543,15 +2559,22 @@ async def cmd_matchreplay(m:Message):
             WHERE m.home_club_id=:c OR m.away_club_id=:c
             ORDER BY CASE WHEN m.status='LIVE' THEN 0 ELSE 1 END,m.id DESC LIMIT 1'''),{'c':c['id']})).mappings().first()
         raw=(await s.execute(text('''SELECT minute,event_type,club_id,description,metadata,
-            p.first_name||' '||p.last_name player,
-            sp.first_name||' '||sp.last_name secondary_player
+            p.first_name player_first,p.last_name player_last,
+            sp.first_name secondary_first,sp.last_name secondary_last
             FROM match_events e
             LEFT JOIN players p ON p.id=e.player_id
             LEFT JOIN players sp ON sp.id=e.secondary_player_id
             WHERE e.match_id=:m AND e.event_type IN ('PASS','CARRY','PRESSURE','TACKLE','INTERCEPTION','SHOT','GOAL')
             ORDER BY e.minute,e.id'''),{'m':row['id']})).mappings().all() if row else []
     if not row: return await m.answer('Матчей пока нет.')
-    key_events=[dict(r) for r in raw if (r.get('metadata') or {}).get('visual_type')]
+    key_events=[]
+    for r in raw:
+        if not (r.get('metadata') or {}).get('visual_type'):
+            continue
+        item=dict(r)
+        item['player']=display_player_name(item.pop('player_first', ''),item.pop('player_last', ''))
+        item['secondary_player']=display_player_name(item.pop('secondary_first', ''),item.pop('secondary_last', '')) if item.get('secondary_first') or item.get('secondary_last') else None
+        key_events.append(item)
     if not key_events: return await m.answer('В этом матче ещё нет визуализируемых событий.')
     index=requested or len(key_events)
     index=min(index,len(key_events))

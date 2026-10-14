@@ -46,7 +46,7 @@ formation_manifest={}
 for f,slots in FORMATION_SLOTS.items():
     counts={}
     for slot,_,_ in slots: counts[slot]=counts.get(slot,0)+1
-    formation_manifest[f]={'slots':[{'position':slot,'depth':x,'lateral':y} for slot,x,y in slots],'counts':counts}
+    formation_manifest[f]={'slots':[{'position':slot,'lateral':x,'depth':y} for slot,x,y in slots],'counts':counts}
 (ROOT/'assets'/'visual'/'formation_manifest.json').write_text(json.dumps(formation_manifest,ensure_ascii=False,indent=2),encoding='utf-8')
 for i,name in enumerate(['FOOTBALL MANAGER','UNITED','CITY','ATHLETIC','ROYAL','SPORTING','DYNAMO','LEGENDS','TITANS','RANGERS','WANDERERS','PHOENIX'],1): club_crest(name,i)
 for n,g in {'goal':'⚽','yellow':'!','red':'×','sub':'↔','injury':'+','transfer':'€','whistle':'▶','tactics':'◇','star':'★','cup':'♛'}.items(): icon(n,g)
