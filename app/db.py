@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from .config import settings
 
@@ -22,15 +26,11 @@ SessionLocal = async_sessionmaker(
 
 
 def _split_sql_statements(sql: str) -> list[str]:
-    """Split PostgreSQL SQL without breaking quoted strings or dollar blocks.
+    """Split PostgreSQL SQL without breaking quoted strings or dollar blocks."""
 
-    Migrations may contain ordinary semicolon-separated statements as well as
-    PL/pgSQL blocks such as DO $$ ... END $$;. SQLAlchemy's asyncpg prepared
-    execution path accepts one statement at a time, so keep the splitter here
-    instead of relying on driver-specific multi-statement behavior.
-    """
     statements: list[str] = []
     buf: list[str] = []
+
     i = 0
     n = len(sql)
 
@@ -45,18 +45,22 @@ def _split_sql_statements(sql: str) -> list[str]:
 
         if line_comment:
             buf.append(ch)
+
             if ch == "\n":
                 line_comment = False
+
             i += 1
             continue
 
         if block_comment:
             buf.append(ch)
+
             if ch == "*" and nxt == "/":
                 buf.append(nxt)
                 i += 2
                 block_comment = False
                 continue
+
             i += 1
             continue
 
@@ -68,6 +72,7 @@ def _split_sql_statements(sql: str) -> list[str]:
             else:
                 buf.append(ch)
                 i += 1
+
             continue
 
         if quote is not None:
@@ -78,6 +83,7 @@ def _split_sql_statements(sql: str) -> list[str]:
                     buf.append(nxt)
                     i += 2
                     continue
+
                 quote = None
 
             elif ch == "\\" and quote == "'" and i + 1 < n:
@@ -113,7 +119,7 @@ def _split_sql_statements(sql: str) -> list[str]:
                 j += 1
 
             if j < n and sql[j] == "$":
-                dollar_tag = sql[i:j + 1]
+                dollar_tag = sql[i : j + 1]
                 buf.append(dollar_tag)
                 i = j + 1
                 continue
@@ -140,13 +146,8 @@ def _split_sql_statements(sql: str) -> list[str]:
 
 
 async def init_db():
-    """Apply versioned SQL migrations once.
+    """Apply versioned SQL migrations once."""
 
-    Existing installations created by the old bootstrap runner are detected
-    through the presence of the users table and marked as migrated without
-    re-running historical/destructive SQL. Fresh databases run all migrations
-    exactly once.
-    """
     root = Path(__file__).resolve().parent.parent
     migrations = sorted((root / "migrations").glob("*.sql"))
 
@@ -165,4 +166,65 @@ async def init_db():
 
         existing = (
             await conn.execute(
-                text
+                text("SELECT to_regclass('public.users')")
+            )
+        ).scalar_one()
+
+        applied = set(
+            (
+                await conn.execute(
+                    text("SELECT version FROM schema_migrations")
+                )
+            ).scalars().all()
+        )
+
+        if existing and not applied:
+            # The previous release executed migrations 001..011
+            # on every boot. Preserve that database as-is and mark
+            # those migrations as already applied.
+            for migration in migrations:
+                version = int(migration.stem.split("_", 1)[0])
+
+                if version <= 11:
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO schema_migrations(version, filename)
+                            VALUES (:v, :f)
+                            """
+                        ),
+                        {
+                            "v": version,
+                            "f": migration.name,
+                        },
+                    )
+
+            applied = {
+                int(m.stem.split("_", 1)[0])
+                for m in migrations
+                if int(m.stem.split("_", 1)[0]) <= 11
+            }
+
+        for migration in migrations:
+            version = int(migration.stem.split("_", 1)[0])
+
+            if version in applied:
+                continue
+
+            sql = migration.read_text(encoding="utf-8")
+
+            for statement in _split_sql_statements(sql):
+                await conn.execute(text(statement))
+
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO schema_migrations(version, filename)
+                    VALUES (:v, :f)
+                    """
+                ),
+                {
+                    "v": version,
+                    "f": migration.name,
+                },
+            )
