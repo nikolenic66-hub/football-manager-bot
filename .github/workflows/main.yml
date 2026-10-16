@@ -73,40 +73,9 @@ jobs:
           rm -rf /tmp/football-extracted
           mkdir -p /tmp/football-extracted
 
-          mapfile -t archives < <(
-            find . \
-              -maxdepth 1 \
-              -type f \
-              -name '*.zip' \
-              -printf '%f\n' |
-            sort
-          )
-
-          echo "Extraction order:"
-          printf '  %s\n' "${archives[@]}"
-
-          for archive in "${archives[@]}"; do
-            echo "Extracting ${archive}"
-
-            python - "$archive" /tmp/football-extracted <<'PY'
-import pathlib
-import sys
-import zipfile
-
-archive = pathlib.Path(sys.argv[1])
-destination = pathlib.Path(sys.argv[2]).resolve()
-
-with zipfile.ZipFile(archive) as zf:
-    for member in zf.infolist():
-        target = (destination / member.filename).resolve()
-
-        if target != destination and destination not in target.parents:
-            raise SystemExit(
-                f"ERROR: Unsafe ZIP path in {archive}: {member.filename}"
-            )
-
-    zf.extractall(destination)
-PY
+          for p in ./*.zip; do
+            echo "Extracting: $p"
+            unzip -oq "$p" -d "/tmp/football-extracted"
           done
 
       - name: Locate project
@@ -281,7 +250,7 @@ PY
           git commit -m "Deploy from release archives [skip ci]"
 
       - name: Sync with main
-        if: env.SKIP_COMMIT != '1'
+        if: ${{ env.SKIP_COMMIT != '1' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -290,7 +259,7 @@ PY
           git merge origin/main --no-edit
 
       - name: Push deployment
-        if: env.SKIP_COMMIT != '1'
+        if: ${{ env.SKIP_COMMIT != '1' }}
         shell: bash
         run: |
           set -euo pipefail
