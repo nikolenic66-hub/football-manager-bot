@@ -151,16 +151,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git restore --source=HEAD --staged --worktree .github/workflows 2>/dev/null || true
           git add -A
-
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
             exit 0
           fi
-
           git commit -m "Deploy from release archives [skip ci]"
 
       - name: Push
@@ -168,19 +164,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3; do
             if git push origin HEAD:main; then
               echo "Push succeeded."
               exit 0
             fi
-            echo "Push failed (attempt $i), syncing and retrying..."
+            echo "Push failed (attempt $i), retrying..."
             git fetch origin main
-            git rebase --autostash origin/main || {
-              echo "Rebase conflict, aborting."
-              git rebase --abort || true
-              exit 1
-            }
+            git reset --soft origin/main
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "Deploy from release archives [skip ci]" || true
+            fi
             sleep 5
           done
-          echo "Push failed after 5 attempts."
+          echo "Push failed after 3 attempts."
           exit 1
