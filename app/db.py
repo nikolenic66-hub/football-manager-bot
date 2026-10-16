@@ -1,9 +1,10 @@
 from pathlib import Path
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .config import settings
+
 
 engine = create_async_engine(
     settings.database_url,
@@ -12,7 +13,12 @@ engine = create_async_engine(
     pool_size=2,
     max_overflow=0,
 )
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+SessionLocal = async_sessionmaker(
+    engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
+)
 
 
 def _split_sql_statements(sql: str) -> list[str]:
@@ -27,6 +33,7 @@ def _split_sql_statements(sql: str) -> list[str]:
     buf: list[str] = []
     i = 0
     n = len(sql)
+
     quote: str | None = None
     dollar_tag: str | None = None
     line_comment = False
@@ -34,18 +41,18 @@ def _split_sql_statements(sql: str) -> list[str]:
 
     while i < n:
         ch = sql[i]
-        nxt = sql[i + 1] if i + 1 < n else ''
+        nxt = sql[i + 1] if i + 1 < n else ""
 
         if line_comment:
             buf.append(ch)
-            if ch == '\n':
+            if ch == "\n":
                 line_comment = False
             i += 1
             continue
 
         if block_comment:
             buf.append(ch)
-            if ch == '*' and nxt == '/':
+            if ch == "*" and nxt == "/":
                 buf.append(nxt)
                 i += 2
                 block_comment = False
@@ -65,47 +72,58 @@ def _split_sql_statements(sql: str) -> list[str]:
 
         if quote is not None:
             buf.append(ch)
+
             if ch == quote:
                 if nxt == quote:
                     buf.append(nxt)
                     i += 2
                     continue
                 quote = None
-            elif ch == '\\' and quote == "'" and i + 1 < n:
+
+            elif ch == "\\" and quote == "'" and i + 1 < n:
                 buf.append(nxt)
                 i += 2
                 continue
+
             i += 1
             continue
 
-        if ch == '-' and nxt == '-':
+        if ch == "-" and nxt == "-":
             buf.extend((ch, nxt))
             i += 2
             line_comment = True
             continue
-        if ch == '/' and nxt == '*':
+
+        if ch == "/" and nxt == "*":
             buf.extend((ch, nxt))
             i += 2
             block_comment = True
             continue
+
         if ch in ("'", '"'):
             quote = ch
             buf.append(ch)
             i += 1
             continue
-        if ch == '$':
+
+        if ch == "$":
             j = i + 1
-            while j < n and (sql[j].isalnum() or sql[j] == '_'):
+
+            while j < n and (sql[j].isalnum() or sql[j] == "_"):
                 j += 1
-            if j < n and sql[j] == '$':
+
+            if j < n and sql[j] == "$":
                 dollar_tag = sql[i:j + 1]
                 buf.append(dollar_tag)
                 i = j + 1
                 continue
-        if ch == ';':
-            statement = ''.join(buf).strip()
+
+        if ch == ";":
+            statement = "".join(buf).strip()
+
             if statement:
                 statements.append(statement)
+
             buf.clear()
             i += 1
             continue
@@ -113,9 +131,11 @@ def _split_sql_statements(sql: str) -> list[str]:
         buf.append(ch)
         i += 1
 
-    statement = ''.join(buf).strip()
+    statement = "".join(buf).strip()
+
     if statement:
         statements.append(statement)
+
     return statements
 
 
@@ -128,37 +148,21 @@ async def init_db():
     exactly once.
     """
     root = Path(__file__).resolve().parent.parent
-    migrations = sorted((root / 'migrations').glob('*.sql'))
+    migrations = sorted((root / "migrations").glob("*.sql"))
+
     async with engine.begin() as conn:
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                filename TEXT NOT NULL,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
             )
-        """))
-        existing = (await conn.execute(text("SELECT to_regclass('public.users')"))).scalar_one()
-        applied = set((await conn.execute(text('SELECT version FROM schema_migrations'))).scalars().all())
-        if existing and not applied:
-            # The previous release executed migrations 001..011 on every boot.
-            # Preserve that database as-is and only replay migrations introduced
-            # after the old bootstrap runner.
-            for migration in migrations:
-                version = int(migration.stem.split('_', 1)[0])
-                if version <= 11:
-                    await conn.execute(
-                        text('INSERT INTO schema_migrations(version,filename) VALUES(:v,:f)'),
-                        {'v': version, 'f': migration.name},
-                    )
-            applied = {int(m.stem.split('_', 1)[0]) for m in migrations if int(m.stem.split('_', 1)[0]) <= 11}
-        for migration in migrations:
-            version = int(migration.stem.split('_', 1)[0])
-            if version in applied:
-                continue
-            sql = migration.read_text(encoding='utf-8')
-            for statement in _split_sql_statements(sql):
-                await conn.execute(text(statement))
+        )
+
+        existing = (
             await conn.execute(
-                text('INSERT INTO schema_migrations(version,filename) VALUES(:v,:f)'),
-                {'v': version, 'f': migration.name},
-            )
+                text
