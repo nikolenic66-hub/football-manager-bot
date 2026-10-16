@@ -1,4 +1,4 @@
-name: Validate and promote release archives
+name: Deploy from release archives
 
 on:
   workflow_dispatch:
@@ -19,7 +19,6 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: production
 
     services:
       postgres:
@@ -43,9 +42,10 @@ jobs:
       FMB_RUN_DB_TESTS: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout release
         uses: actions/checkout@v4
         with:
+          ref: release
           fetch-depth: 0
           persist-credentials: true
 
@@ -62,7 +62,7 @@ jobs:
             exit 1
           fi
 
-          echo "Release archives:"
+          echo "Found ${#archives[@]} archive(s):"
           ls -lh "${archives[@]}"
 
       - name: Extract release
@@ -95,11 +95,7 @@ jobs:
               -print
           )
 
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: app/bot.py was not found in release archives."
-            find /tmp/football-extracted -maxdepth 4 -type f | head -200
-            exit 1
-          fi
+          test -n "$PROJECT"
 
           echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
 
@@ -108,28 +104,20 @@ jobs:
           test -f "$PROJECT/app/db.py"
           test -f "$PROJECT/requirements.txt"
 
-          echo "Project found:"
-          echo "$PROJECT"
+          echo "Project: $PROJECT"
 
-      - name: Verify database code
+      - name: Validate db.py
         working-directory: ${{ env.PROJECT }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking app/db.py..."
-
-          if grep -n "sync_sql" app/db.py; then
-            echo "ERROR: old sync_sql block found in release app/db.py"
+          if grep -nE 'sync_sql|setval|IndeterminateDatatype' app/db.py; then
+            echo "ERROR: old broken sequence-sync code detected in app/db.py"
             exit 1
           fi
 
-          if grep -n "setval" app/db.py; then
-            echo "ERROR: old sequence synchronization block found in release app/db.py"
-            exit 1
-          fi
-
-          echo "Database code is OK."
+          echo "db.py validation passed."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -149,7 +137,7 @@ jobs:
         run: |
           python -m compileall -q app
 
-      - name: Prepare PostgreSQL schema
+      - name: Initialize database
         working-directory: ${{ env.PROJECT }}
         run: |
           python -c "import asyncio; from app.db import init_db; asyncio.run(init_db())"
@@ -164,7 +152,7 @@ jobs:
         run: |
           pytest -q
 
-      - name: Prepare project for deployment
+      - name: Prepare project
         shell: bash
         run: |
           set -euo pipefail
@@ -174,45 +162,22 @@ jobs:
 
           cp -a "$PROJECT"/. /tmp/final-football-project/
 
-          find /tmp/final-football-project \
-            -type d \
-            -name "__pycache__" \
-            -prune \
-            -exec rm -rf {} +
-
-          find /tmp/final-football-project \
-            -type f \
-            -name "*.pyc" \
-            -delete
-
-          rm -rf /tmp/final-football-project/.pytest_cache
-
       - name: Replace repository contents
         shell: bash
         run: |
           set -euo pipefail
 
           find . -mindepth 1 -maxdepth 1 \
-            ! -name ".git" \
-            ! -name ".github" \
+            ! -name '.git' \
+            ! -name '.github' \
             -exec rm -rf {} +
 
           cp -a /tmp/final-football-project/. .
 
           rm -f ./*.zip
 
-          find . \
-            -type d \
-            -name "__pycache__" \
-            -prune \
-            -exec rm -rf {} +
-
-          find . \
-            -type f \
-            -name "*.pyc" \
-            -delete
-
-          rm -rf .pytest_cache
+          find . -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find . -name '*.pyc' -delete
 
       - name: Commit deployment
         shell: bash
@@ -222,7 +187,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Keep the workflow that is currently running.
           git restore \
             --source=HEAD \
             --staged \
@@ -234,36 +198,21 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "Nothing to commit."
-            echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          git commit -m "Deploy release archives [skip ci]"
+          git commit -m "Deploy from release archives [skip ci]"
 
-      - name: Sync with main
-        if: env.SKIP_COMMIT != '1'
+      - name: Merge main
         shell: bash
         run: |
           set -euo pipefail
 
           git fetch origin main
 
-          echo "=== HEAD before merge ==="
-          git --no-pager log --oneline -5
-
-          echo "=== status before merge ==="
-          git status --short
-
           git merge origin/main --no-edit
 
-          echo "=== status after merge ==="
-          git status --short
-
-          echo "=== HEAD after merge ==="
-          git --no-pager log --oneline -5
-
       - name: Push to main
-        if: env.SKIP_COMMIT != '1'
         shell: bash
         run: |
           set -euo pipefail
