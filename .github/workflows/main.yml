@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - release
+      - main
     paths:
       - "*.zip"
       - ".github/workflows/main.yml"
