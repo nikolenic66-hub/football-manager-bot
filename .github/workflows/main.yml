@@ -199,4 +199,73 @@ jobs:
 
           cp -a /tmp/final-football-project/. .
 
-          rm -f
+          rm -f ./*.zip
+
+          find . \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+          find . \
+            -type f \
+            -name "*.pyc" \
+            -delete
+
+          rm -rf .pytest_cache
+
+      - name: Commit deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Keep the workflow that is currently running.
+          git restore \
+            --source=HEAD \
+            --staged \
+            --worktree \
+            .github/workflows \
+            2>/dev/null || true
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          git commit -m "Deploy release archives [skip ci]"
+
+      - name: Sync with main
+        if: env.SKIP_COMMIT != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+
+          echo "=== HEAD before merge ==="
+          git --no-pager log --oneline -5
+
+          echo "=== status before merge ==="
+          git status --short
+
+          git merge origin/main --no-edit
+
+          echo "=== status after merge ==="
+          git status --short
+
+          echo "=== HEAD after merge ==="
+          git --no-pager log --oneline -5
+
+      - name: Push to main
+        if: env.SKIP_COMMIT != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git push origin HEAD:main
