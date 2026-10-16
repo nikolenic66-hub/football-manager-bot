@@ -75,6 +75,7 @@ jobs:
           mkdir -p /tmp/football-extracted
 
           for p in ./*.zip; do
+            echo "Extracting: $p"
             unzip -oq "$p" -d "/tmp/football-extracted"
           done
 
@@ -165,7 +166,7 @@ jobs:
           find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
           find . -name '*.pyc' -delete
 
-      - name: Commit and rebase
+      - name: Commit deployment
         if: env.SKIP != '1'
         shell: bash
         run: |
@@ -174,8 +175,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Never allow the workflow file itself from the release archive
-          # to become part of the deployment commit.
+          # Do not allow the workflow file from the release archive
+          # to overwrite the workflow that is currently running.
           git restore \
             --source=HEAD \
             --staged \
@@ -193,66 +194,59 @@ jobs:
 
           git commit -m "Deploy from release archives [skip ci]"
 
-          # Synchronize with the current main branch.
+      - name: Sync with main
+        if: env.SKIP != '1' && env.SKIP_COMMIT != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git fetch origin main
 
-          # IMPORTANT:
-          # The deployment commit already contains everything that must
-          # be deployed. Reset the index/worktree to that commit and
-          # remove every untracked/ignored generated file before rebase.
-          git reset --hard HEAD
-          git clean -fdx
+          echo "=== HEAD before merge ==="
+          git --no-pager log --oneline -5
 
-          echo "=== git status before rebase ==="
+          echo "=== status before merge ==="
           git status --short
 
-          echo "=== git diff before rebase ==="
-          git diff --stat
+          # IMPORTANT:
+          # Do NOT use rebase here.
+          #
+          # The deployment is already committed. Merge the current
+          # origin/main into that deployment commit instead.
+          git merge origin/main --no-edit
 
-          # Hard safety check: rebase must NEVER start with a dirty tree.
-          if ! git diff --quiet || ! git diff --cached --quiet; then
-            echo "ERROR: working tree is not clean before rebase."
-            git status --short
-            git diff --stat
-            git diff --cached --stat
-            exit 1
-          fi
+          echo "=== status after merge ==="
+          git status --short
 
-          git rebase origin/main
+          echo "=== HEAD after merge ==="
+          git --no-pager log --oneline -5
 
-      - name: Push
+      - name: Push to main
         if: env.SKIP != '1' && env.SKIP_COMMIT != '1'
         shell: bash
         run: |
           set -euo pipefail
 
           for i in 1 2 3; do
+            echo "Push attempt $i..."
+
             if git push origin HEAD:main; then
               echo "Push succeeded."
               exit 0
             fi
 
-            echo "Push failed (attempt $i), syncing and retrying..."
-
-            git fetch origin main
-
-            # The previous step guarantees a clean tree.
-            # Keep that invariant before every retry as well.
-            git reset --hard HEAD
-            git clean -fdx
-
-            if ! git diff --quiet || ! git diff --cached --quiet; then
-              echo "ERROR: working tree is dirty before retry rebase."
-              git status --short
-              git diff --stat
-              git diff --cached --stat
+            if [ "$i" -eq 3 ]; then
+              echo "Push failed after 3 attempts."
               exit 1
             fi
 
-            git rebase origin/main
+            echo "Push failed. Fetching latest main..."
+
+            git fetch origin main
+
+            echo "Merging latest origin/main..."
+
+            git merge origin/main --no-edit
 
             sleep 5
           done
-
-          echo "Push failed after 3 attempts."
-          exit 1
