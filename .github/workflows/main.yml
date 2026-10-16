@@ -1,10 +1,10 @@
-name: Deploy from release archives
+name: Validate and promote release archives
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - release
     paths:
       - '*.zip'
       - '.github/workflows/main.yml'
@@ -13,12 +13,32 @@ permissions:
   contents: write
 
 concurrency:
-  group: deploy-main
+  group: promote-release
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: football
+          POSTGRES_PASSWORD: football
+          POSTGRES_DB: football_manager_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U football -d football_manager_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      BOT_TOKEN: "123456789:CI_TEST_TOKEN_PLACEHOLDER"
+      DATABASE_URL: postgresql+asyncpg://football:football@127.0.0.1:5432/football_manager_test
+      TEST_DATABASE_URL: postgresql+asyncpg://football:football@127.0.0.1:5432/football_manager_test
+      FMB_RUN_DB_TESTS: "1"
 
     steps:
       - name: Checkout
@@ -81,12 +101,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install "greenlet>=3.0"
           pip install pytest
 
       - name: Compile
         if: env.SKIP != '1'
         working-directory: ${{ env.PROJECT }}
         run: python -m compileall -q app
+
+      - name: Prepare PostgreSQL schema for DB regression tests
+        if: env.SKIP != '1'
+        working-directory: ${{ env.PROJECT }}
+        run: |
+          python -c "import asyncio; from app.db import init_db; asyncio.run(init_db())"
+          python -m app.seed
 
       - name: Tests
         if: env.SKIP != '1'
@@ -113,42 +141,46 @@ jobs:
             -exec rm -rf {} +
           cp -a /tmp/final-football-project/. .
           rm -f ./*.zip
+          find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find . -name '*.pyc' -delete
 
-      - name: Commit and rebase
+      - name: Commit
         if: env.SKIP != '1'
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git restore --source=HEAD --staged --worktree .github/workflows 2>/dev/null || true
           git add -A
-          git restore --staged .github/workflows 2>/dev/null || true
+
           if git diff --cached --quiet; then
             echo "Nothing to commit."
             echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
             exit 0
           fi
+
           git commit -m "Deploy from release archives [skip ci]"
-          git fetch origin main
-          git rebase origin/main
 
       - name: Push
         if: env.SKIP != '1' && env.SKIP_COMMIT != '1'
         shell: bash
         run: |
           set -euo pipefail
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             if git push origin HEAD:main; then
               echo "Push succeeded."
               exit 0
             fi
             echo "Push failed (attempt $i), syncing and retrying..."
             git fetch origin main
-            git rebase origin/main || {
+            git rebase --autostash origin/main || {
               echo "Rebase conflict, aborting."
+              git rebase --abort || true
               exit 1
             }
             sleep 5
           done
-          echo "Push failed after 3 attempts."
+          echo "Push failed after 5 attempts."
           exit 1
