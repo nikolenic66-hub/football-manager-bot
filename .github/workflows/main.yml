@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: promote-release
+  group: deploy-main
   cancel-in-progress: false
 
 jobs:
@@ -42,13 +42,14 @@ jobs:
       FMB_RUN_DB_TESTS: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Check release archives
+      - name: Find release archives
         shell: bash
         run: |
           set -euo pipefail
@@ -56,15 +57,15 @@ jobs:
 
           archives=(./*.zip)
 
-          if [ ${#archives[@]} -eq 0 ]; then
+          if [ "${#archives[@]}" -eq 0 ]; then
             echo "ERROR: No ZIP archives found in repository root."
             exit 1
           fi
 
-          echo "Found ${#archives[@]} ZIP archive(s):"
-          ls -lh "${archives[@]}"
+          echo "Release archives:"
+          printf '  %s\n' "${archives[@]}"
 
-      - name: Extract release
+      - name: Extract archives
         shell: bash
         run: |
           set -euo pipefail
@@ -72,54 +73,100 @@ jobs:
           rm -rf /tmp/football-extracted
           mkdir -p /tmp/football-extracted
 
-          for archive in ./*.zip; do
-            echo "Extracting: $archive"
-            unzip -oq "$archive" -d /tmp/football-extracted
+          mapfile -t archives < <(
+            find . \
+              -maxdepth 1 \
+              -type f \
+              -name '*.zip' \
+              -printf '%f\n' |
+            sort
+          )
+
+          echo "Extraction order:"
+          printf '  %s\n' "${archives[@]}"
+
+          for archive in "${archives[@]}"; do
+            echo "Extracting ${archive}"
+
+            python - "$archive" /tmp/football-extracted <<'PY'
+import pathlib
+import sys
+import zipfile
+
+archive = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2]).resolve()
+
+with zipfile.ZipFile(archive) as zf:
+    for member in zf.infolist():
+        target = (destination / member.filename).resolve()
+
+        if target != destination and destination not in target.parents:
+            raise SystemExit(
+                f"ERROR: Unsafe ZIP path in {archive}: {member.filename}"
+            )
+
+    zf.extractall(destination)
+PY
           done
 
-      - name: Find project
+      - name: Locate project
         shell: bash
         run: |
           set -euo pipefail
 
-          PROJECT=""
-
-          while IFS= read -r bot; do
-            PROJECT="$(dirname "$(dirname "$bot")")"
-            break
-          done < <(
+          mapfile -t candidates < <(
             find /tmp/football-extracted \
               -type f \
               -path '*/app/bot.py' \
-              -print
+              -printf '%h\n' |
+            sed 's#/app$##' |
+            sort -u
           )
 
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: Could not find project containing app/bot.py"
+          if [ "${#candidates[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one extracted project."
+            echo "Found:"
+            printf '  %s\n' "${candidates[@]}"
             exit 1
           fi
 
+          PROJECT="${candidates[0]}"
+
+          for required in \
+            app/bot.py \
+            app/config.py \
+            app/db.py \
+            requirements.txt
+          do
+            if [ ! -f "$PROJECT/$required" ]; then
+              echo "ERROR: Missing $required"
+              exit 1
+            fi
+          done
+
           echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT"
 
-          test -f "$PROJECT/app/bot.py"
-          test -f "$PROJECT/app/config.py"
-          test -f "$PROJECT/app/db.py"
-          test -f "$PROJECT/requirements.txt"
+      - name: Protect deployment workflow
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "Project found: $PROJECT"
+          rm -rf "$PROJECT/.github"
+          cp -a .github "$PROJECT/.github"
 
-      - name: Validate db.py
+      - name: Validate database runner
         working-directory: ${{ env.PROJECT }}
         shell: bash
         run: |
           set -euo pipefail
 
           if grep -nE 'sync_sql|setval|IndeterminateDatatype' app/db.py; then
-            echo "ERROR: Old broken sequence-sync code detected in app/db.py"
+            echo "ERROR: Forbidden legacy sequence-sync code detected in app/db.py"
             exit 1
           fi
 
-          echo "db.py validation passed."
+          echo "Database runner validation passed."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -132,7 +179,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install "greenlet>=3.0"
-          pip install pytest
+          pip install "pytest>=8.4,<9" "pytest-asyncio>=1.2,<2"
 
       - name: Compile
         working-directory: ${{ env.PROJECT }}
@@ -154,7 +201,7 @@ jobs:
         run: |
           pytest -q
 
-      - name: Prepare project
+      - name: Prepare deployed project
         shell: bash
         run: |
           set -euo pipefail
@@ -177,17 +224,28 @@ jobs:
 
           rm -rf /tmp/final-football-project/.pytest_cache
 
+          find /tmp/final-football-project \
+            -maxdepth 1 \
+            -type f \
+            -name "*.zip" \
+            -delete
+
       - name: Replace repository contents
         shell: bash
         run: |
           set -euo pipefail
 
-          find . -mindepth 1 -maxdepth 1 \
+          find . \
+            -mindepth 1 \
+            -maxdepth 1 \
             ! -name ".git" \
             ! -name ".github" \
             -exec rm -rf {} +
 
           cp -a /tmp/final-football-project/. .
+
+          rm -rf .github
+          git checkout -- .github
 
           rm -f ./*.zip
 
@@ -212,17 +270,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git restore \
-            --source=HEAD \
-            --staged \
-            --worktree \
-            .github/workflows \
-            2>/dev/null || true
-
           git add -A
 
           if git diff --cached --quiet; then
-            echo "Nothing to commit."
+            echo "Nothing to deploy."
             echo "SKIP_COMMIT=1" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -238,7 +289,7 @@ jobs:
           git fetch origin main
           git merge origin/main --no-edit
 
-      - name: Push to main
+      - name: Push deployment
         if: env.SKIP_COMMIT != '1'
         shell: bash
         run: |
