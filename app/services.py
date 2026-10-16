@@ -4,7 +4,10 @@ import json
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import re
+import logging
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 from app.game.engine import simulate_match, expected_goals
 from app.game.ratings import player_rating
 from app.game.tactics import Tactics, Style
@@ -54,21 +57,34 @@ def _tactics_from_row(r):
                    width=r['width'], defensive_line=r['defensive_line'], aggression=r['aggression'])
 
 async def ensure_squad(s, club_id):
-    n=(await s.execute(text('SELECT count(*) FROM club_players WHERE club_id=:c'),{'c':club_id})).scalar_one()
-    if n>=23: return n
-    need=23-n
-    rows=(await s.execute(text(f'''SELECT {PLAYER_FIELDS} FROM players p
-        WHERE p.rarity IN ('BASE','RARE')
-          AND p.age BETWEEN 17 AND 24
-          AND p.potential BETWEEN 60 AND 90
-          AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id)
-        ORDER BY random() LIMIT :n'''),{'n':need})).mappings().all()
-    if len(rows)<need: raise RuntimeError('Not enough free players in the market.')
-    for r in rows:
-        await s.execute(text('INSERT INTO club_players(club_id,player_id) VALUES(:c,:p)'),{'c':club_id,'p':r['id']})
-    await s.execute(text("""UPDATE club_players cp SET contract_salary=COALESCE(cp.contract_salary,p.salary),release_clause=CASE WHEN cp.release_clause=0 THEN GREATEST(p.market_value*2,p.salary*36) ELSE cp.release_clause END,contract_until=COALESCE(cp.contract_until,CURRENT_DATE+INTERVAL '3 years') FROM players p WHERE cp.club_id=:c AND p.id=cp.player_id"""),{'c':club_id})
+    n=int((await s.execute(text('SELECT count(*) FROM club_players WHERE club_id=:c'),{'c':club_id})).scalar_one())
+    if n >= 23:
+        return n
+    if n == 0:
+        await build_starting_lineup(s, club_id)
+        n=23
+    else:
+        need=23-n
+        rows=(await s.execute(text('''SELECT p.id FROM players p
+            WHERE p.is_template=TRUE AND p.rarity IN ('BASE','RARE')
+              AND NOT EXISTS(
+                  SELECT 1 FROM club_players cp JOIN players owned ON owned.id=cp.player_id
+                  WHERE cp.club_id=:c AND owned.template_id=p.id
+              )
+            ORDER BY p.rarity,p.id LIMIT :n'''), {'c':club_id,'n':need})).scalars().all()
+        if len(rows) < need:
+            raise RuntimeError('Not enough player templates to complete the squad.')
+        for template_id in rows:
+            await add_copy_to_club(s,club_id,int(template_id))
+        n=23
+    await s.execute(text('''UPDATE club_players cp SET
+        contract_salary=COALESCE(cp.contract_salary,p.salary),
+        release_clause=CASE WHEN cp.release_clause=0 THEN GREATEST(p.market_value*2,p.salary*36) ELSE cp.release_clause END,
+        contract_until=COALESCE(cp.contract_until,CURRENT_DATE+INTERVAL '3 years')
+        FROM players p WHERE cp.club_id=:c AND p.id=cp.player_id'''),{'c':club_id})
     await s.execute(text('INSERT INTO club_training(club_id) VALUES(:c) ON CONFLICT DO NOTHING'),{'c':club_id})
-    return n+need
+    return n
+
 
 async def create_test_bot_club(s, name, admin_id=None):
     """Create an admin-only test club with a synthetic negative Telegram owner."""
@@ -186,7 +202,7 @@ def _relevant_score(player, slot):
     return sum(float(_player_value(player, stat)) for stat in _AUTOSQUAD_STATS.get(slot, ('mental',)))
 
 
-def build_starting_lineup(players, slots):
+def _build_position_lineup(players, slots):
     """Build an ordered XI, preferring exact and secondary positions before fallback."""
     available=list(players)
     chosen=[]
@@ -204,6 +220,190 @@ def build_starting_lineup(players, slots):
         used.add(_player_value(p, 'id'))
     return chosen
 
+
+
+_TEMPLATE_SLOTS = [
+    'GK','LB','CB','CB','RB','CM','CM','CM','LW','ST','RW',
+    'GK','GK','CB','CB','LB','RB','DM','CM','CM','AM','LW','ST',
+]
+STARTING_SLOT_RARITIES = tuple(
+    'RARE' if i in {2,3,6,7,8,10} else 'EPIC' if i in {5,9} else 'BASE'
+    for i in range(23)
+)
+
+
+async def create_player_copy(s, template_id):
+    template=(await s.execute(text('SELECT id FROM players WHERE id=:t AND is_template=TRUE FOR SHARE'), {'t':template_id})).first()
+    if not template:
+        raise ValueError('Player template not found.')
+    row=(await s.execute(text("""INSERT INTO players(
+        first_name,last_name,nationality,age,position,pace,shooting,passing,dribbling,
+        defending,physical,stamina,mental,market_value,salary,potential,rarity,card_version,
+        real_player,preferred_foot,secondary_positions,portrait_url,portrait_source,talents,
+        tactical_archetype,data_source,portrait_license,portrait_author,portrait_url_hash,
+        is_template,template_id
+    ) SELECT
+        first_name,last_name,nationality,age,position,pace,shooting,passing,dribbling,
+        defending,physical,stamina,mental,market_value,salary,potential,rarity,card_version,
+        real_player,preferred_foot,secondary_positions,NULL,NULL,talents,
+        tactical_archetype,'copy',NULL,NULL,NULL,FALSE,:t
+      FROM players WHERE id=:t AND is_template=TRUE
+      RETURNING id"""), {'t':template_id})).first()
+    if not row:
+        raise ValueError('Player template not found.')
+    logger.info('Created player copy player_id=%s template_id=%s', row.id, template_id)
+    return int(row.id)
+
+
+async def club_has_template(s, club_id, template_id):
+    return (await s.execute(text("""SELECT 1 FROM club_players cp
+        JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id=:c AND p.template_id=:t LIMIT 1"""),
+        {'c':club_id,'t':template_id})).first() is not None
+
+
+async def add_copy_to_club(s, club_id, template_id, shirt_number=None):
+    template=(await s.execute(text('SELECT market_value,salary FROM players WHERE id=:t AND is_template=TRUE FOR SHARE'), {'t':template_id})).mappings().first()
+    if not template:
+        raise ValueError('Player template not found.')
+    if await club_has_template(s, club_id, template_id):
+        comp=int(template['market_value'])//2
+        club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'), {'c':club_id})).mappings().first()
+        if not club:
+            raise ValueError('Club not found.')
+        new_budget=int(club['budget'])+comp
+        await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:c'), {'b':new_budget,'c':club_id})
+        await s.execute(text("""INSERT INTO club_financial_transactions(
+            club_id,category,amount,balance_after,description)
+            VALUES(:c,'OTHER',:amount,:balance,:description)"""), {
+            'c':club_id,'amount':comp,'balance':new_budget,
+            'description':f'Компенсация за повторный выбор шаблона игрока #{template_id}',
+        })
+        return None, comp
+    new_id=await create_player_copy(s, template_id)
+    inserted=(await s.execute(text("""INSERT INTO club_players(
+        club_id,player_id,template_id,shirt_number,fitness,form,morale,contract_salary,release_clause)
+        VALUES(:c,:p,:t,:shirt,100,0,70,:salary,:clause)
+        ON CONFLICT (club_id,template_id) WHERE template_id IS NOT NULL DO NOTHING
+        RETURNING player_id"""), {
+        'c':club_id,'p':new_id,'t':template_id,'shirt':shirt_number,
+        'salary':int(template['salary']),'clause':int(template['market_value'])*2,
+    })).scalar_one_or_none()
+    if inserted is None:
+        await s.execute(text('DELETE FROM players WHERE id=:p AND is_template=FALSE'), {'p':new_id})
+        comp=int(template['market_value'])//2
+        club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'), {'c':club_id})).mappings().first()
+        if not club:
+            raise ValueError('Club not found.')
+        new_budget=int(club['budget'])+comp
+        await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:c'), {'b':new_budget,'c':club_id})
+        await s.execute(text("""INSERT INTO club_financial_transactions(
+            club_id,category,amount,balance_after,description)
+            VALUES(:c,'OTHER',:amount,:balance,:description)"""), {
+            'c':club_id,'amount':comp,'balance':new_budget,
+            'description':f'Компенсация за повторный выбор шаблона игрока #{template_id}',
+        })
+        return None, comp
+    return int(inserted), 0
+
+
+async def _template_usage_counts(s, club_id):
+    rows=(await s.execute(text("""SELECT p.template_id,COUNT(*) AS uses
+        FROM club_players cp JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id<>:c AND p.template_id IS NOT NULL
+        GROUP BY p.template_id"""), {'c':club_id})).all()
+    return {int(r.template_id):int(r.uses) for r in rows}
+
+
+async def _pick_template(s, used_templates, rarity_order, positions, usage):
+    for rarity in rarity_order:
+        rows=(await s.execute(text("""SELECT id FROM players
+            WHERE is_template=TRUE AND rarity=:rarity
+              AND position=ANY(:positions)
+              AND NOT (id=ANY(:used))"""), {
+            'rarity':rarity,'positions':list(positions),'used':list(used_templates or [0]),
+        })).scalars().all()
+        if rows:
+            return int(min(rows, key=lambda pid:(usage.get(int(pid),0), int(pid))))
+    return None
+
+
+async def _build_starting_squad_from_templates(s, club_id):
+    """Create the 23-player 4-3-3 squad from unique player templates."""
+    existing=int((await s.execute(text('SELECT COUNT(*) FROM club_players WHERE club_id=:c'), {'c':club_id})).scalar_one())
+    if existing:
+        if existing != 23:
+            raise ValueError('Club already has a non-standard squad; reset it before rebuilding.')
+        return existing
+    usage=await _template_usage_counts(s,club_id)
+    slots=list(_TEMPLATE_SLOTS)
+    # Exact 4-3-3 starting XI occupies the first 11 slots. Two EPIC cards go
+    # to key positions; six RARE cards are spread across CB/CM/LW/RW.
+    used=set()
+    selected=[]
+    for idx,pos in enumerate(slots):
+        target_rarity=STARTING_SLOT_RARITIES[idx]
+        if target_rarity == 'EPIC':
+            rarity_order=('EPIC','RARE','BASE')
+        elif target_rarity == 'RARE':
+            rarity_order=('RARE','EPIC','BASE')
+        else:
+            rarity_order=('BASE','RARE','EPIC')
+        tid=await _pick_template(s,used,rarity_order,{pos},usage)
+        if tid is None:
+            raise RuntimeError(f'No template available for {pos}.')
+        selected.append(tid)
+        used.add(tid)
+    if len(selected) != 23 or len(set(selected)) != 23:
+        raise RuntimeError('Could not build a unique 23-player squad.')
+    created_ids=[]
+    for shirt,tid in enumerate(selected,1):
+        new_id,_=await add_copy_to_club(s,club_id,tid,shirt)
+        if new_id is not None:
+            created_ids.append(int(new_id))
+    if len(created_ids) != 23:
+        raise RuntimeError('Could not create all 23 player copies for the squad.')
+    await s.execute(text('INSERT INTO club_lineups(club_id,player_ids) VALUES(:c,:ids) ON CONFLICT(club_id) DO UPDATE SET player_ids=EXCLUDED.player_ids'),
+                    {'c':club_id,'ids':created_ids[:11]})
+    return 23
+
+
+
+def build_starting_lineup(first, second):
+    if hasattr(first, 'execute'):
+        return _build_starting_squad_from_templates(first, second)
+    return _build_position_lineup(first, second)
+
+
+async def full_reset(s, admin_user_id=None):
+    """Manually reset all club/season state and rebuild every squad from templates."""
+    active_leagues=(await s.execute(text("SELECT id FROM leagues WHERE status='ACTIVE' ORDER BY id FOR UPDATE"))).scalars().all()
+    for league_id in active_leagues:
+        await archive_league(s, int(league_id))
+    for sql in (
+        'DELETE FROM match_player_stats','DELETE FROM match_events','DELETE FROM match_substitutions',
+        'DELETE FROM match_tactics','DELETE FROM match_lineups','DELETE FROM club_substitution_plans',
+        'DELETE FROM club_counterplans','DELETE FROM club_player_instructions','DELETE FROM club_lineups',
+        'DELETE FROM club_tactics','DELETE FROM club_training','DELETE FROM player_development_log',
+        'DELETE FROM transfer_offers','DELETE FROM transfer_listings','DELETE FROM transfers',
+        'DELETE FROM club_players',
+        'DELETE FROM league_teams','DELETE FROM matches','DELETE FROM leagues',
+        'DELETE FROM club_season_finances','DELETE FROM club_financial_transactions',
+        'DELETE FROM players WHERE is_template=FALSE',
+        "UPDATE clubs SET budget=2000000,fans=5000,reputation=1,stadium_level=1,ticket_price=20,sponsor_level=1,debt=0",
+        'UPDATE players SET is_template=TRUE,template_id=NULL WHERE is_seed=TRUE',
+    ):
+        await s.execute(text(sql))
+    club_ids=[int(r[0]) for r in (await s.execute(text('SELECT id FROM clubs ORDER BY id'))).all()]
+    for club_id in club_ids:
+        await build_starting_lineup(s,club_id)
+        await s.execute(text('INSERT INTO club_training(club_id) VALUES(:c) ON CONFLICT DO NOTHING'), {'c':club_id})
+        await s.execute(text('INSERT INTO club_tactics(club_id) VALUES(:c) ON CONFLICT DO NOTHING'), {'c':club_id})
+    await s.execute(text("""INSERT INTO admin_actions_log(admin_user_id,action,target_type,target_id,payload)
+        VALUES(:u,'full_reset','system',NULL,CAST(:p AS jsonb))"""), {
+        'u':admin_user_id,'p':json.dumps({'clubs_reset':len(club_ids)},ensure_ascii=False),
+    })
+    return len(club_ids)
 
 async def _starting_players(s,club_id):
     rows=(await s.execute(text(f"SELECT {PLAYER_FIELDS},cp.fitness,cp.form,cp.morale,cp.is_injured,cp.injury_matches,cp.suspension_matches, p.secondary_positions FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c AND cp.is_injured=false AND cp.suspension_matches=0 ORDER BY p.potential DESC,p.id"),{'c':club_id})).mappings().all()
@@ -544,15 +744,19 @@ async def market_players(s, limit=10):
         WHERE cp.player_id IS NULL ORDER BY p.market_value DESC,p.id LIMIT :n'''),{'n':limit})).mappings().all()
 
 async def buy_player(s, club_id, player_id):
-    player=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.market_value FROM players p
+    player=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.market_value,COALESCE(p.template_id,p.id) AS source_template_id FROM players p
         WHERE p.id=:p AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id) FOR UPDATE'''),{'p':player_id})).mappings().first()
     if not player: raise ValueError('Player is no longer available on the market.')
     club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'),{'c':club_id})).mappings().first()
     if not club: raise ValueError('Club not found.')
+    duplicate=(await s.execute(text('''SELECT 1 FROM club_players cp JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id=:c AND COALESCE(p.template_id,p.id)=:t LIMIT 1'''),
+        {'c':club_id,'t':int(player['source_template_id'])})).first()
+    if duplicate: raise ValueError('У вас уже есть такой игрок.')
     price=int(player['market_value'])
     if club['budget']<price: raise ValueError(f'Not enough budget. Need €{price:,}.')
     await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {display_player_name(player.get("first_name"),player.get("last_name"))} за €{price:,}')
-    await s.execute(text('INSERT INTO club_players(club_id,player_id) VALUES(:c,:p)'),{'c':club_id,'p':player_id})
+    await s.execute(text('INSERT INTO club_players(club_id,player_id,template_id) SELECT :c,:p,template_id FROM players WHERE id=:p'),{'c':club_id,'p':player_id})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,NULL,:c,:price)'),{'p':player_id,'c':club_id,'price':price})
     return player,price
 
@@ -714,14 +918,6 @@ async def _materialize_live_events(s, match, phase_data, upto_minute):
     existing=(await s.execute(text('''SELECT minute,event_type,club_id,player_id,secondary_player_id,description
         FROM match_events WHERE match_id=:m'''),{'m':match['id']})).mappings().all()
     existing_keys={(int(r['minute']),r['event_type'],r['club_id'],r['player_id'],r['secondary_player_id'],r['description']) for r in existing}
-    player_names={'HOME':{},'AWAY':{}}
-    prs=(await s.execute(text('''SELECT cp.club_id,p.id,p.first_name,p.last_name
-        FROM club_players cp JOIN players p ON p.id=cp.player_id
-        WHERE cp.club_id IN (:home,:away)'''),
-        {'home':match['home_club_id'],'away':match['away_club_id']})).mappings().all()
-    for r in prs:
-        team='HOME' if r['club_id']==match['home_club_id'] else 'AWAY'
-        player_names[team][display_player_name(r.get('first_name'),r.get('last_name'))]=r['id']
     inserted=0
     for raw in sorted(events,key=lambda e:(int(e.get('minute',0)),str(e.get('type','')),str(e.get('player','')))):
         minute=int(raw.get('minute',0))
@@ -732,12 +928,10 @@ async def _materialize_live_events(s, match, phase_data, upto_minute):
         # Player ids are already resolved in the phase snapshot when possible.
         # Fall back to the active XI by name for old snapshots.
         player_id=None; secondary_id=None
-        player_name=raw.get('player')
-        secondary_name=raw.get('secondary_player')
-        team_names=player_names.get(team,{})
-        if player_name or secondary_name:
-            player_id=team_names.get(player_name) if player_name else None
-            secondary_id=team_names.get(secondary_name) if secondary_name else None
+        player_id=raw.get('player_id')
+        secondary_id=raw.get('secondary_player_id')
+        player_id=int(player_id) if player_id is not None else None
+        secondary_id=int(secondary_id) if secondary_id is not None else None
         description=str(raw.get('text') or raw.get('description') or '').replace('\\n','\n')
         metadata=raw.get('metadata') or {}
         key=(minute,raw.get('type'),cid,player_id,secondary_id,description)
@@ -922,7 +1116,7 @@ async def advance_live_matches(s, league_id=None):
                 second_h,second_a=await _live_score_at_minute(s,match['id'],minute,match['home_club_id'],match['away_club_id'])
                 home_score=int(match['home_halftime_score'] or 0)+second_h
                 away_score=int(match['away_halftime_score'] or 0)+second_a
-                first_xg=phase_data.get('full_xg') or [float(match.get('home_xg') or 0),float(match.get('away_xg') or 0)]
+                first_xg=phase_data.get('first_half_xg') or [float(match.get('home_xg') or 0),float(match.get('away_xg') or 0)]
                 second_xg=phase_data.get('second_half_xg') or [0,0]
                 progress=max(0,min(45,minute-45))/45
                 hp,ap=_live_possession(phase_data,minute)
@@ -1000,10 +1194,14 @@ async def accept_transfer_offer(s, seller_club_id, offer_id):
     if count>=30: raise ValueError('Buyer squad is full.')
     budget=next(int(r['budget']) for r in locked if r['id']==buyer)
     if budget<offer['amount']: raise ValueError('Buyer no longer has enough budget.')
+    duplicate=(await s.execute(text('''SELECT 1 FROM club_players cp JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id=:c AND COALESCE(p.template_id,p.id)=COALESCE((SELECT p2.template_id FROM players p2 WHERE p2.id=:p),:p) LIMIT 1'''),
+        {'c':buyer,'p':offer['player_id']})).first()
+    if duplicate: raise ValueError('У вас уже есть такой игрок.')
     await record_financial_transaction(s,buyer,'TRANSFER_OUT',-offer['amount'],f'Трансфер: {display_player_name(offer.get("first_name"),offer.get("last_name"))}')
     await record_financial_transaction(s,seller,'TRANSFER_IN',offer['amount'],f'Продажа: {display_player_name(offer.get("first_name"),offer.get("last_name"))}')
     await s.execute(text('DELETE FROM club_players WHERE club_id=:c AND player_id=:p'),{'c':seller,'p':offer['player_id']})
-    await s.execute(text('INSERT INTO club_players(club_id,player_id,contract_salary,release_clause) VALUES(:c,:p,:sal,:clause)'),{'c':buyer,'p':offer['player_id'],'sal':max(15000,int(offer['amount'])//35),'clause':max(int(offer['amount'])*2,1000000)})
+    await s.execute(text('INSERT INTO club_players(club_id,player_id,template_id,contract_salary,release_clause) SELECT :c,:p,template_id,:sal,:clause FROM players WHERE id=:p'),{'c':buyer,'p':offer['player_id'],'sal':max(15000,int(offer['amount'])//35),'clause':max(int(offer['amount'])*2,1000000)})
     await s.execute(text("UPDATE transfer_listings SET status='SOLD' WHERE id=:l"),{'l':offer['listing_id']})
     await s.execute(text("UPDATE transfer_offers SET status=CASE WHEN id=:o THEN 'ACCEPTED' ELSE 'REJECTED' END WHERE listing_id=:l AND status='PENDING'"),{'o':offer_id,'l':offer['listing_id']})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,:f,:t,:a)'),{'p':offer['player_id'],'f':seller,'t':buyer,'a':offer['amount']})
@@ -1013,15 +1211,20 @@ async def accept_transfer_offer(s, seller_club_id, offer_id):
     return offer
 
 async def buy_player(s, club_id, player_id):
-    player=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.market_value,p.age,p.potential FROM players p
+    player=(await s.execute(text('''SELECT p.id,p.first_name,p.last_name,p.market_value,p.age,p.potential,
+        COALESCE(p.template_id,p.id) AS source_template_id FROM players p
         WHERE p.id=:p AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.player_id=p.id) FOR UPDATE'''),{'p':player_id})).mappings().first()
     if not player: raise ValueError('Player is no longer available on the market.')
     club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'),{'c':club_id})).mappings().first()
     if not club: raise ValueError('Club not found.')
+    duplicate=(await s.execute(text('''SELECT 1 FROM club_players cp JOIN players p ON p.id=cp.player_id
+        WHERE cp.club_id=:c AND COALESCE(p.template_id,p.id)=:t LIMIT 1'''),
+        {'c':club_id,'t':int(player['source_template_id'])})).first()
+    if duplicate: raise ValueError('У вас уже есть такой игрок.')
     price=int(player['market_value'])
     if club['budget']<price: raise ValueError(f'Not enough budget. Need €{price:,}.')
     await record_financial_transaction(s,club_id,'TRANSFER_OUT',-price,f'Покупка {display_player_name(player.get("first_name"),player.get("last_name"))} за €{price:,}')
-    await s.execute(text('INSERT INTO club_players(club_id,player_id,contract_salary,release_clause) VALUES(:c,:p,:sal,:clause)'),{'c':club_id,'p':player_id,'sal':max(15000,price//35),'clause':max(price*2,1000000)})
+    await s.execute(text('INSERT INTO club_players(club_id,player_id,template_id,contract_salary,release_clause) SELECT :c,:p,template_id,:sal,:clause FROM players WHERE id=:p'),{'c':club_id,'p':player_id,'sal':max(15000,price//35),'clause':max(price*2,1000000)})
     await s.execute(text('INSERT INTO transfers(player_id,from_club_id,to_club_id,price) VALUES(:p,NULL,:c,:price)'),{'p':player_id,'c':club_id,'price':price})
     return player,price
 
@@ -1114,15 +1317,12 @@ async def _persist_fast_match_result(s, match, home, away, ht, at, hb, ab, hc, a
     """Persist a complete deterministic match without entering the live clock."""
     await _save_lineup_and_tactics(s,match['id'],match['home_club_id'],home,ht)
     await _save_lineup_and_tactics(s,match['id'],match['away_club_id'],away,at)
-    name_to_id={}
-    for p in home: name_to_id.setdefault(p.name,p.id)
-    for p in away: name_to_id.setdefault(p.name,p.id)
     event_rows=[]
     for ev in sorted(result.events,key=lambda e:(e.minute, e.type, e.player or '')):
         team=ev.team
         cid=match['home_club_id'] if team in {'HOME',match['home_name']} else match['away_club_id']
-        pid=name_to_id.get(ev.player) if ev.player else None
-        sid=name_to_id.get(ev.secondary_player) if ev.secondary_player else None
+        pid=int(ev.player_id) if ev.player_id is not None else None
+        sid=int(ev.secondary_player_id) if ev.secondary_player_id is not None else None
         event_rows.append((ev.minute,ev.type,cid,pid,sid,ev.text or '',ev.metadata or {}))
         await s.execute(text('''INSERT INTO match_events(match_id,minute,event_type,club_id,player_id,secondary_player_id,description,metadata)
             VALUES(:m,:min,:t,:c,:p,:sp,:d,:meta)'''),
@@ -1131,7 +1331,7 @@ async def _persist_fast_match_result(s, match, home, away, ht, at, hb, ab, hc, a
     for _,typ,_,pid,_,_,_ in event_rows:
         if typ=='GOAL' and pid: goals_by_player[pid]+=1
         if typ=='ASSIST' and pid: assists_by_player[pid]+=1
-    motm_id=name_to_id.get(result.man_of_the_match) if result.man_of_the_match else None
+    motm_id=next((p.id for p in home+away if p.name == result.man_of_the_match), None) if result.man_of_the_match else None
     for p in home+away:
         rating=float(result.ratings.get(p.name,6.2))
         await s.execute(text('''INSERT INTO match_player_stats(match_id,club_id,player_id,rating,minutes,goals,assists)
@@ -1147,6 +1347,33 @@ async def _persist_fast_match_result(s, match, home, away, ht, at, hb, ab, hc, a
         {'h':int(result.home_score),'a':int(result.away_score),'hx':round(float(result.home_xg),2),'ax':round(float(result.away_xg),2),'motm':motm_id,'m':match['id']})
     return {'match_id':match['id'],'home':match['home_name'],'away':match['away_name'],
             'home_score':int(result.home_score),'away_score':int(result.away_score)}
+
+
+async def archive_league(s, league_id):
+    """Archive the final standings and release all league club slots."""
+    league=(await s.execute(text("SELECT id,name,status FROM leagues WHERE id=:l FOR UPDATE"),{'l':league_id})).mappings().first()
+    if not league:
+        raise ValueError('Лига не найдена.')
+    rows=(await s.execute(text("""SELECT t.club_id,c.name club_name,t.played,t.wins,t.draws,t.losses,
+            t.goals_for,t.goals_against,t.points
+        FROM league_teams t JOIN clubs c ON c.id=t.club_id
+        WHERE t.league_id=:l
+        ORDER BY t.points DESC,(t.goals_for-t.goals_against) DESC,t.goals_for DESC,c.id"""),{'l':league_id})).mappings().all()
+    if not rows:
+        await s.execute(text("UPDATE leagues SET status='FINISHED',finished_at=now() WHERE id=:l"),{'l':league_id})
+        return 0
+    season_number=int((await s.execute(text('SELECT COALESCE(MAX(season_number),0)+1 FROM league_history WHERE league_id=:l'),{'l':league_id})).scalar_one())
+    for place,row in enumerate(rows,1):
+        await s.execute(text("""INSERT INTO league_history
+            (league_id,league_name,season_number,club_id,club_name,place,played,wins,draws,losses,goals_for,goals_against,points)
+            VALUES(:l,:ln,:sn,:c,:cn,:place,:played,:wins,:draws,:losses,:gf,:ga,:points)"""), {
+            'l':league_id,'ln':league['name'],'sn':season_number,'c':row['club_id'],'cn':row['club_name'],
+            'place':place,'played':row['played'],'wins':row['wins'],'draws':row['draws'],'losses':row['losses'],
+            'gf':row['goals_for'],'ga':row['goals_against'],'points':row['points'],
+        })
+    await s.execute(text('DELETE FROM league_teams WHERE league_id=:l'),{'l':league_id})
+    await s.execute(text("UPDATE leagues SET status='FINISHED',finished_at=now() WHERE id=:l"),{'l':league_id})
+    return season_number
 
 
 async def fast_play_round(s, league_id):
@@ -1214,7 +1441,9 @@ async def finalize_live_round(s, league_id, finished):
                 await queue_club_notification(s,cid,'TOURNAMENT','🏆 Сезон завершён',
                     f'Вы заняли {position}-е место. Призовые: €{amount:,}.',
                     f'season-finished:{league_id}:{cid}')
-        await s.execute(text("UPDATE leagues SET current_round=:n,status=:st,finished_at=CASE WHEN :f THEN now() ELSE finished_at END WHERE id=:l"),{'n':league['current_round'] if final else league['current_round']+1,'st':'FINISHED' if final else 'ACTIVE','f':final,'l':league_id})
+            await archive_league(s,league_id)
+        else:
+            await s.execute(text("UPDATE leagues SET current_round=:n,status='ACTIVE' WHERE id=:l"),{'n':league['current_round']+1,'l':league_id})
         return True
     return False
 

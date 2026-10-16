@@ -94,8 +94,10 @@ async def queue_live_event_notifications(s, match_id):
             gi+=1
         goal_scores[event['id']]=(gh,ga)
 
-    owner_rows=(await s.execute(text('SELECT id,owner_user_id FROM clubs WHERE id=ANY(:ids)'), {'ids':[row['home_club_id'],row['away_club_id']]})).mappings().all()
-    owner_cache={r['id']:r['owner_user_id'] for r in owner_rows}
+    owner_rows=(await s.execute(text('''SELECT c.id,c.owner_user_id,u.telegram_id
+        FROM clubs c JOIN users u ON u.id=c.owner_user_id
+        WHERE c.id=ANY(:ids)'''), {'ids':[row['home_club_id'],row['away_club_id']]})).mappings().all()
+    owner_cache={r['id']:(r['owner_user_id'],int(r['telegram_id'])) for r in owner_rows}
     for e in important:
         event_home,event_away=goal_scores.get(e['id'],(0,0))
         if e['minute']>45:
@@ -117,9 +119,15 @@ async def queue_live_event_notifications(s, match_id):
 
 
 async def _queue_for_club(s, club_id, category, owner_cache, title, body, dedupe_key):
-    uid=owner_cache.get(club_id) if owner_cache is not None else (await s.execute(text('SELECT owner_user_id FROM clubs WHERE id=:c'),{'c':club_id})).scalar_one_or_none()
-    if uid is not None:
-        await queue_notification(s,uid,category,title,body,dedupe_key)
+    cached=owner_cache.get(club_id) if owner_cache is not None else None
+    if cached is None:
+        cached=(await s.execute(text('''SELECT c.owner_user_id,u.telegram_id FROM clubs c JOIN users u ON u.id=c.owner_user_id WHERE c.id=:c'''),{'c':club_id})).first()
+    if not cached:
+        return
+    uid,telegram_id=cached
+    if int(telegram_id) < 0:
+        return
+    await queue_notification(s,uid,category,title,body,dedupe_key)
 
 async def live_worker(bot):
     # One process owns the live scheduler. Row locks remain the second line of

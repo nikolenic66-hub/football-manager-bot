@@ -14,7 +14,7 @@ from sqlalchemy import text
 from ..config import settings
 from ..db import SessionLocal
 from ..game.ratings import player_rating
-from ..services import start_league, create_test_bot_club, fast_play_round, fast_play_all
+from ..services import start_league, create_test_bot_club, fast_play_round, fast_play_all, full_reset
 from app.services import clean_display_name, display_player_name
 
 admin_router = Router()
@@ -62,6 +62,7 @@ class AdminStates(StatesGroup):
     league_add_club = State()
     league_remove_club = State()
     league_delete_confirm = State()
+    full_reset_confirm = State()
 
 
 
@@ -129,18 +130,6 @@ def player_card_text(p):
             f"Stats: {stats}\n"
             f"Market value: {p['market_value']:,} · Salary: {p['salary']:,}\n"
             f"Talents: {', '.join(talents) if talents else '—'}")
-
-
-@admin_router.message(CommandStart())
-async def admin_start_reset(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer('FSM сброшен. Выберите действие:', reply_markup=admin_menu())
-
-
-@admin_router.message(Command('cancel'))
-async def admin_cancel(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer('Отменено.', reply_markup=admin_menu())
 
 
 @admin_router.message(Command('admin'))
@@ -259,6 +248,11 @@ async def admin_player_delete(c: CallbackQuery, state: FSMContext):
         return await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
     try:
         async with SessionLocal() as s:
+            copies=int((await s.execute(text('SELECT COUNT(*) FROM players WHERE template_id=:id'), {'id':pid})).scalar_one())
+            if copies:
+                await state.clear()
+                await c.message.edit_text(f'❌ У шаблона есть {copies} копий. Удалить нельзя.', reply_markup=back(f'admin:player:{pid}'))
+                return await c.answer()
             await s.execute(text('UPDATE matches SET motm_player_id=NULL WHERE motm_player_id=:id'),{'id':pid})
             for table,col in [('match_events','player_id'),('match_events','secondary_player_id')]: await s.execute(text(f'UPDATE {table} SET {col}=NULL WHERE {col}=:id'),{'id':pid})
             await s.execute(text('UPDATE club_lineups SET player_ids=array_remove(player_ids,:id)'),{'id':pid})
@@ -347,8 +341,8 @@ async def apc_pot(m: Message, state: FSMContext):
             if unknown_required:
                 raise RuntimeError(f"players has unsupported required columns: {sorted(unknown_required)}")
 
-            insert_cols = ['first_name','last_name','nationality','age','position','pace','shooting','passing','dribbling','defending','physical','stamina','mental','market_value','salary','potential','rarity','card_version','real_player','preferred_foot','secondary_positions','talents','tactical_archetype','data_source']
-            values = [':f',':l',':n',':age',':pos',':pace',':shooting',':passing',':dribbling',':defending',':physical',':stamina',':mental',':mv',':sal',':pot',"'BASE'","'STANDARD'",'FALSE',"'R'","'{}'","'[]'","'BALANCED'","'generated'"]
+            insert_cols = ['first_name','last_name','nationality','age','position','pace','shooting','passing','dribbling','defending','physical','stamina','mental','market_value','salary','potential','rarity','card_version','real_player','preferred_foot','secondary_positions','talents','tactical_archetype','data_source','is_seed','is_template','template_id']
+            values = [':f',':l',':n',':age',':pos',':pace',':shooting',':passing',':dribbling',':defending',':physical',':stamina',':mental',':mv',':sal',':pot',"'BASE'","'STANDARD'",'FALSE',"'R'","'{}'","'[]'","'BALANCED'","'admin'",'FALSE','TRUE','NULL']
             if 'overall' in column_names:
                 insert_cols.append('overall'); values.append(':ovr')
 
@@ -435,7 +429,8 @@ async def admin_club_create_bot_name(m,state):
             await s.commit()
     except Exception:
         logger.exception('Admin test bot club create failed')
-        return await m.answer('❌ Не удалось создать тестовый клуб. Проверьте наличие свободных игроков.')
+        await state.clear()
+        return await m.answer('❌ Не удалось создать тестовый клуб. FSM сброшен. Проверьте наличие свободных игроков.')
     await state.clear()
     await m.answer(f'✅ Тестовый клуб создан!\nНазвание: {name}\nID клуба: {cid}\nTelegram ID владельца: {tg_id}',reply_markup=back('admin:clubs'))
 
@@ -576,15 +571,25 @@ async def aft_amount(m,state):
     await state.update_data(amount=v);await state.set_state(AdminStates.finance_description);await m.answer('Описание:')
 @admin_router.message(AdminStates.finance_description)
 async def aft_desc(m,state):
-    d=await state.get_data();desc=m.text.strip()
-    async with SessionLocal() as s:
-        row=(await s.execute(text('SELECT budget FROM clubs WHERE id=:id'),{'id':d['club_id']})).scalar_one_or_none()
-        if row is None:return await m.answer('Клуб не найден.')
-        new=row+d['amount']
-        if new<0:return await m.answer('Бюджет не может быть отрицательным.')
-        await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:id'),{'b':new,'id':d['club_id']})
-        await s.execute(text('INSERT INTO club_financial_transactions(club_id,category,amount,balance_after,description) VALUES(:c,\'OTHER\',:a,:b,:d)'),{'c':d['club_id'],'a':d['amount'],'b':new,'d':desc});await s.commit()
-    await log_action(m.from_user.id,'finance_manual_transaction','club',d['club_id'],d);await state.clear();await m.answer('✅ Транзакция выполнена.',reply_markup=back('admin:finance'))
+    d=await state.get_data();desc=(m.text or '').strip()
+    try:
+        async with SessionLocal() as s:
+            row=(await s.execute(text('SELECT budget FROM clubs WHERE id=:id'),{'id':d['club_id']})).scalar_one_or_none()
+            if row is None:
+                await state.clear()
+                return await m.answer('Клуб не найден.',reply_markup=back('admin:finance'))
+            new=row+d['amount']
+            if new<0:
+                await state.clear()
+                return await m.answer('Бюджет не может быть отрицательным.',reply_markup=back('admin:finance'))
+            await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:id'),{'b':new,'id':d['club_id']})
+            await s.execute(text('INSERT INTO club_financial_transactions(club_id,category,amount,balance_after,description) VALUES(:c,\'OTHER\',:a,:b,:d)'),{'c':d['club_id'],'a':d['amount'],'b':new,'d':desc});await s.commit()
+        await log_action(m.from_user.id,'finance_manual_transaction','club',d['club_id'],d)
+    except Exception:
+        logger.exception('Admin finance transaction failed')
+        await state.clear()
+        return await m.answer('❌ Ошибка операции. FSM сброшен.',reply_markup=back('admin:finance'))
+    await state.clear();await m.answer('✅ Транзакция выполнена.',reply_markup=back('admin:finance'))
 @admin_router.callback_query(F.data == 'admin:finance:history')
 async def admin_fin_history_start(c,state):
     await state.set_state(AdminStates.finance_club)
@@ -650,14 +655,18 @@ async def _admin_league_club_picker(c, lid, page, adding):
 
 async def _admin_league_table(c,lid):
     async with SessionLocal() as s:
-        league=(await s.execute(text('SELECT name,current_round,total_rounds,status FROM leagues WHERE id=:l'),{'l':lid})).mappings().first()
-        rows=(await s.execute(text('''SELECT c.name,lt.played,lt.wins,lt.draws,lt.losses,lt.goals_for,lt.goals_against,lt.points
-            FROM league_teams lt JOIN clubs c ON c.id=lt.club_id WHERE lt.league_id=:l
-            ORDER BY lt.points DESC,(lt.goals_for-lt.goals_against) DESC,lt.goals_for DESC,c.id'''),{'l':lid})).mappings().all()
+        league=(await s.execute(text('SELECT * FROM leagues WHERE id=:l'),{'l':lid})).mappings().first()
+        if not league: return await c.answer('Лига не найдена.',show_alert=True)
+        if league['status']=='FINISHED':
+            rows=(await s.execute(text('''SELECT club_name name,played,wins,draws,losses,goals_for,goals_against,points,place
+                FROM league_history WHERE league_id=:l AND season_number=(SELECT MAX(season_number) FROM league_history WHERE league_id=:l) ORDER BY place'''),{'l':lid})).mappings().all()
+        else:
+            rows=(await s.execute(text('''SELECT c.name,lt.played,lt.wins,lt.draws,lt.losses,lt.goals_for,lt.goals_against,lt.points
+                FROM league_teams lt JOIN clubs c ON c.id=lt.club_id WHERE lt.league_id=:l
+                ORDER BY lt.points DESC,(lt.goals_for-lt.goals_against) DESC,lt.goals_for DESC,c.id'''),{'l':lid})).mappings().all()
     lines=[f'🏆 <b>{league["name"]}</b> · {league["status"]}',f'Тур: {league["current_round"]}/{league["total_rounds"]}']
-    for i,r in enumerate(rows,1): lines.append(f'{i}. {r["name"]} — {r["points"]} очк. ({r["wins"]}-{r["draws"]}-{r["losses"]}), {r["goals_for"]}:{r["goals_against"]}')
+    for i,r in enumerate(rows,1): lines.append(f'{r.get("place",i)}. {r["name"]} — {r["points"]} очк. ({r["wins"]}-{r["draws"]}-{r["losses"]}), {r["goals_for"]}:{r["goals_against"]}')
     await c.message.edit_text('\n'.join(lines),reply_markup=back(f'admin:league:{lid}'))
-
 
 def _admin_round_text(round_no,results):
     return '\n'.join(f'• {r["home"]} {r["home_score"]}:{r["away_score"]} {r["away"]}' for r in results)
@@ -665,9 +674,15 @@ def _admin_round_text(round_no,results):
 @admin_router.callback_query(F.data == 'admin:leagues')
 async def admin_leagues(c,state):
     await state.clear()
-    async with SessionLocal() as s:rows=(await s.execute(text('''SELECT l.id,l.name,l.status,l.creator_user_id,count(t.club_id) members FROM leagues l LEFT JOIN league_teams t ON t.league_id=l.id GROUP BY l.id ORDER BY l.id DESC'''))).mappings().all()
+    async with SessionLocal() as s:
+        rows=(await s.execute(text('''SELECT l.id,l.name,l.status,l.creator_user_id,count(t.club_id) members,
+            (SELECT h.club_name FROM league_history h WHERE h.league_id=l.id AND h.place=1 ORDER BY h.season_number DESC LIMIT 1) winner_name,
+            (SELECT h.season_number FROM league_history h WHERE h.league_id=l.id ORDER BY h.season_number DESC LIMIT 1) winner_season
+            FROM leagues l LEFT JOIN league_teams t ON t.league_id=l.id GROUP BY l.id ORDER BY l.id DESC'''))).mappings().all()
     b=InlineKeyboardBuilder()
-    for r in rows:b.button(text=f'{r["name"]} [{r["status"]}] · {r["members"]} · creator {r["creator_user_id"]}',callback_data=f'admin:league:{r["id"]}')
+    for r in rows:
+        suffix=(f' 🏆 {r["winner_name"]} — победитель сезона {r["winner_season"]}' if r['status']=='FINISHED' and r['winner_name'] else '')
+        b.button(text=f'{r["name"]} [{r["status"]}] · {r["members"]}{suffix}',callback_data=f'admin:league:{r["id"]}')
     b.button(text='⬅️ Назад',callback_data='admin:menu');b.adjust(1);await c.message.edit_text('🏆 <b>ЛИГИ</b>',reply_markup=b.as_markup());await c.answer()
 
 @admin_router.callback_query(F.data.regexp(r'^admin:league:\d+(?::(?!delete:yes$).+)?$'))
@@ -677,6 +692,7 @@ async def admin_league_router(c,state):
         async with SessionLocal() as s:r=(await s.execute(text('SELECT * FROM leagues WHERE id=:id'),{'id':lid})).mappings().first()
         if not r:return await c.answer('Лига не найдена.',show_alert=True)
         actions=[('▶️ Стартовать',f'admin:league:{lid}:start'),('➕ Добавить клуб',f'admin:league:{lid}:add:0'),('➖ Убрать клуб',f'admin:league:{lid}:remove:0'),('⚡ Быстро отыграть тур',f'admin:league:{lid}:fastround'),('⚡ Быстро отыграть оставшиеся туры',f'admin:league:{lid}:fastall'),('📊 Таблица',f'admin:league:{lid}:table')]
+        if r['status']=='FINISHED': actions.append(('📜 История сезонов',f'admin:league:{lid}:history:0'))
         if r['status']=='FINISHED' and r['creator_user_id']==c.from_user.id: actions.append(('🔄 Перезапустить лигу',f'admin:league:{lid}:restart'))
         actions.extend([('🗑 Удалить лигу',f'admin:league:{lid}:delete'),('⬅️ Назад','admin:leagues')])
         await c.message.edit_text(f'🏆 <b>{r["name"]}</b> · {r["status"]}\ncreator={r["creator_user_id"]}\nТур: {r["current_round"]}/{r["total_rounds"]}',reply_markup=kb(actions));return await c.answer()
@@ -706,6 +722,22 @@ async def admin_league_router(c,state):
             logger.exception('Admin league club membership failed: league_id=%s club_id=%s adding=%s',lid,cid,adding)
             await c.answer('❌ Не удалось изменить состав лиги.',show_alert=True)
         return await c.answer()
+    if action=='history':
+        page=max(0,int(parts[4]) if len(parts)>4 else 0)
+        async with SessionLocal() as s:
+            rows=(await s.execute(text('''SELECT season_number,place,club_name,points FROM league_history WHERE league_id=:l ORDER BY season_number DESC,place ASC'''),{'l':lid})).mappings().all()
+        seasons=sorted({int(r['season_number']) for r in rows}, reverse=True)
+        if not seasons: return await c.answer('История пока пуста.',show_alert=True)
+        page=min(page,(len(seasons)-1)//5); shown=seasons[page*5:(page+1)*5]
+        lines=['📜 <b>ИСТОРИЯ СЕЗОНОВ</b>']
+        for sn in shown:
+            results=[r for r in rows if int(r['season_number'])==sn]
+            lines.append(f'\n<b>Сезон {sn}:</b> '+', '.join(f'{r["place"]}. {r["club_name"]} ({r["points"]} очков)' for r in results))
+        buttons=[]
+        if page>0: buttons.append(('⬅️ Новее',f'admin:league:{lid}:history:{page-1}'))
+        if (page+1)*5<len(seasons): buttons.append(('Старее ➡️',f'admin:league:{lid}:history:{page+1}'))
+        buttons.append(('⬅️ К лиге',f'admin:league:{lid}'))
+        await c.message.edit_text('\n'.join(lines),reply_markup=kb(buttons)); return await c.answer()
     if action=='table': await _admin_league_table(c,lid); return await c.answer()
     if action=='fastround':
         try:
@@ -726,8 +758,8 @@ async def admin_league_router(c,state):
                 rounds=await fast_play_all(s,lid); await s.commit()
             await log_action(c.from_user.id,'league_fast_all','league',lid,{'rounds':len(rounds)})
             async with SessionLocal() as s:
-                rows=(await s.execute(text('''SELECT c.name,lt.points,lt.goals_for,lt.goals_against FROM league_teams lt JOIN clubs c ON c.id=lt.club_id WHERE lt.league_id=:l ORDER BY lt.points DESC,(lt.goals_for-lt.goals_against) DESC,lt.goals_for DESC,c.id'''),{'l':lid})).mappings().all()
-            table='\n'.join(f'{i}. {r["name"]} — {r["points"]} очк. ({r["goals_for"]}:{r["goals_against"]})' for i,r in enumerate(rows,1))
+                rows=(await s.execute(text('''SELECT club_name name,points,goals_for,goals_against,place FROM league_history WHERE league_id=:l AND season_number=(SELECT MAX(season_number) FROM league_history WHERE league_id=:l) ORDER BY place'''),{'l':lid})).mappings().all()
+            table='\n'.join(f'{r["place"]}. {r["name"]} — {r["points"]} очк. ({r["goals_for"]}:{r["goals_against"]})' for r in rows)
             await c.message.edit_text(f'✅ Сезон завершён! Итоговая таблица:\n{table}',reply_markup=kb([('🏆 Таблица',f'admin:league:{lid}:table'),('⬅️ Назад',f'admin:league:{lid}')]))
         except Exception as exc:
             logger.exception('Admin fast season failed: league_id=%s',lid)
@@ -744,7 +776,11 @@ async def admin_league_router(c,state):
             async with SessionLocal() as s:
                 r=(await s.execute(text('SELECT id,name,status,creator_user_id FROM leagues WHERE id=:id FOR UPDATE'),{'id':lid})).mappings().first()
                 if not r or r['creator_user_id']!=c.from_user.id or r['status']!='FINISHED': return await c.answer('Перезапуск доступен только создателю завершённой лиги.',show_alert=True)
+                archived_clubs=(await s.execute(text('''SELECT DISTINCT club_id FROM league_history WHERE league_id=:l AND season_number=(SELECT MAX(season_number) FROM league_history WHERE league_id=:l) ORDER BY club_id'''),{'l':lid})).scalars().all()
                 await s.execute(text('DELETE FROM matches WHERE league_id=:l'),{'l':lid})
+                await s.execute(text('DELETE FROM league_teams WHERE league_id=:l'),{'l':lid})
+                for club_id in archived_clubs:
+                    await s.execute(text('INSERT INTO league_teams(league_id,club_id) VALUES(:l,:c)'),{'l':lid,'c':club_id})
                 await s.execute(text('UPDATE league_teams SET played=0,wins=0,draws=0,losses=0,goals_for=0,goals_against=0,points=0 WHERE league_id=:l'),{'l':lid})
                 await s.execute(text("UPDATE leagues SET status='WAITING',current_round=0,started_at=NULL,finished_at=NULL,total_rounds=0 WHERE id=:l"),{'l':lid}); await s.commit()
             await log_action(c.from_user.id,'league_restart','league',lid); await state.clear(); await c.message.edit_text('✅ Лига перезапущена. Готова к новому сезону.',reply_markup=back(f'admin:league:{lid}'))
@@ -773,7 +809,46 @@ async def admin_league_delete(c,state):
 
 # ---------------- system ----------------
 @admin_router.callback_query(F.data == 'admin:system')
-async def admin_system(c,state):await state.clear();await c.message.edit_text('⚙️ <b>СИСТЕМА</b>',reply_markup=kb([('📜 Лог действий админа','admin:system:log'),('🧹 Очистить кэш карточек','admin:system:cache'),('🔔 Очистить очередь уведомлений','admin:system:notif'),('⬅️ Назад','admin:menu')]));await c.answer()
+async def admin_system(c,state):
+    await state.clear()
+    await c.message.edit_text('⚙️ <b>СИСТЕМА</b>',reply_markup=kb([('📜 Лог действий админа','admin:system:log'),('🧹 Очистить кэш карточек','admin:system:cache'),('🔔 Очистить очередь уведомлений','admin:system:notif'),('🔄 СБРОСИТЬ ВСЁ С НУЛЯ','admin:system:reset'),('⬅️ Назад','admin:menu')]))
+    await c.answer()
+@admin_router.callback_query(F.data == 'admin:system:reset')
+async def admin_full_reset_prepare(c, state):
+    async with SessionLocal() as s:
+        active=(await s.execute(text("SELECT 1 FROM leagues WHERE status='ACTIVE' LIMIT 1"))).first()
+    if active:
+        await c.answer('Сначала завершите сезон', show_alert=True)
+        return
+    await state.set_state(AdminStates.full_reset_confirm)
+    await c.message.edit_text('⚠️ <b>Полный сброс необратим.</b> Все составы, матчи, лиги, трансферы и финансы клубов будут очищены, после чего для каждого клуба будет создан новый состав из копий шаблонов.',
+                              reply_markup=kb([('⚠️ Да, я уверен','admin:system:reset:yes'),('⬅️ Отмена','admin:system')]))
+    await c.answer()
+
+
+@admin_router.callback_query(F.data == 'admin:system:reset:yes')
+async def admin_full_reset_confirm(c, state):
+    if await state.get_state() != AdminStates.full_reset_confirm.state:
+        await c.answer('Подтверждение устарело. Начните заново.', show_alert=True)
+        return
+    try:
+        async with SessionLocal() as s:
+            clubs=await full_reset(s, c.from_user.id)
+            await s.commit()
+        await state.clear()
+        await c.message.edit_text(f'✅ Полный сброс выполнен. Все клубы — с нуля. Клубов: {clubs}.', reply_markup=back('admin:system'))
+        await c.answer('Готово')
+    except ValueError as exc:
+        await state.clear()
+        await c.message.edit_text(f'❌ {exc}', reply_markup=back('admin:system'))
+        await c.answer()
+    except Exception:
+        await state.clear()
+        logger.exception('Admin full reset failed')
+        await c.message.edit_text('❌ Полный сброс не выполнен.', reply_markup=back('admin:system'))
+        await c.answer()
+
+
 @admin_router.callback_query(F.data == 'admin:system:log')
 async def admin_log(c):
     async with SessionLocal() as s:rows=(await s.execute(text('SELECT id,action,target_type,target_id,created_at FROM admin_actions_log ORDER BY id DESC LIMIT 50'))).mappings().all()

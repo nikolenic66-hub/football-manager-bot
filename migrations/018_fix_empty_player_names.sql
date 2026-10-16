@@ -11,7 +11,8 @@ last_name = CASE
         THEN id::text
     ELSE last_name
 END
-WHERE btrim(COALESCE(first_name, '')) = ''
+WHERE real_player IS NOT TRUE
+  AND (btrim(COALESCE(first_name, '')) = ''
    OR btrim(COALESCE(last_name, '')) = ''
    OR btrim(COALESCE(first_name, '')) ~ '^[0-9]{4}$'
-   OR btrim(COALESCE(last_name, '')) ~ '^[0-9]{4}$';
+   OR btrim(COALESCE(last_name, '')) ~ '^[0-9]{4}$');

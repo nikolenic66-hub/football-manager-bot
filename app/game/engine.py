@@ -8,7 +8,7 @@ from app.game.board import TacticalBoard, board_effect, phase_profile
 from app.game.match_state import fatigue_factor
 @dataclass
 class MatchEvent:
-    minute:int; type:str; team:str; player:str|None=None; secondary_player:str|None=None; text:str=''; metadata:dict=field(default_factory=dict)
+    minute:int; type:str; team:str; player:str|None=None; secondary_player:str|None=None; text:str=''; metadata:dict=field(default_factory=dict); player_id:int|None=None; secondary_player_id:int|None=None
 @dataclass
 class MatchResult:
     home_score:int; away_score:int; home_xg:float; away_xg:float; events:list[MatchEvent]=field(default_factory=list); ratings:dict[str,float]=field(default_factory=dict); man_of_the_match:str|None=None
@@ -258,9 +258,9 @@ def simulate_match(home_name,away_name,home,away,home_tactics,away_tactics,seed,
             p=pick_scorer(rng,team)
             if p is None: continue
             a=pick_assist(rng,team,p); minute=rng.randint(2,90)
-            events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!'))
+            events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!',{},p.id,a.id if a else None))
             _goal_sequence(events,p,a,'HOME' if team is home else 'AWAY',minute,positions,visual_rng)
-            if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.'))
+            if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.',{},a.id,p.id))
     _add_open_play_events(events,home,away,home_tactics,away_tactics,home_board,away_board,seed*17+1,4,88,hx,ax)
     _add_non_goal_shots(events,home,away,home_tactics,away_tactics,home_board,away_board,seed*17+2,7,88,count=2+int((home_tactics.tempo+away_tactics.tempo)/100))
     for minute in sorted(rng.sample(range(8,89),k=rng.randint(1,4))):
@@ -287,9 +287,9 @@ def _half_result(home, away, ht, at, seed, half, home_counter=None, away_counter
             p=pick_scorer(rng,team)
             if p is None: continue
             a=pick_assist(rng,team,p); minute=rng.randint(1,45)
-            events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!'))
+            events.append(MatchEvent(minute,'GOAL',name,p.name,a.name if a else None,f'⚽ {p.name} забивает!',{},p.id,a.id if a else None))
             _goal_sequence(events,p,a,name,minute,positions,visual_rng)
-            if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.'))
+            if a: events.append(MatchEvent(minute,'ASSIST',name,a.name,p.name,f'🅰️ Передача {a.name}.',{},a.id,p.id))
     _add_open_play_events(events,home,away,ht,at,home_board,away_board,seed*17+3,3,44,hx,ax)
     _add_non_goal_shots(events,home,away,ht,at,home_board,away_board,seed*17+4,6,44,count=2)
     for _ in range(rng.randint(0,2)):
@@ -375,10 +375,10 @@ def simulate_second_half(home, away, ht, at, seed, substitutions=None, home_coun
                 if scorer is None:
                     continue
                 assist=pick_assist(rng,pool,scorer)
-                events.append(MatchEvent(minute,'GOAL',name,scorer.name,assist.name if assist else None,f'⚽ {scorer.name} забивает!'))
+                events.append(MatchEvent(minute,'GOAL',name,scorer.name,assist.name if assist else None,f'⚽ {scorer.name} забивает!',{},scorer.id,assist.id if assist else None))
                 _goal_sequence(events,scorer,assist,name,minute,positions,visual_rng)
                 if assist:
-                    events.append(MatchEvent(minute,'ASSIST',name,assist.name,scorer.name,f'🅰️ Передача {assist.name}.'))
+                    events.append(MatchEvent(minute,'ASSIST',name,assist.name,scorer.name,f'🅰️ Передача {assist.name}.',{},assist.id,scorer.id))
         # A small deterministic sample of replay actions per 5-minute block.
         if minute % 5 == 0:
             _add_open_play_events(events,home_now,away_now,ht,at,home_board,away_board,seed*19+minute,minute,min(90,minute+4),hfx,afx,count=1)

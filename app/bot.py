@@ -718,8 +718,8 @@ async def cmd_matchcenter(m:Message, from_user=None):
 @router.message(Command('cards'))
 async def cmd_cards(m:Message):
     async with SessionLocal() as s:
-        rows=(await s.execute(text("SELECT rarity,count(*) n FROM players GROUP BY rarity ORDER BY CASE rarity WHEN 'LEGENDARY' THEN 1 WHEN 'EPIC' THEN 2 WHEN 'RARE' THEN 3 ELSE 4 END"))).mappings().all()
-        real=(await s.execute(text('SELECT count(*) FROM players WHERE real_player=true'))).scalar_one()
+        rows=(await s.execute(text("SELECT rarity,count(*) n FROM players WHERE is_template=TRUE GROUP BY rarity ORDER BY CASE rarity WHEN 'LEGENDARY' THEN 1 WHEN 'EPIC' THEN 2 WHEN 'RARE' THEN 3 ELSE 4 END"))).mappings().all()
+        real=(await s.execute(text('SELECT count(*) FROM players WHERE real_player=true AND is_template=TRUE'))).scalar_one()
     labels={'LEGENDARY':'🟡 Легендарные','EPIC':'🟣 Эпические','RARE':'🟢 Редкие','BASE':'⚪ Базовые'}
     total=sum(r['n'] for r in rows)
     out=['🃏 <b>БАЗА КАРТОЧЕК</b>','',f'Всего: <b>{total}</b>',f'Реальных игроков в seed: <b>{real}</b>','']
@@ -1807,6 +1807,7 @@ async def _refresh_contract_item(cq,pid):
 # --- Dedicated live match viewer -----------------------------------------
 _LIVE_SCREENS: dict[int, asyncio.Task] = {}
 _LIVE_SCREEN_SIGNATURES: dict[tuple[int,int], str] = {}
+_LIVE_SCREEN_LOCK = asyncio.Lock()
 
 def _live_watch_keyboard(match_id, finished=False, halftime=False):
     k=InlineKeyboardBuilder()
@@ -1919,47 +1920,50 @@ async def _live_screen_loop(message,user_id,match_id):
         if _LIVE_SCREENS.get(user_id) is asyncio.current_task(): _LIVE_SCREENS.pop(user_id,None)
         logger.info('Live screen closed: user_id=%s match_id=%s',user_id,match_id)
 
-async def _cancel_live_screen(user_id):
+async def _cancel_live_screen_unlocked(user_id):
     task=_LIVE_SCREENS.pop(user_id,None)
     if task:
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
 
+async def _cancel_live_screen(user_id):
+    async with _LIVE_SCREEN_LOCK:
+        await _cancel_live_screen_unlocked(user_id)
+
 
 async def _open_live_screen(cq,match_id):
-    await _cancel_live_screen(cq.from_user.id)
-    async with SessionLocal() as s: loaded=await _load_live_view(s,match_id)
-    if not loaded:
-        return False
-    row,events,motm=loaded
-    text_value=_live_watch_text(row,events,motm)
-    markup=_live_watch_keyboard(match_id,row['status']=='FINISHED',bool(row.get('halftime_locked')))
-    try:
-        # The viewer is a separate message, leaving the match-center message intact.
-        # Use the bot API directly instead of Message.answer(): this also works
-        # reliably for callback messages originating from notification messages.
-        live_message=await cq.bot.send_message(
-            chat_id=cq.message.chat.id,
-            text=text_value,
-            reply_markup=markup,
-        )
-    except Exception:
-        logger.exception('Live screen message creation failed: user_id=%s match_id=%s',cq.from_user.id,match_id)
-        return False
-    _LIVE_SCREEN_SIGNATURES[(cq.from_user.id,match_id)]=repr((
-        row['status'],row['current_minute'],row['home_score'],row['away_score'],
-        row['home_xg'],row['away_xg'],row['home_possession'],row['away_possession'],
-        [(e['minute'],e['event_type'],e['description'],e.get('_score_at_event')) for e in events],
-        motm['rating'] if motm else None
-    ))
-    if row['status']!='FINISHED':
-        _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(
-            _live_screen_loop(live_message,cq.from_user.id,match_id),
-            name=f'live-screen-{cq.from_user.id}-{match_id}'
-        )
-    logger.info('Live screen opened by user: user_id=%s match_id=%s message_id=%s',cq.from_user.id,match_id,getattr(live_message,'message_id',None))
-    return True
+    async with _LIVE_SCREEN_LOCK:
+        await _cancel_live_screen_unlocked(cq.from_user.id)
+        async with SessionLocal() as s:
+            loaded=await _load_live_view(s,match_id)
+        if not loaded:
+            return False
+        row,events,motm=loaded
+        text_value=_live_watch_text(row,events,motm)
+        markup=_live_watch_keyboard(match_id,row['status']=='FINISHED',bool(row.get('halftime_locked')))
+        try:
+            live_message=await cq.bot.send_message(
+                chat_id=cq.message.chat.id,
+                text=text_value,
+                reply_markup=markup,
+            )
+        except Exception:
+            logger.exception('Live screen message creation failed: user_id=%s match_id=%s',cq.from_user.id,match_id)
+            return False
+        _LIVE_SCREEN_SIGNATURES[(cq.from_user.id,match_id)]=repr((
+            row['status'],row['current_minute'],row['home_score'],row['away_score'],
+            row['home_xg'],row['away_xg'],row['home_possession'],row['away_possession'],
+            [(e['minute'],e['event_type'],e['description'],e.get('_score_at_event')) for e in events],
+            motm['rating'] if motm else None
+        ))
+        if row['status']!='FINISHED':
+            _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(
+                _live_screen_loop(live_message,cq.from_user.id,match_id),
+                name=f'live-screen-{cq.from_user.id}-{match_id}'
+            )
+        logger.info('Live screen opened by user: user_id=%s match_id=%s message_id=%s',cq.from_user.id,match_id,getattr(live_message,'message_id',None))
+        return True
 
 @router.callback_query(F.data.regexp(r'^match:watch:\d+$'))
 async def cb_match_watch(cq:CallbackQuery):
@@ -2135,10 +2139,11 @@ async def _show_live_substitutions(cq:CallbackQuery, match_id):
 async def cb_match_watch_live(cq:CallbackQuery):
     try: mid=int(cq.data.rsplit(':',1)[1])
     except ValueError: return await cq.answer('Некорректный матч.',show_alert=True)
-    await _cancel_live_screen(cq.from_user.id)
-    ok,finished=await _render_live_screen(cq.message,cq.from_user.id,mid,force=True)
-    if ok and not finished:
-        _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(_live_screen_loop(cq.message,cq.from_user.id,mid),name=f'live-screen-{cq.from_user.id}-{mid}')
+    async with _LIVE_SCREEN_LOCK:
+        await _cancel_live_screen_unlocked(cq.from_user.id)
+        ok,finished=await _render_live_screen(cq.message,cq.from_user.id,mid,force=True)
+        if ok and not finished:
+            _LIVE_SCREENS[cq.from_user.id]=asyncio.create_task(_live_screen_loop(cq.message,cq.from_user.id,mid),name=f'live-screen-{cq.from_user.id}-{mid}')
     await cq.answer('📺 Live-экран' if ok else 'Матч недоступен.',show_alert=not ok)
 
 @router.callback_query(F.data.startswith('match:watch:tactics:'))

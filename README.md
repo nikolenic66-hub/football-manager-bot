@@ -36,6 +36,18 @@ python -m app
 
 On first `python -m app`, the database schema is created and the fictional player pool is seeded automatically.
 
+### PostgreSQL regression tests
+
+The player-template regression suite in `tests/test_player_templates_db.py` runs against a real PostgreSQL database. Local runs skip these tests unless both variables are set:
+
+```bash
+export TEST_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@HOST:5432/DBNAME
+export FMB_RUN_DB_TESTS=1
+pytest -q
+```
+
+The target database must already have the current migrations applied. CI provisions PostgreSQL, applies the migrations and runs the same DB tests automatically.
+
 ## Run with Docker
 
 ```bash
@@ -120,7 +132,7 @@ The player pool is now designed for **1,248 cards** with four rarities:
 - 🟣 EPIC — 80 cards
 - 🟡 LEGENDARY — 30 cards
 
-The curated premium seed contains real footballers (including a separate 30-card legend pool). The remaining pool is generated and marked `data_source=generated`, so real-world data can be imported without mixing it with generated players.
+The curated premium seed contains real footballers (including a separate 30-card legend pool) marked `data_source=curated_real`. The synthetic seed pool is marked `data_source=seed`; administrator-created templates use `data_source=admin`. This keeps seed markers separate from user/admin-created players.
 
 For a larger real-player database, use `scripts/import_players.py` with a properly licensed/public CSV dataset. The project does not silently download third-party player data at startup.
 
@@ -214,3 +226,7 @@ The visual tactical board uses the exact same formation slot source as the engin
 - `DATABASE_URL` must use the same PostgreSQL credentials.
 - Migrations are versioned in `schema_migrations`; legacy installations are not replayed destructively.
 - Only one live worker is active at a time via PostgreSQL advisory lock. 
+
+### Release/Amvera deployment gate
+
+Release archives are validated from the `release` branch by `.github/workflows/main.yml`. The workflow runs compile checks and the PostgreSQL regression suite before promoting the tested project to `main`. The promotion job uses the GitHub `production` environment. To make this an actual approval gate, configure at least one required reviewer for that environment in GitHub repository settings. The repository's `amvera.yml` does not encode a deployment branch, so the Amvera project itself must be configured to deploy `main`; that external setting cannot be verified from repository files alone.

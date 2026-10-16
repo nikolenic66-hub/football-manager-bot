@@ -45,22 +45,18 @@ def _split_sql_statements(sql: str) -> list[str]:
 
         if line_comment:
             buf.append(ch)
-
             if ch == "\n":
                 line_comment = False
-
             i += 1
             continue
 
         if block_comment:
             buf.append(ch)
-
             if ch == "*" and nxt == "/":
                 buf.append(nxt)
                 i += 2
                 block_comment = False
                 continue
-
             i += 1
             continue
 
@@ -72,25 +68,20 @@ def _split_sql_statements(sql: str) -> list[str]:
             else:
                 buf.append(ch)
                 i += 1
-
             continue
 
         if quote is not None:
             buf.append(ch)
-
             if ch == quote:
                 if nxt == quote:
                     buf.append(nxt)
                     i += 2
                     continue
-
                 quote = None
-
             elif ch == "\\" and quote == "'" and i + 1 < n:
                 buf.append(nxt)
                 i += 2
                 continue
-
             i += 1
             continue
 
@@ -114,10 +105,8 @@ def _split_sql_statements(sql: str) -> list[str]:
 
         if ch == "$":
             j = i + 1
-
             while j < n and (sql[j].isalnum() or sql[j] == "_"):
                 j += 1
-
             if j < n and sql[j] == "$":
                 dollar_tag = sql[i : j + 1]
                 buf.append(dollar_tag)
@@ -126,10 +115,8 @@ def _split_sql_statements(sql: str) -> list[str]:
 
         if ch == ";":
             statement = "".join(buf).strip()
-
             if statement:
                 statements.append(statement)
-
             buf.clear()
             i += 1
             continue
@@ -138,7 +125,6 @@ def _split_sql_statements(sql: str) -> list[str]:
         i += 1
 
     statement = "".join(buf).strip()
-
     if statement:
         statements.append(statement)
 
@@ -165,9 +151,7 @@ async def init_db():
         )
 
         existing = (
-            await conn.execute(
-                text("SELECT to_regclass('public.users')")
-            )
+            await conn.execute(text("SELECT to_regclass('public.users')"))
         ).scalar_one()
 
         applied = set(
@@ -184,7 +168,6 @@ async def init_db():
             # those migrations as already applied.
             for migration in migrations:
                 version = int(migration.stem.split("_", 1)[0])
-
                 if version <= 11:
                     await conn.execute(
                         text(
@@ -193,10 +176,7 @@ async def init_db():
                             VALUES (:v, :f)
                             """
                         ),
-                        {
-                            "v": version,
-                            "f": migration.name,
-                        },
+                        {"v": version, "f": migration.name},
                     )
 
             applied = {
@@ -223,8 +203,5 @@ async def init_db():
                     VALUES (:v, :f)
                     """
                 ),
-                {
-                    "v": version,
-                    "f": migration.name,
-                },
+                {"v": version, "f": migration.name},
             )

@@ -1,6 +1,6 @@
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import hashlib, math
+import hashlib, math, os, tempfile, threading
 from functools import lru_cache
 from app.game.economy import stadium_capacity
 from app.game.ratings import player_rating
@@ -9,6 +9,8 @@ from app.services import clean_display_name
 ROOT=Path(__file__).resolve().parents[2]
 ASSET=ROOT/'assets'/'visual'
 CARD_DIR=ASSET/'cards'; FORM_DIR=ASSET/'formations'; CLUB_DIR=ASSET/'clubs'; CREST_DIR=ASSET/'crests'
+_CARD_LOCKS={}
+_CARD_LOCKS_GUARD=threading.Lock()
 for p in (CARD_DIR,FORM_DIR,CLUB_DIR,CREST_DIR): p.mkdir(parents=True,exist_ok=True)
 FONT='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 FONT_B='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
@@ -91,106 +93,126 @@ def player_card(player,out=None,size=(620,860)):
         size,
     )).encode()).hexdigest()
     cache_meta=out.with_suffix(out.suffix+'.sha256')
-    if out.exists() and cache_meta.exists() and cache_meta.read_text(encoding='ascii')==fingerprint:
+    with _CARD_LOCKS_GUARD:
+        card_lock=_CARD_LOCKS.setdefault(str(out),threading.Lock())
+    with card_lock:
+        if out.exists() and cache_meta.exists() and cache_meta.read_text(encoding='ascii')==fingerprint:
+            return out
+
+        W,H=size
+        im=Image.new('RGB',(W,H),(6,10,18)); d=ImageDraw.Draw(im)
+        light=(247,248,250); muted=(190,201,214)
+        deep=tuple(max(0,min(255,int(c*.34))) for c in bg)
+        mid=tuple(max(0,min(255,int(c*.62))) for c in bg)
+
+        # Deep rarity field + original diagonal energy bands.
+        d.rectangle((0,0,W,H),fill=deep)
+        for offset in range(-H,W+H,92):
+            d.polygon([(offset,0),(offset+34,0),(offset-H+34,H),(offset-H,H)],fill=mid)
+        d.polygon([(0,210),(W,55),(W,105),(0,260)],fill=tuple(max(0,min(255,int(c*.48))) for c in accent))
+        d.rectangle((0,H-112,W,H),fill=(5,10,18))
+
+        # Main frame: clipped corners, double outline, no FUT-style wings.
+        frame=[(30,18),(W-30,18),(W-16,44),(W-16,H-44),(W-42,H-18),(42,H-18),(16,H-44),(16,44)]
+        d.polygon(frame,fill=(8,14,24),outline=accent)
+        d.line(frame+[frame[0]],fill=tuple(min(255,int(c*.58+80)) for c in accent),width=2,joint='curve')
+        inner=[(43,32),(W-43,32),(W-29,53),(W-29,H-59),(W-56,H-34),(56,H-34),(29,H-59),(29,53)]
+        d.polygon(inner,fill=tuple(max(0,min(255,int(c*.48))) for c in bg),outline=tuple(max(0,min(255,int(c*.78))) for c in accent))
+        d.line((52,43,W-52,43),fill=accent,width=2)
+
+        # Portrait dominates the upper half.
+        px,py,pw,ph=50,60,W-100,385
+        portrait_box=[(px+22,py),(px+pw-22,py),(px+pw,py+22),(px+pw,py+ph-20),(px+pw-20,py+ph),(px+20,py+ph),(px,py+ph-20),(px,py+22)]
+        d.polygon(portrait_box,fill=(7,13,22),outline=tuple(max(0,min(255,int(c*.9))) for c in accent))
+        if portrait_path and portrait_path.exists():
+            try:
+                src=Image.open(portrait_path).convert('RGB')
+                target=(pw-8,ph-8)
+                scale=max(target[0]/src.width,target[1]/src.height)
+                src=src.resize((max(1,round(src.width*scale)),max(1,round(src.height*scale))),Image.Resampling.LANCZOS)
+                left=max(0,(src.width-target[0])//2); top=max(0,(src.height-target[1])//2)
+                src=src.crop((left,top,left+target[0],top+target[1]))
+                mask=Image.new('L',target,0); md=ImageDraw.Draw(mask)
+                md.polygon([(22,0),(target[0]-22,0),(target[0],22),(target[0],target[1]-20),(target[0]-20,target[1]),(20,target[1]),(0,target[1]-20),(0,22)],fill=255)
+                im.paste(src,(px+4,py+4),mask)
+                d=ImageDraw.Draw(im)
+            except Exception:
+                portrait_path=None
+        if not portrait_path:
+            silhouette(d,W//2,py+205,1.35,accent)
+
+        # OVR / position / country plaque.
+        text_center(d,(91,91),overall_text,font(64,True),light)
+        text_center(d,(91,151),str(player.get('position') or '—'),font(27,True),accent)
+        nation=str(player.get('nationality') or '').strip().upper()[:3]
+        if nation and nation != '---':
+            plaque=(48,177,143,220)
+            rounded(d,plaque,9,fill=tuple(max(0,min(255,int(c*.30))) for c in accent),outline=accent,w=2)
+            text_center(d,((plaque[0]+plaque[2])//2,(plaque[1]+plaque[3])//2),nation,font(18,True),light)
+
+        # Name band.
+        first=clean_display_name(player.get('first_name') or '').upper()
+        last=clean_display_name(player.get('last_name') or '').upper()
+        name=' '.join(x for x in (first,last) if x) or 'PLAYER'
+        name_y=476
+        if len(name)>18 and ' ' in name:
+            parts=name.split(); split=len(parts)-1
+            text_center(d,(W//2,name_y-15),' '.join(parts[:split]),font(28,True),light)
+            text_center(d,(W//2,name_y+20),' '.join(parts[split:])[:18],font(28,True),light)
+        else:
+            text_center(d,(W//2,name_y),name[:24],font(29,True),light)
+        d.line((76,512,W-76,512),fill=tuple(max(0,min(255,int(c*.65))) for c in accent),width=2)
+
+        # Compact clipped stat tiles: intentionally not six-sided FUT hexagons.
+        stats=[
+            ('PAC',int(player.get('pace') or 0)),('SHO',int(player.get('shooting') or 0)),
+            ('PAS',int(player.get('passing') or 0)),('DRI',int(player.get('dribbling') or 0)),
+            ('DEF',int(player.get('defending') or 0)),('PHY',phy),
+        ]
+        tile_w=(W-126)//2; tile_h=58; gap=14; y0=529
+        for i,(label,val) in enumerate(stats):
+            col=i%2; row=i//2; x=48+col*(tile_w+gap); y=y0+row*(tile_h+10)
+            pts=[(x+10,y),(x+tile_w-10,y),(x+tile_w,y+8),(x+tile_w-7,y+tile_h),(x+7,y+tile_h),(x,y+8)]
+            d.polygon(pts,fill=(6,12,21),outline=tuple(max(0,min(255,int(c*.82))) for c in accent))
+            d.text((x+15,y+9),label,font=font(14,True),fill=muted)
+            text_center(d,(x+tile_w-36,y+30),str(val),font(25,True),light)
+            bar_x=x+15; bar_y=y+44; bar_w=tile_w-30
+            d.line((bar_x,bar_y,bar_x+bar_w,bar_y),fill=(34,43,55),width=3)
+            d.line((bar_x,bar_y,bar_x+round(bar_w*max(0,min(99,val))/100),bar_y),fill=accent,width=3)
+
+        ment=int(player.get('mental') or 0)
+        text_center(d,(W//2,748),f'MENT  {ment}',font(17,True),accent)
+
+        # Club crest is optional: missing assets are intentionally left blank.
+        if crest_path:
+            try:
+                cr=Image.open(crest_path).convert('RGBA')
+                cr.thumbnail((74,74),Image.Resampling.LANCZOS)
+                im.paste(cr,(W-112,H-100),cr)
+            except Exception:
+                pass
+
+        # The player card path is shared by all users. Render into unique temporary
+        # files and atomically replace both artifacts so concurrent viewers never
+        # observe a partially-written PNG or fingerprint.
+        tmp_png=None; tmp_meta=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=out.parent,suffix='.tmp',delete=False) as fh:
+                tmp_png=Path(fh.name)
+            im.save(tmp_png,format='PNG',optimize=True)
+            os.replace(tmp_png,out)
+            tmp_png=None
+            with tempfile.NamedTemporaryFile(dir=cache_meta.parent,suffix='.tmp',mode='w',encoding='ascii',delete=False) as fh:
+                fh.write(fingerprint)
+                tmp_meta=Path(fh.name)
+            os.replace(tmp_meta,cache_meta)
+            tmp_meta=None
+        finally:
+            for tmp in (tmp_png,tmp_meta):
+                if tmp is not None:
+                    try: tmp.unlink()
+                    except FileNotFoundError: pass
         return out
-
-    W,H=size
-    im=Image.new('RGB',(W,H),(6,10,18)); d=ImageDraw.Draw(im)
-    light=(247,248,250); muted=(190,201,214)
-    deep=tuple(max(0,min(255,int(c*.34))) for c in bg)
-    mid=tuple(max(0,min(255,int(c*.62))) for c in bg)
-
-    # Deep rarity field + original diagonal energy bands.
-    d.rectangle((0,0,W,H),fill=deep)
-    for offset in range(-H,W+H,92):
-        d.polygon([(offset,0),(offset+34,0),(offset-H+34,H),(offset-H,H)],fill=mid)
-    d.polygon([(0,210),(W,55),(W,105),(0,260)],fill=tuple(max(0,min(255,int(c*.48))) for c in accent))
-    d.rectangle((0,H-112,W,H),fill=(5,10,18))
-
-    # Main frame: clipped corners, double outline, no FUT-style wings.
-    frame=[(30,18),(W-30,18),(W-16,44),(W-16,H-44),(W-42,H-18),(42,H-18),(16,H-44),(16,44)]
-    d.polygon(frame,fill=(8,14,24),outline=accent)
-    d.line(frame+[frame[0]],fill=tuple(min(255,int(c*.58+80)) for c in accent),width=2,joint='curve')
-    inner=[(43,32),(W-43,32),(W-29,53),(W-29,H-59),(W-56,H-34),(56,H-34),(29,H-59),(29,53)]
-    d.polygon(inner,fill=tuple(max(0,min(255,int(c*.48))) for c in bg),outline=tuple(max(0,min(255,int(c*.78))) for c in accent))
-    d.line((52,43,W-52,43),fill=accent,width=2)
-
-    # Portrait dominates the upper half.
-    px,py,pw,ph=50,60,W-100,385
-    portrait_box=[(px+22,py),(px+pw-22,py),(px+pw,py+22),(px+pw,py+ph-20),(px+pw-20,py+ph),(px+20,py+ph),(px,py+ph-20),(px,py+22)]
-    d.polygon(portrait_box,fill=(7,13,22),outline=tuple(max(0,min(255,int(c*.9))) for c in accent))
-    if portrait_path and portrait_path.exists():
-        try:
-            src=Image.open(portrait_path).convert('RGB')
-            target=(pw-8,ph-8)
-            scale=max(target[0]/src.width,target[1]/src.height)
-            src=src.resize((max(1,round(src.width*scale)),max(1,round(src.height*scale))),Image.Resampling.LANCZOS)
-            left=max(0,(src.width-target[0])//2); top=max(0,(src.height-target[1])//2)
-            src=src.crop((left,top,left+target[0],top+target[1]))
-            mask=Image.new('L',target,0); md=ImageDraw.Draw(mask)
-            md.polygon([(22,0),(target[0]-22,0),(target[0],22),(target[0],target[1]-20),(target[0]-20,target[1]),(20,target[1]),(0,target[1]-20),(0,22)],fill=255)
-            im.paste(src,(px+4,py+4),mask)
-            d=ImageDraw.Draw(im)
-        except Exception:
-            portrait_path=None
-    if not portrait_path:
-        silhouette(d,W//2,py+205,1.35,accent)
-
-    # OVR / position / country plaque.
-    text_center(d,(91,91),overall_text,font(64,True),light)
-    text_center(d,(91,151),str(player.get('position') or '—'),font(27,True),accent)
-    nation=str(player.get('nationality') or '').strip().upper()[:3]
-    if nation and nation != '---':
-        plaque=(48,177,143,220)
-        rounded(d,plaque,9,fill=tuple(max(0,min(255,int(c*.30))) for c in accent),outline=accent,w=2)
-        text_center(d,((plaque[0]+plaque[2])//2,(plaque[1]+plaque[3])//2),nation,font(18,True),light)
-
-    # Name band.
-    first=clean_display_name(player.get('first_name') or '').upper()
-    last=clean_display_name(player.get('last_name') or '').upper()
-    name=' '.join(x for x in (first,last) if x) or 'PLAYER'
-    name_y=476
-    if len(name)>18 and ' ' in name:
-        parts=name.split(); split=len(parts)-1
-        text_center(d,(W//2,name_y-15),' '.join(parts[:split]),font(28,True),light)
-        text_center(d,(W//2,name_y+20),' '.join(parts[split:])[:18],font(28,True),light)
-    else:
-        text_center(d,(W//2,name_y),name[:24],font(29,True),light)
-    d.line((76,512,W-76,512),fill=tuple(max(0,min(255,int(c*.65))) for c in accent),width=2)
-
-    # Compact clipped stat tiles: intentionally not six-sided FUT hexagons.
-    stats=[
-        ('PAC',int(player.get('pace') or 0)),('SHO',int(player.get('shooting') or 0)),
-        ('PAS',int(player.get('passing') or 0)),('DRI',int(player.get('dribbling') or 0)),
-        ('DEF',int(player.get('defending') or 0)),('PHY',phy),
-    ]
-    tile_w=(W-126)//2; tile_h=58; gap=14; y0=529
-    for i,(label,val) in enumerate(stats):
-        col=i%2; row=i//2; x=48+col*(tile_w+gap); y=y0+row*(tile_h+10)
-        pts=[(x+10,y),(x+tile_w-10,y),(x+tile_w,y+8),(x+tile_w-7,y+tile_h),(x+7,y+tile_h),(x,y+8)]
-        d.polygon(pts,fill=(6,12,21),outline=tuple(max(0,min(255,int(c*.82))) for c in accent))
-        d.text((x+15,y+9),label,font=font(14,True),fill=muted)
-        text_center(d,(x+tile_w-36,y+30),str(val),font(25,True),light)
-        bar_x=x+15; bar_y=y+44; bar_w=tile_w-30
-        d.line((bar_x,bar_y,bar_x+bar_w,bar_y),fill=(34,43,55),width=3)
-        d.line((bar_x,bar_y,bar_x+round(bar_w*max(0,min(99,val))/100),bar_y),fill=accent,width=3)
-
-    ment=int(player.get('mental') or 0)
-    text_center(d,(W//2,748),f'MENT  {ment}',font(17,True),accent)
-
-    # Club crest is optional: missing assets are intentionally left blank.
-    if crest_path:
-        try:
-            cr=Image.open(crest_path).convert('RGBA')
-            cr.thumbnail((74,74),Image.Resampling.LANCZOS)
-            im.paste(cr,(W-112,H-100),cr)
-        except Exception:
-            pass
-
-    im.save(out,format='PNG',optimize=True)
-    cache_meta.write_text(fingerprint,encoding='ascii')
-    return out
-
 def formation_positions(formation):
     """Return display coordinates from the canonical board x/y coordinates."""
     from app.game.board import FORMATION_SLOTS

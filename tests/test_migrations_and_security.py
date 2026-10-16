@@ -15,3 +15,11 @@ def test_compose_does_not_hardcode_database_password_or_expose_port():
     assert 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD' in compose
     assert '# ports:' not in compose
     assert 'ports:' not in compose
+
+
+def test_release_workflow_validates_on_release_branch_before_promoting_main():
+    workflow = (Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'main.yml').read_text()
+    assert 'branches:\n      - release' in workflow
+    assert 'git push origin HEAD:main' in workflow
+    assert 'environment: production' in workflow
+    assert 'run: pytest -q' in workflow

@@ -48,14 +48,19 @@ def _insert_values(i,first,last,nat,pos,rarity,rng,real=False,card='STANDARD',ma
     elif rarity=='EPIC': market=max(market,8_000_000)
     elif rarity=='RARE': market=max(market,2_000_000)
     talents=_talents(rng,pos,rarity)
-    return dict(id=i,first_name=first,last_name=last,nationality=nat[:3].upper(),age=age or rng.randint(18,34),position=pos,**st,market_value=market,salary=max(15_000,market//35),potential=min(99,base+rng.randint(0,7)),rarity=rarity,card_version=card,real_player=real,preferred_foot='L' if rng.random()<.28 else 'R',secondary_positions=[],portrait_url=None,portrait_source=None,talents=json.dumps(talents),tactical_archetype=talents[0],data_source='curated_real' if real else 'generated')
+    return dict(id=i,first_name=first,last_name=last,nationality=nat[:3].upper(),age=age or rng.randint(18,34),position=pos,**st,market_value=market,salary=max(15_000,market//35),potential=min(99,base+rng.randint(0,7)),rarity=rarity,card_version=card,real_player=real,preferred_foot='L' if rng.random()<.28 else 'R',secondary_positions=[],portrait_url=None,portrait_source=None,talents=json.dumps(talents),tactical_archetype=talents[0],data_source='curated_real' if real else 'seed')
 
 
 async def seed():
     rng=Random(20261002)
     async with SessionLocal() as s:
+        # Serialize seed/bootstrap across processes and always repair the identity sequence.
+        await s.execute(text("SELECT pg_advisory_xact_lock(hashtext('football-manager-seed'))"))
         count=(await s.execute(text('SELECT count(*) FROM players'))).scalar_one()
-        if count: return count
+        if count:
+            await s.execute(text("SELECT setval('players_id_seq', COALESCE((SELECT MAX(id) FROM players), 1), (SELECT COUNT(*) > 0 FROM players))"))
+            await s.commit()
+            return count
         rows=[]
         used=set()
         # Premium real players.
@@ -76,8 +81,9 @@ async def seed():
             full=f'{first} {last}'
             rows.append(_insert_values(i,first,last,'NLD',pos,rarity,rng,real=False))
         for v in rows:
-            await s.execute(text('''INSERT INTO players(id,first_name,last_name,nationality,age,position,pace,shooting,passing,dribbling,defending,physical,stamina,mental,market_value,salary,potential,rarity,card_version,real_player,preferred_foot,secondary_positions,portrait_url,portrait_source,talents,tactical_archetype,data_source)
-            VALUES(:id,:first_name,:last_name,:nationality,:age,:position,:pace,:shooting,:passing,:dribbling,:defending,:physical,:stamina,:mental,:market_value,:salary,:potential,:rarity,:card_version,:real_player,:preferred_foot,:secondary_positions,:portrait_url,:portrait_source,:talents,:tactical_archetype,:data_source)'''),v)
+            await s.execute(text('''INSERT INTO players(id,first_name,last_name,nationality,age,position,pace,shooting,passing,dribbling,defending,physical,stamina,mental,market_value,salary,potential,rarity,card_version,real_player,preferred_foot,secondary_positions,portrait_url,portrait_source,talents,tactical_archetype,data_source,is_seed,is_template,template_id)
+            VALUES(:id,:first_name,:last_name,:nationality,:age,:position,:pace,:shooting,:passing,:dribbling,:defending,:physical,:stamina,:mental,:market_value,:salary,:potential,:rarity,:card_version,:real_player,:preferred_foot,:secondary_positions,:portrait_url,:portrait_source,:talents,:tactical_archetype,:data_source,TRUE,TRUE,NULL)'''),v)
+        await s.execute(text("SELECT setval('players_id_seq', COALESCE((SELECT MAX(id) FROM players), 1), TRUE)"))
         await s.commit()
     return len(rows)
 
