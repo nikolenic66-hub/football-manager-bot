@@ -20,9 +20,8 @@ def test_archive_league_orders_archives_releases_and_finishes():
     assert 'ORDER BY t.points DESC,(t.goals_for-t.goals_against) DESC,t.goals_for DESC,c.id' in block
     assert 'INSERT INTO league_history' in block
     assert 'enumerate(rows,1)' in block
-    assert 'MAX(season_number)' in block
-    assert "DELETE FROM league_teams WHERE league_id=:l" in block
-    assert "UPDATE leagues SET status='FINISHED',finished_at=now()" in block
+    assert "SELECT id,name,status,season_number FROM leagues WHERE id=:l FOR UPDATE" in block
+    assert "UPDATE leagues SET status='FINISHED',season_state='SEASON_END',finished_at=now()" in block
 
 
 def test_final_round_archives_only_after_prizes_and_before_finished_state():
@@ -32,12 +31,12 @@ def test_final_round_archives_only_after_prizes_and_before_finished_state():
     assert block.index('await settle_season_prizes(s,league_id)') < block.index('await archive_league(s,league_id)')
 
 
-def test_full_reset_archives_active_leagues_before_deleting_them():
+def test_full_reset_does_not_archive_leagues_or_issue_normal_season_rewards():
     block = SERVICES[SERVICES.index('async def full_reset'):SERVICES.index('async def _starting_players')]
-    assert "SELECT id FROM leagues WHERE status='ACTIVE'" in block
-    assert 'await archive_league(s, int(league_id))' in block
+    assert 'archive_league(' not in block
     assert "'DELETE FROM leagues'" in block
-
+    assert 'pg_advisory_xact_lock' in block
+    assert 'ensure_initial_season(s)' in block
 
 def test_admin_league_history_has_five_season_pages_and_finished_winner():
     assert "'📜 История сезонов'" in ADMIN

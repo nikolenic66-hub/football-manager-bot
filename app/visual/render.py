@@ -76,6 +76,8 @@ def player_card(player,out=None,size=(620,860)):
 
     # PHY is a presentation value explicitly defined by the card format.
     phy=round((int(player.get('physical') or 0)+int(player.get('stamina') or 0))/2)
+    fatigue=max(0,min(100,100-int(player.get('fitness') or 100)))
+    morale=max(0,min(100,int(player.get('morale') if player.get('morale') is not None else 70)))
     portrait_signature=(
         str(portrait_path),
         (portrait_path.stat().st_mtime_ns,portrait_path.stat().st_size)
@@ -86,6 +88,7 @@ def player_card(player,out=None,size=(620,860)):
         player.get('nationality'),rarity,overall_text,
         player.get('pace'),player.get('shooting'),player.get('passing'),player.get('dribbling'),
         player.get('defending'),player.get('physical'),player.get('stamina'),player.get('mental'),
+        fatigue,morale,
         portrait_signature,
         str(crest_path),
         (crest_path.stat().st_mtime_ns,crest_path.stat().st_size)
@@ -182,6 +185,8 @@ def player_card(player,out=None,size=(620,860)):
 
         ment=int(player.get('mental') or 0)
         text_center(d,(W//2,748),f'MENT  {ment}',font(17,True),accent)
+        text_center(d,(W//2,H-82),f'УСТАЛОСТЬ {fatigue}% · МОРАЛЬ {morale}%',font(21,True),light)
+        d.line((72,H-50,W-72,H-50),fill=tuple(max(0,min(255,int(c*.55))) for c in accent),width=2)
 
         # Club crest is optional: missing assets are intentionally left blank.
         if crest_path:
@@ -540,7 +545,12 @@ def match_phase_screen(home, away, formation_home, formation_away, phase='POSSES
     d.text((1090,590),'ПОСЛЕДНИЕ СОБЫТИЯ',font=font(16,True),fill=(115,190,225))
     y=625
     for e in (events or [])[-5:]:
-        txt=f"{e.get('minute','')}′ {e.get('description','')}"[:28]
+        ev_minute=int(e.get('minute') or 0)
+        minute_label=f'90+{ev_minute-90}' if ev_minute>90 else str(e.get('minute',''))
+        description=str(e.get('description',''))
+        if ev_minute>90:
+            description=re.sub(r"^(?:⚽\s*)?90\+\d+′\s*",'',description)
+        txt=f"{minute_label}′ {description}"[:28]
         d.text((1090,y),txt,font=font(13),fill=(225,235,245)); y+=34
     if out is None:
         out=ASSET/f"match_phase_{hashlib.md5(f'{home}{away}{phase}'.encode()).hexdigest()[:10]}.png"
@@ -561,7 +571,8 @@ def dynamic_match_screen(home, away, formation_home, formation_away, phase='POSS
     im=Image.new('RGB',size,(4,12,22)); d=ImageDraw.Draw(im)
     # Header
     d.text((45,28),f'{home}  {home_score}:{away_score}  {away}',font=font(30,True),fill=(245,248,252))
-    d.text((45,70),f'{minute}′ · {phase}',font=font(18,True),fill=(110,200,235))
+    minute_label=f'90+{int(minute)-90}' if int(minute)>90 else str(minute)
+    d.text((45,70),f'{minute_label}′ · {phase}',font=font(18,True),fill=(110,200,235))
     # pitch
     px0,py0,px1,py1=45,125,1125,855
     d.rounded_rectangle((px0,py0,px1,py1),radius=24,fill=(10,82,52),outline=(115,205,150),width=3)

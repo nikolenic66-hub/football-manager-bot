@@ -1,6 +1,9 @@
 from collections import Counter
 from dataclasses import dataclass
 
+from sqlalchemy import Column, Integer, MetaData, String, Table, and_, bindparam, not_, select, func
+
+
 @dataclass(frozen=True)
 class ScoutingReport:
     opponent_id: int
@@ -13,6 +16,101 @@ class ScoutingReport:
     key_players: tuple[str, ...]
     tendencies: tuple[str, ...]
     counter_recommendations: tuple[str, ...]
+
+
+_PLAYER_COLUMNS = (
+    'id', 'first_name', 'last_name', 'nationality', 'age', 'position', 'pace',
+    'shooting', 'passing', 'dribbling', 'defending', 'physical', 'stamina',
+    'mental', 'market_value', 'salary', 'potential', 'preferred_foot',
+)
+
+
+def _players_table():
+    metadata = MetaData()
+    return Table('players', metadata, *[Column(name, String if name in {'first_name','last_name','nationality','position','preferred_foot'} else Integer) for name in _PLAYER_COLUMNS])
+
+
+def _range_condition(column, spec):
+    if spec is None:
+        return None
+    if isinstance(spec, dict):
+        lo, hi = spec.get('min'), spec.get('max')
+    elif isinstance(spec, (tuple, list)):
+        lo = spec[0] if len(spec) > 0 else None
+        hi = spec[1] if len(spec) > 1 else None
+    else:
+        lo, hi = None, spec
+    clauses = []
+    if lo is not None:
+        clauses.append(column >= bindparam(f'{column.name}_min', lo))
+    if hi is not None:
+        clauses.append(column <= bindparam(f'{column.name}_max', hi))
+    return and_(*clauses) if clauses else None
+
+
+def build_scout_query(filters=None):
+    """Build a deterministic SQLAlchemy Select for the player scout.
+
+    Supported filters: position (str/list), age, potential, value, wage,
+    nationality, transfer_status, preferred_foot and numeric attributes.
+    The caller may add pagination with limit/offset to this Select.
+    """
+    filters = filters or {}
+    p = _players_table()
+    conditions = []
+
+    positions = filters.get('position')
+    if positions:
+        if isinstance(positions, str):
+            positions = [positions]
+        conditions.append(p.c.position.in_(list(positions)))
+
+    for key, column_name in (
+        ('age', 'age'), ('potential', 'potential'), ('value', 'market_value'), ('wage', 'salary')
+    ):
+        condition = _range_condition(getattr(p.c, column_name), filters.get(key))
+        if condition is not None:
+            conditions.append(condition)
+
+    if filters.get('nationality'):
+        conditions.append(p.c.nationality == bindparam('nationality', str(filters['nationality']).upper()[:3]))
+    if filters.get('preferred_foot'):
+        conditions.append(p.c.preferred_foot == bindparam('preferred_foot', filters['preferred_foot']))
+
+    transfer_status = filters.get('transfer_status')
+    active_listing = "EXISTS (SELECT 1 FROM transfer_listings tl WHERE tl.player_id=players.id AND tl.status='LISTED')"
+    owned = "EXISTS (SELECT 1 FROM club_players cp WHERE cp.player_id=players.id)"
+    # Raw correlated predicates keep this builder independent from an ORM
+    # mapping, while the returned object is a normal SQLAlchemy Select.
+    from sqlalchemy import text as sql_text
+    if transfer_status == 'free':
+        conditions.append(sql_text(f'NOT {owned}'))
+        conditions.append(sql_text(f'NOT {active_listing}'))
+    elif transfer_status == 'listed':
+        conditions.append(sql_text(active_listing))
+    elif transfer_status == 'not_for_sale':
+        conditions.append(sql_text(owned))
+        conditions.append(sql_text(f'NOT {active_listing}'))
+
+    attributes = filters.get('attributes') or {}
+    for name, spec in attributes.items():
+        if name not in {'pace','shooting','passing','dribbling','defending','physical','stamina','mental'}:
+            raise ValueError(f'Unsupported scouting attribute: {name}')
+        condition = _range_condition(getattr(p.c, name), spec)
+        if condition is not None:
+            conditions.append(condition)
+
+    query = select(*[getattr(p.c, name) for name in _PLAYER_COLUMNS])
+    if conditions:
+        query = query.where(and_(*conditions))
+    # Hard deterministic order fixes page 5 -> 6 -> 5 drift.
+    return query.order_by(p.c.id.asc())
+
+
+def build_scout_count_query(filters=None):
+    """Return a matching deterministic count query for the same filters."""
+    base = build_scout_query(filters).order_by(None).subquery('scout_rows')
+    return select(func.count()).select_from(base)
 
 
 def build_scout_report(opponent_id, opponent_name, matches, player_events):

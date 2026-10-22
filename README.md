@@ -113,7 +113,7 @@ PostgreSQL is included in `docker-compose.yml`.
 
 A real Telegram + PostgreSQL integration run still requires a local/server environment with the Python dependencies, a PostgreSQL instance and a Telegram BotFather token.
 
-The project can run from the bundled curated seed, and can be extended with properly licensed real-player data through the importer.
+The project seeds 3,000 fictional player identities. Licensed source datasets may be used for attributes, but imported names are replaced with deterministic fictional identities.
 
 ## Club economy
 
@@ -132,15 +132,15 @@ The player pool is now designed for **1,248 cards** with four rarities:
 - 🟣 EPIC — 80 cards
 - 🟡 LEGENDARY — 30 cards
 
-The curated premium seed contains real footballers (including a separate 30-card legend pool) marked `data_source=curated_real`. The synthetic seed pool is marked `data_source=seed`; administrator-created templates use `data_source=admin`. This keeps seed markers separate from user/admin-created players.
+The seed creates 3,000 fictional player templates: 120 premium templates plus 2,880 generated players. All seeded/imported identities are fictionalized; player attributes can be sourced from an appropriately licensed CSV. Seed rows use `data_source=seed`; administrator-created templates use `data_source=admin`.
 
-For a larger real-player database, use `scripts/import_players.py` with a properly licensed/public CSV dataset. The project does not silently download third-party player data at startup.
+To import additional player attributes, use `scripts/import_players.py` with a properly licensed/public CSV dataset. Imported identities are replaced with fictional names, and the project does not silently download third-party player data at startup.
 
 The database also stores card version, rarity, real/generated flag, preferred foot, secondary positions, portrait URL and data source, so portraits and multiple card editions can be added without changing the game model later.
 
 ## Real players and portraits
 
-The seed contains a curated real-player premium/legend pool and a larger generated base pool. For a larger licensed real-player import, use `scripts/import_players.py` with a CSV whose data rights permit reuse. `scripts/fetch_portraits.py` can then resolve portraits from Wikimedia Commons and save the source/license/author metadata next to the player record. Wikimedia notes that files have individual license conditions and that portrait/personality rights can be separate from copyright, so the script deliberately stores provenance instead of assuming every image is automatically safe to reuse.
+The seed contains a 3,000-player fictional premium/base pool. For additional licensed player attributes, use `scripts/import_players.py` with a CSV whose data rights permit reuse; imported names are anonymized before insertion. `scripts/fetch_portraits.py` can then resolve portraits from Wikimedia Commons and save the source/license/author metadata next to the player record. Wikimedia notes that files have individual license conditions and that portrait/personality rights can be separate from copyright, so the script deliberately stores provenance instead of assuming every image is automatically safe to reuse.
 
 ## Player talents
 

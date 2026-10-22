@@ -114,6 +114,16 @@ def test_live_kickoff_only_starts_current_round():
 
 def test_finalize_live_round_advances_current_round():
     source = (ROOT / 'app' / 'services.py').read_text(encoding='utf-8')
-    assert "pending=(await s.execute(text(\"SELECT count(*) FROM matches WHERE league_id=:l AND round=:r AND status!='FINISHED'\")" in source
-    assert "league['current_round']+1" in source
-    assert "UPDATE leagues SET current_round=:n" in source
+    block = source[source.index('async def finalize_live_round'):source.index('async def deliver_due_notifications')]
+    assert "status NOT IN ('FINISHED','FAILED')" in block
+    assert 'FROM leagues WHERE id=:l FOR UPDATE' in block
+    assert 'league_match_finalizations' in block
+    assert 'Damaged league schedule; refusing to advance' in block
+    assert 'round_no+1' in block
+    assert "UPDATE leagues SET current_round=:n" in block
+    worker = (ROOT / 'app' / 'live_worker.py').read_text(encoding='utf-8')
+    assert 'round_reconcile_at=now_mono+60.0' in worker
+    assert "f.status='FAILED'" in worker
+    season = (ROOT / 'app' / 'game' / 'season.py').read_text(encoding='utf-8')
+    assert "status NOT IN ('FINISHED','FAILED')" in season
+    assert 'if active_leagues:' in season

@@ -20,5 +20,4 @@ WHERE cp.template_id IS NOT NULL
   );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_copy_per_template_per_club
-    ON club_players(club_id, template_id)
-    WHERE template_id IS NOT NULL;
+    ON club_players(club_id, template_id);

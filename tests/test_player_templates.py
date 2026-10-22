@@ -18,14 +18,31 @@ def test_create_player_copy_clones_template_and_marks_copy():
     assert "tactical_archetype,'copy',NULL,NULL,NULL,FALSE,:t" in block
 
 
-def test_add_copy_to_club_compensates_duplicate_template_at_half_market_value():
+def test_add_copy_to_club_skips_duplicate_template_without_compensation():
     block = SERVICES[SERVICES.index('async def add_copy_to_club'):SERVICES.index('async def _template_usage_counts')]
     assert 'await club_has_template(s, club_id, template_id)' in block
-    assert "comp=int(template['market_value'])//2" in block
-    assert "UPDATE clubs SET budget=:b" in block
-    assert "VALUES(:c,'OTHER',:amount,:balance,:description)" in block
-    assert 'return None, comp' in block
+    assert 'COALESCE(cp.template_id,p.template_id)' in SERVICES
+    duplicate = block[block.index('if await club_has_template'):block.index('new_id=await create_player_copy')]
+    assert 'return None, 0' in duplicate
+    assert 'UPDATE clubs SET budget=:b' not in duplicate
+    assert "VALUES(:c,'OTHER',:amount,:balance,:description)" not in duplicate
     assert 'return int(inserted), 0' in block
+    assert 'if inserted is None:' in block
+    conflict = block[block.index('if inserted is None:'):block.index('return int(inserted), 0')]
+    assert 'return None, 0' in conflict
+    assert 'club_financial_transactions' not in conflict
+
+
+def test_starting_lineup_regression_never_creates_duplicate_template_ids():
+    block = SERVICES[SERVICES.index('async def _build_starting_squad_from_templates'):SERVICES.index('def build_starting_lineup', SERVICES.index('async def _build_starting_squad_from_templates'))]
+    pick = SERVICES[SERVICES.index('async def _pick_template'):SERVICES.index('async def _build_starting_squad_from_templates')]
+    assert 'used=set()' in block
+    assert 'used.add(tid)' in block
+    assert 'NOT (id=ANY(:used))' in pick
+    assert 'len(set(selected)) != 23' in block
+    assert '_add_template_copies_batch' in block
+    assert 'used | skipped' in block
+    assert 'len(created_by_template) != 23' in block
 
 
 def test_starting_lineup_has_23_slots_and_exact_rarity_targets_when_pool_is_sufficient():
@@ -84,15 +101,20 @@ def test_copy_ownership_column_and_unique_index_exist_in_new_migration():
     assert 'ADD COLUMN IF NOT EXISTS template_id BIGINT' in migration
     assert 'UPDATE club_players cp' in migration
     assert 'CREATE UNIQUE INDEX IF NOT EXISTS one_copy_per_template_per_club' in migration
-    assert 'WHERE template_id IS NOT NULL' in migration
+    assert 'ON club_players(club_id, template_id);' in migration
+    assert 'WHERE template_id IS NOT NULL' not in migration
 
 
 def test_starting_lineup_persists_real_copy_ids():
     block = SERVICES[SERVICES.index('async def _build_starting_squad_from_templates'):SERVICES.index('def build_starting_lineup', SERVICES.index('async def _build_starting_squad_from_templates'))]
-    assert 'created_ids=[]' in block
-    assert 'new_id,_=await add_copy_to_club' in block
+    assert 'used=set()' in block
+    assert 'skipped=set()' in block
+    assert '_add_template_copies_batch' in block
+    assert 'used | skipped' in block
+    assert 'used.add(tid)' in block
+    assert 'skipped.update(item[3] for item in missing)' in block
     assert "'ids':created_ids[:11]" in block
-    assert 'len(created_ids) != 23' in block
+    assert 'len(created_by_template) != 23' in block
 
 
 def test_buy_and_transfer_reject_duplicate_templates():
@@ -131,7 +153,44 @@ def test_seed_marker_repair_is_idempotent_and_preserves_admin_templates():
     assert 'template_id=NULL' in migration
 
 
-def test_migration_022_duplicate_cleanup_is_logged():
+def test_migration_026_backfills_and_enforces_non_null_template_id():
+    migration = (ROOT / 'migrations' / '026_enforce_club_player_template_id.sql').read_text(encoding='utf-8')
+    assert 'UPDATE club_players cp' in migration
+    assert 'COALESCE(p.template_id, CASE WHEN p.is_template THEN p.id END)' in migration
+    assert 'ALTER TABLE club_players ALTER COLUMN template_id SET NOT NULL' in migration
+    assert 'DROP INDEX IF EXISTS one_copy_per_template_per_club;' in migration
+    assert 'CREATE UNIQUE INDEX one_copy_per_template_per_club' in migration
+    assert 'WHERE template_id IS NOT NULL' not in migration
+
+
+def test_all_club_player_template_conflicts_use_non_partial_unique_index():
+    assert 'ON CONFLICT (club_id,template_id) DO NOTHING' in SERVICES
+    assert 'ON CONFLICT (club_id,template_id) WHERE template_id IS NOT NULL DO NOTHING' not in SERVICES
+
+
+def test_full_reset_is_serialized_and_pool_is_sized_for_background_work():
     db = (ROOT / 'app' / 'db.py').read_text()
-    assert "migration.name == '022_club_player_templates.sql'" in db
-    assert 'duplicate cleanup removed %s club_players rows.' in db
+    reset = SERVICES[SERVICES.index('async def full_reset'):SERVICES.index('async def _starting_players')]
+    assert 'pool_size=5' in db
+    assert 'max_overflow=10' in db
+    assert 'pool_recycle=1800' in db
+    assert "pg_advisory_xact_lock(hashtextextended('football_manager_full_reset'" in reset
+    assert "hashtextextended('football_manager_squad:' || :club_id, 0)" in SERVICES
+    assert "'club_id':str(club_id)" in SERVICES
+    assert 'CAST(:club_id AS text)' not in SERVICES
+
+
+def test_all_club_advisory_lock_parameters_are_bound_as_strings():
+    # asyncpg cannot infer an integer bind for the text concatenation used by
+    # hashtextextended(). Every per-club advisory-lock bind must therefore be
+    # explicitly converted to str at the call site.
+    for line in SERVICES.splitlines():
+        if "hashtextextended('football_manager_squad:' || :club_id" in line:
+            assert "'club_id':str(club_id)" in line
+    assert SERVICES.count("hashtextextended('football_manager_squad:' || :club_id, 0)") >= 2
+
+
+def test_full_reset_callback_is_acknowledged_before_long_database_work():
+    block = ADMIN[ADMIN.index('async def admin_full_reset_confirm'):ADMIN.index("@admin_router.callback_query(F.data == 'admin:system:log')")]
+    assert "await c.answer('Сброс запускается…')" in block
+    assert block.index("await c.answer('Сброс запускается…')") < block.index('await full_reset')

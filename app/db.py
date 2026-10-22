@@ -13,9 +13,10 @@ from .config import settings
 engine = create_async_engine(
     settings.database_url,
     pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_size=2,
-    max_overflow=0,
+    pool_recycle=300,
+    pool_size=3,
+    max_overflow=5,
+    connect_args={"statement_cache_size": 0},
 )
 
 SessionLocal = async_sessionmaker(
@@ -138,6 +139,9 @@ async def init_db():
     migrations = sorted((root / "migrations").glob("*.sql"))
 
     async with engine.begin() as conn:
+        # The bot and FastAPI run as separate Supervisor processes and may boot
+        # concurrently. Serialize schema migration checks across both processes.
+        await conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('football_manager_schema_migrations'))"))
         await conn.execute(
             text(
                 """
@@ -194,7 +198,10 @@ async def init_db():
             sql = migration.read_text(encoding="utf-8")
 
             for statement in _split_sql_statements(sql):
-                await conn.execute(text(statement))
+                # Migration statements are static PostgreSQL SQL, not SQLAlchemy
+                # templates. Execute them through the driver so JSON literals
+                # containing fragments like ":10" are not parsed as bind params.
+                await conn.exec_driver_sql(statement)
 
             await conn.execute(
                 text(
@@ -205,3 +212,25 @@ async def init_db():
                 ),
                 {"v": version, "f": migration.name},
             )
+
+
+        # Defensive schema repair for databases where an earlier deployment
+        # recorded migration 067 but did not actually create the column (for
+        # example, after a manual restore or a partial deploy). This is
+        # deliberately idempotent and runs on every startup before API routes
+        # can issue SELECT/INSERT statements that reference bench_ids.
+        await conn.exec_driver_sql(
+            """CREATE TABLE IF NOT EXISTS club_lineups (
+                club_id BIGINT PRIMARY KEY REFERENCES clubs(id) ON DELETE CASCADE,
+                player_ids BIGINT[] NOT NULL DEFAULT '{}'::BIGINT[]
+            )"""
+        )
+        await conn.exec_driver_sql(
+            """ALTER TABLE club_lineups
+               ADD COLUMN IF NOT EXISTS bench_ids BIGINT[] NOT NULL DEFAULT '{}'::BIGINT[]"""
+        )
+
+        # Fresh installations (and databases reset outside the admin flow) need
+        # a season row before tests, leagues, or Battle Pass can operate.
+        from app.game.season import ensure_initial_season
+        await ensure_initial_season(conn)

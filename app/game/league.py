@@ -2,7 +2,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Fixture: round_no:int; home_club_id:int; away_club_id:int
 def round_robin(club_ids,double_round=True):
-    if not 4<=len(club_ids)<=12: raise ValueError('League must contain 4..12 clubs.')
+    if not 4<=len(club_ids)<=16: raise ValueError('League must contain 4..16 clubs.')
     if len(club_ids)%2: raise ValueError('Number of clubs must be even.')
     arr=club_ids[:]; rounds=[]; n=len(arr)
     for r in range(n-1):

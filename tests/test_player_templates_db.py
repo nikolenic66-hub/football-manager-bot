@@ -104,11 +104,29 @@ async def test_db_full_reset_rebuilds_real_club_squad(sandbox):
         owned = set((await conn.execute(text('SELECT player_id FROM club_players WHERE club_id=:c'), {'c': club_id})).scalars().all())
         club = (await conn.execute(text('SELECT budget,fans,reputation,stadium_level,ticket_price,sponsor_level,debt FROM clubs WHERE id=:c'), {'c': club_id})).one()
         copies = int((await conn.execute(text('SELECT COUNT(*) FROM players WHERE data_source=\'pytest\' AND last_name=:tag AND is_template=FALSE'), {'tag': tag})).scalar_one())
+        duplicates = (await conn.execute(text('''
+            SELECT cp.club_id,p.template_id,COUNT(*)
+            FROM club_players cp JOIN players p ON p.id=cp.player_id
+            WHERE cp.club_id=:c
+            GROUP BY cp.club_id,p.template_id
+            HAVING COUNT(*) > 1
+        '''), {'c': club_id})).all()
+        null_templates = int((await conn.execute(text(
+            'SELECT COUNT(*) FROM club_players WHERE club_id=:c AND template_id IS NULL'
+        ), {'c': club_id})).scalar_one())
+        index_def = (await conn.execute(text(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND indexname='one_copy_per_template_per_club'"
+        ))).scalar_one_or_none()
     assert count == 23
     assert len(lineup) == 11
     assert set(lineup).issubset(owned)
     assert club == (2_000_000, 5_000, 1, 1, 20, 1, 0)
+    assert duplicates == []
+    assert null_templates == 0
     assert copies == 23
+    assert index_def is not None
+    assert 'where' not in index_def.lower()
+    assert '(club_id, template_id)' in index_def
 
 
 @pytest.mark.asyncio
@@ -154,7 +172,7 @@ async def test_db_buy_player_rejects_duplicate_template(sandbox):
 
 
 @pytest.mark.asyncio
-async def test_db_concurrent_copy_creation_has_one_owner_and_one_compensation(sandbox):
+async def test_db_concurrent_copy_creation_has_one_owner_and_no_compensation(sandbox):
     db, club_id, _, tag = sandbox
     async with db.connect() as conn:
         template_id = int((await conn.execute(text("SELECT id FROM players WHERE data_source='pytest' AND last_name=:tag AND rarity='EPIC' LIMIT 1"), {'tag': tag})).scalar_one())
@@ -167,7 +185,7 @@ async def test_db_concurrent_copy_creation_has_one_owner_and_one_compensation(sa
             return result
 
     results = await asyncio.gather(worker(), worker())
-    assert sorted(r[1] for r in results) == [0, 100000 // 2]
+    assert sorted(r[1] for r in results) == [0, 0]
     async with db.connect() as conn:
         count = int((await conn.execute(text("""
             SELECT COUNT(*) FROM club_players WHERE club_id=:c AND template_id=:t
@@ -267,3 +285,28 @@ async def test_db_migration_023_repairs_legacy_admin_marker_and_is_idempotent(le
             FROM players WHERE id IN (100,500,501,502) ORDER BY id
         """))).all()
     assert rows == [(100, True, True, None), (500, False, True, None), (501, False, False, 100), (502, False, False, 500)]
+
+
+@pytest.mark.asyncio
+async def test_db_migration_027_allows_regular_on_conflict_target(sandbox):
+    db, club_id, user_id, _ = sandbox
+    Session = async_sessionmaker(db, expire_on_commit=False, class_=AsyncSession)
+    async with Session() as s:
+        await full_reset(s, user_id)
+        await s.commit()
+    async with db.begin() as conn:
+        await _apply_migration(conn, ROOT / 'migrations/027_regular_unique_index.sql')
+        row = (await conn.execute(text('''
+            SELECT player_id, template_id
+            FROM club_players
+            WHERE club_id=:c
+            ORDER BY id
+            LIMIT 1
+        '''), {'c': club_id})).one()
+        inserted = (await conn.execute(text('''
+            INSERT INTO club_players(club_id,player_id,template_id)
+            VALUES(:c,:p,:t)
+            ON CONFLICT (club_id,template_id) DO NOTHING
+            RETURNING player_id
+        '''), {'c': club_id, 'p': int(row.player_id), 't': int(row.template_id)})).scalar_one_or_none()
+    assert inserted is None

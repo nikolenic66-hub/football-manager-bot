@@ -55,3 +55,14 @@ def test_seed_marker_repair_is_numbered_after_sequence_sync():
     sql = (ROOT / 'migrations' / '023_seed_marker_repair.sql').read_text(encoding='utf-8')
     assert "data_source='admin'" in sql
     assert "data_source IN ('seed','curated_real')" in sql
+
+
+def test_club_player_template_index_is_non_partial_after_026():
+    migration_022 = (ROOT / 'migrations' / '022_club_player_templates.sql').read_text(encoding='utf-8')
+    migration_026 = (ROOT / 'migrations' / '026_enforce_club_player_template_id.sql').read_text(encoding='utf-8')
+    assert 'ON club_players(club_id, template_id);' in migration_022
+    assert 'WHERE template_id IS NOT NULL' not in migration_022
+    assert 'ALTER TABLE club_players ALTER COLUMN template_id SET NOT NULL;' in migration_026
+    assert 'DROP INDEX IF EXISTS one_copy_per_template_per_club;' in migration_026
+    assert 'CREATE UNIQUE INDEX one_copy_per_template_per_club' in migration_026
+    assert 'WHERE template_id IS NOT NULL' not in migration_026

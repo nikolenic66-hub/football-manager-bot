@@ -1,0 +1,59 @@
+--- a/app/services.py
++++ b/app/services.py
+@@ -267,19 +267,10 @@
+     if not template:
+         raise ValueError('Player template not found.')
+     if await club_has_template(s, club_id, template_id):
+-        comp=int(template['market_value'])//2
+-        club=(await s.execute(text('SELECT budget FROM clubs WHERE id=:c FOR UPDATE'), {'c':club_id})).mappings().first()
+-        if not club:
+-            raise ValueError('Club not found.')
+-        new_budget=int(club['budget'])+comp
+-        await s.execute(text('UPDATE clubs SET budget=:b WHERE id=:c'), {'b':new_budget,'c':club_id})
+-        await s.execute(text("""INSERT INTO club_financial_transactions(
+-            club_id,category,amount,balance_after,description)
+-            VALUES(:c,'OTHER',:amount,:balance,:description)"""), {
+-            'c':club_id,'amount':comp,'balance':new_budget,
+-            'description':f'Компенсация за повторный выбор шаблона игрока #{template_id}',
+-        })
+-        return None, comp
++        # A duplicate template is a no-op. Callers such as the starting-squad
++        # builder must be able to skip it and choose another template; no
++        # compensation is appropriate because no copy was created.
++        return None, 0
+     new_id=await create_player_copy(s, template_id)
+     inserted=(await s.execute(text("""INSERT INTO club_players(
+         club_id,player_id,template_id,shirt_number,fitness,form,morale,contract_salary,release_clause)
+--- a/tests/test_player_templates.py
++++ b/tests/test_player_templates.py
+@@ -18,14 +18,25 @@
+     assert "tactical_archetype,'copy',NULL,NULL,NULL,FALSE,:t" in block
+ 
+ 
+-def test_add_copy_to_club_compensates_duplicate_template_at_half_market_value():
++def test_add_copy_to_club_skips_duplicate_template_without_compensation():
+     block = SERVICES[SERVICES.index('async def add_copy_to_club'):SERVICES.index('async def _template_usage_counts')]
+     assert 'await club_has_template(s, club_id, template_id)' in block
+-    assert "comp=int(template['market_value'])//2" in block
+-    assert "UPDATE clubs SET budget=:b" in block
+-    assert "VALUES(:c,'OTHER',:amount,:balance,:description)" in block
+-    assert 'return None, comp' in block
++    duplicate = block[block.index('if await club_has_template'):block.index('new_id=await create_player_copy')]
++    assert 'return None, 0' in duplicate
++    assert 'UPDATE clubs SET budget=:b' not in duplicate
++    assert "VALUES(:c,'OTHER',:amount,:balance,:description)" not in duplicate
+     assert 'return int(inserted), 0' in block
++
++
++def test_starting_lineup_regression_never_creates_duplicate_template_ids():
++    block = SERVICES[SERVICES.index('async def _build_starting_squad_from_templates'):SERVICES.index('def build_starting_lineup', SERVICES.index('async def _build_starting_squad_from_templates'))]
++    pick = SERVICES[SERVICES.index('async def _pick_template'):SERVICES.index('async def _build_starting_squad_from_templates')]
++    assert 'used=set()' in block
++    assert 'used.add(tid)' in block
++    assert 'NOT (id=ANY(:used))' in pick
++    assert 'len(set(selected)) != 23' in block
++    assert 'new_id,_=await add_copy_to_club' in block
++    assert 'len(created_ids) != 23' in block
+ 
+ 
+ def test_starting_lineup_has_23_slots_and_exact_rarity_targets_when_pool_is_sufficient():

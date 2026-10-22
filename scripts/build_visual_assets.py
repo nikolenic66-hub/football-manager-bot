@@ -1,8 +1,7 @@
 """Build deterministic visual assets for the game.
 
-This creates formation boards, generic club crests, event icons and a fallback
-card for every seeded player ID. Real portraits can replace the silhouette on
-individual cards when portrait files are available.
+This creates formation boards, generic club crests, event icons and fictional
+player cards. Generated avatars are used; real-player portraits are disabled.
 """
 from pathlib import Path
 import sys
@@ -19,7 +18,7 @@ from app.db import SessionLocal
 from app.game.ratings import player_rating
 
 ROOT=Path(__file__).resolve().parents[1]; ICON=ROOT/'assets/visual/icons'; ICON.mkdir(parents=True,exist_ok=True)
-FIRST=['Lars','Marco','Jonas','Daniel','Milan','Alex','Noah','Sven','Rafael','Nico','Victor','Leo','Max','Tom','Elias','Felix','Oscar','Lucas','Mateo','Ivan','Adrian','Julian','Matias','Dario','Enzo','Leon','Theo','Samuel','David','Oskar']
+FIRST=['Aren','Bren','Cirov','Dalen','Eron','Farel','Noah','Sven','Rafael','Nico','Victor','Leo','Max','Tom','Elias','Felix','Oscar','Lucas','Mateo','Ivan','Adrian','Julian','Matias','Dario','Enzo','Leon','Theo','Samuel','David','Oskar']
 LAST=['van Dijk','Silva','Jansen','Costa','Martin','Santos','Muller','Rossi','Bakker','Novak','Kovacs','Fischer','Berg','Moretti','de Jong','Keller','Meyer','Pereira','Lind','Romero','Petrov','Nielsen','Andersson','Garcia','Fernandez','Mendez','Serrano','Kovac','Popescu','Marin']
 POSITIONS=['GK']*100+['CB']*190+['LB']*90+['RB']*90+['DM']*100+['CM']*210+['AM']*120+['LW']*80+['RW']*80+['ST']*188
 
@@ -70,8 +69,7 @@ async def build_player_cards_from_db():
             'id':d['id'],'first_name':d['first_name'],'last_name':d['last_name'],
             'nationality':d['nationality'],'position':d['position'],'rarity':d['rarity'],
             'portrait_file': next((str(p.relative_to(ROOT)) for p in (
-                ROOT/'assets'/'portraits'/f'{d["id"]}_real.png',
-                ROOT/'assets'/'portraits'/f'{d["id"]}_avatar.png'
+                ROOT/'assets'/'portraits'/f'{d["id"]}_avatar.png',
             ) if p.exists()),None)
         })
     return count,manifest

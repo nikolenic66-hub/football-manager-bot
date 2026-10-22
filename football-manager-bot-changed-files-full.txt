@@ -1,0 +1,891 @@
+FOOTBALL MANAGER — FULL CONTENTS OF LATEST FIXED FILES
+All listed files are complete from first to last line.
+
+====================================================================================================
+FILE: app/server.py
+====================================================================================================
+"""FastAPI endpoints for the Telegram Football Manager Mini App."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from functools import wraps
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.exc import InterfaceError
+
+from .config import settings
+from .db import SessionLocal, init_db
+from .services import buy_player, market_players, make_transfer_offer, accept_transfer_offer, train_squad, upgrade_stadium, add_copy_to_club
+from .game.packs import list_packs, open_pack
+from .game.economy import stadium_capacity
+from .repositories import create_club
+from .telegram_auth import TelegramInitDataError, validate_telegram_init_data
+
+log = logging.getLogger(__name__)
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "mini_app" / "dist"
+app = FastAPI(title="Football Manager API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def initialize_database_schema():
+    # The API may start before the bot process; make sure all migrations are applied.
+    await init_db()
+
+
+class TacticsPayload(BaseModel):
+    formation: str = Field(default="4-3-3", min_length=3, max_length=10)
+    style: str = Field(default="BALANCE", min_length=3, max_length=20)
+    tempo: int = Field(default=50, ge=0, le=100)
+    pressing: int = Field(default=50, ge=0, le=100)
+    width: int = Field(default=50, ge=0, le=100)
+    defensive_line: int = Field(default=50, ge=0, le=100)
+    aggression: int = Field(default=50, ge=0, le=100)
+
+
+class BidPayload(BaseModel):
+    player_id: int = Field(gt=0)
+
+
+class CreateClubPayload(BaseModel):
+    name: str = Field(min_length=3, max_length=20)
+    emblem_shape: str
+    emblem_color: str
+    emblem_symbol: str
+
+
+EMBLEM_SHAPES = {"shield", "circle", "diamond", "triangle", "star", "square"}
+EMBLEM_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "black", "white"}
+EMBLEM_SYMBOLS = {"ball", "lion", "eagle", "wolf", "lightning", "crown", "sword", "star"}
+
+
+def retry_on_interface_error(endpoint):
+    """Retry an HTTP endpoint once if its DB connection was closed unexpectedly."""
+    @wraps(endpoint)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await endpoint(*args, **kwargs)
+        except InterfaceError:
+            log.warning("DB connection closed, retrying...")
+            return await endpoint(*args, **kwargs)
+    return wrapped
+
+
+async def authenticated_telegram_user(x_telegram_init_data: str | None = Header(default=None)) -> dict[str, Any]:
+    """Validate signed Telegram initData; never accept unsigned user IDs."""
+    init_data = x_telegram_init_data.strip() if isinstance(x_telegram_init_data, str) else ""
+    try:
+        return validate_telegram_init_data(init_data, settings.bot_token)
+    except TelegramInitDataError as exc:
+        # Log only a reason code. Never log the raw initData, hash, token, or user payload.
+        reason = str(exc)
+        log.warning("Telegram Mini App authentication rejected (reason=%s)", reason)
+        if reason == "missing":
+            detail = "Откройте приложение из Telegram: initData отсутствует."
+        elif reason == "bot_token_missing":
+            detail = "На сервере не настроен BOT_TOKEN."
+        elif reason == "signature_mismatch":
+            detail = "Invalid Telegram initData signature. Проверьте, что BOT_TOKEN в Amvera совпадает с токеном этого бота."
+        elif reason == "expired":
+            detail = "Telegram initData устарел. Полностью закройте и снова откройте Mini App из Telegram."
+        else:
+            detail = "Invalid Telegram initData (reason: %s). Откройте Mini App заново из Telegram." % reason
+        raise HTTPException(status_code=401, detail=detail) from exc
+
+
+async def user_and_club(user: dict[str, Any], session):
+    row = (await session.execute(text("""SELECT u.id AS user_id, c.* FROM users u
+        LEFT JOIN clubs c ON c.owner_user_id=u.id
+        WHERE u.telegram_id=:telegram_id ORDER BY c.is_test ASC, c.id LIMIT 1"""),
+        {"telegram_id": user["telegram_id"]})).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User or club not found; create a club first")
+    if row.get("id") is None:
+        raise HTTPException(status_code=404, detail="Club not found; create a club first")
+    return row
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/me")
+@retry_on_interface_error
+async def get_me(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        row = (await session.execute(text("""SELECT u.id AS user_id, c.id AS club_id, c.name AS club_name
+            FROM users u LEFT JOIN clubs c ON c.owner_user_id=u.id
+            WHERE u.telegram_id=:telegram_id ORDER BY c.is_test ASC, c.id LIMIT 1"""),
+            {"telegram_id": user["telegram_id"]})).mappings().first()
+        if not row:
+            user_id = (await session.execute(text("""INSERT INTO users(telegram_id,username,first_name)
+                VALUES(:t,:u,:f) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                first_name=EXCLUDED.first_name RETURNING id"""),
+                {"t": user["telegram_id"], "u": user.get("username"), "f": user.get("first_name") or "Manager"})).scalar_one()
+            await session.commit()
+            return {"telegram_id": user["telegram_id"], "user_id": int(user_id), "club_id": None, "club_name": None,
+                    "first_name": user.get("first_name"), "username": user.get("username")}
+        return {"telegram_id": user["telegram_id"], "user_id": int(row["user_id"]),
+                "club_id": int(row["club_id"]) if row["club_id"] is not None else None,
+                "club_name": row["club_name"], "first_name": user.get("first_name"),
+                "username": user.get("username")}
+
+
+@app.post("/api/club/create")
+async def create_club_endpoint(payload: CreateClubPayload, user=Depends(authenticated_telegram_user)):
+    name = payload.name.strip()
+    if not 3 <= len(name) <= 20:
+        raise HTTPException(status_code=422, detail="Название клуба должно содержать 3–20 символов")
+    if payload.emblem_shape not in EMBLEM_SHAPES:
+        raise HTTPException(status_code=422, detail="Недопустимая форма эмблемы")
+    if payload.emblem_color not in EMBLEM_COLORS:
+        raise HTTPException(status_code=422, detail="Недопустимый цвет эмблемы")
+    if payload.emblem_symbol not in EMBLEM_SYMBOLS:
+        raise HTTPException(status_code=422, detail="Недопустимый символ эмблемы")
+    async with SessionLocal() as session:
+        user_id = (await session.execute(text("SELECT id FROM users WHERE telegram_id=:t"),
+            {"t": user["telegram_id"]})).scalar_one_or_none()
+        if user_id is None:
+            user_id = (await session.execute(text("""INSERT INTO users(telegram_id,username,first_name)
+                VALUES(:t,:u,:f) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                first_name=EXCLUDED.first_name RETURNING id"""),
+                {"t": user["telegram_id"], "u": user.get("username"), "f": user.get("first_name") or "Manager"})).scalar_one()
+        try:
+            club_id = await create_club(session, int(user_id), name)
+            await session.execute(text("""UPDATE clubs SET emblem_shape=:shape, emblem_color=:color,
+                emblem_symbol=:symbol WHERE id=:id"""),
+                {"shape": payload.emblem_shape, "color": payload.emblem_color,
+                 "symbol": payload.emblem_symbol, "id": club_id})
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InterfaceError:
+            await session.rollback()
+            raise
+        except Exception as exc:
+            await session.rollback()
+            log.exception("Club creation failed")
+            raise HTTPException(status_code=500, detail="Не удалось создать клуб. Попробуйте ещё раз.") from exc
+    return {"status": "created", "club_id": int(club_id), "name": name,
+            "emblem_shape": payload.emblem_shape, "emblem_color": payload.emblem_color,
+            "emblem_symbol": payload.emblem_symbol}
+
+
+@app.get("/api/club/{club_id}")
+@retry_on_interface_error
+async def get_club(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        if int(club["id"]) != club_id:
+            raise HTTPException(status_code=403, detail="This club does not belong to you")
+        count = (await session.execute(text("SELECT count(*) FROM club_players WHERE club_id=:c"), {"c": club_id})).scalar_one()
+        return {"id": club_id, "name": club["name"], "short_name": club["short_name"],
+                "budget": int(club["budget"]), "stadium_name": club["stadium_name"],
+                "stadium_level": club["stadium_level"], "fans": club["fans"], "reputation": club["reputation"],
+                "squad_size": int(count), "emblem_shape": club.get("emblem_shape") or "shield",
+                "emblem_color": club.get("emblem_color") or "blue", "emblem_symbol": club.get("emblem_symbol") or "ball"}
+
+
+@app.get("/api/squad/{club_id}")
+@retry_on_interface_error
+async def get_squad(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        if int(club["id"]) != club_id:
+            raise HTTPException(status_code=403, detail="This club does not belong to you")
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,
+            ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall,
+            cp.fitness,cp.morale,cp.is_injured,p.portrait_url,p.age,cp.shirt_number
+            FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c
+            ORDER BY cp.shirt_number NULLS LAST,p.position,p.id"""), {"c": club_id})).mappings().all()
+        return {"players": [dict(r) for r in rows]}
+
+
+@app.get("/api/matches/live")
+@retry_on_interface_error
+async def live_matches(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT m.id,m.home_club_id,m.away_club_id,
+            hc.name AS home_name,ac.name AS away_name,COALESCE(m.home_score,0) home_score,
+            COALESCE(m.away_score,0) away_score,m.status,m.started_at
+            FROM matches m JOIN clubs hc ON hc.id=m.home_club_id JOIN clubs ac ON ac.id=m.away_club_id
+            WHERE m.status='LIVE' AND (m.home_club_id=:c OR m.away_club_id=:c) ORDER BY m.id"""), {"c": club["id"]})).mappings().all()
+        result=[]
+        for row in rows:
+            events=(await session.execute(text("SELECT id,minute,event_type,club_id,player_id,description,metadata FROM match_events WHERE match_id=:m ORDER BY minute,id"), {"m":row["id"]})).mappings().all()
+            item=dict(row); item["events"]=[dict(e) for e in events]; result.append(item)
+        return {"matches": result}
+
+
+@app.get("/api/matches/next")
+@retry_on_interface_error
+async def next_match(user=Depends(authenticated_telegram_user)):
+    """Return the next scheduled or currently live match for the authenticated user's club."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        row = (await session.execute(text("""SELECT m.id, m.home_club_id, m.away_club_id,
+                hc.name AS home_name, ac.name AS away_name,
+                COALESCE(m.home_score, 0) AS home_score, COALESCE(m.away_score, 0) AS away_score,
+                m.status, m.current_minute, m.started_at, m.scheduled_at,
+                m.competition_type, m.is_test,
+                CASE WHEN m.competition_type='FRIENDLY' THEN 'Товарищеский матч'
+                     ELSE COALESCE(l.name, m.competition_type, 'Матч') END AS competition_name
+            FROM matches m
+            JOIN clubs hc ON hc.id = m.home_club_id
+            JOIN clubs ac ON ac.id = m.away_club_id
+            LEFT JOIN leagues l ON l.id = m.league_id
+            WHERE (m.home_club_id = :club_id OR m.away_club_id = :club_id)
+              AND (m.status IN ('LIVE', 'SCHEDULED')
+                   OR (m.is_test=TRUE AND m.competition_type='FRIENDLY' AND m.status='FINISHED'))
+            ORDER BY CASE WHEN m.is_test=TRUE AND m.competition_type='FRIENDLY' THEN 0
+                          WHEN m.status = 'LIVE' THEN 1 ELSE 2 END,
+                     CASE WHEN m.scheduled_at >= now() THEN 0 ELSE 1 END,
+                     CASE WHEN m.scheduled_at >= now() THEN m.scheduled_at END ASC NULLS LAST,
+                     CASE WHEN m.scheduled_at < now() THEN m.scheduled_at END DESC NULLS LAST,
+                     m.id DESC
+            LIMIT 1"""), {"club_id": int(club["id"])})).mappings().first()
+        if row is None:
+            return {"match": None}
+        match = dict(row)
+        if match["status"] == "LIVE" or (match.get("is_test") and match.get("competition_type") == "FRIENDLY"):
+            events = (await session.execute(text("""SELECT id, minute, event_type, club_id,
+                    player_id, description, metadata
+                FROM match_events WHERE match_id = :match_id ORDER BY minute, id"""),
+                {"match_id": int(match["id"])})).mappings().all()
+            match["events"] = [dict(event) for event in events]
+        else:
+            match["events"] = []
+        return {"match": match}
+
+
+@app.get("/api/tactics/{club_id}")
+@retry_on_interface_error
+async def get_tactics(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        if int(club["id"]) != club_id: raise HTTPException(status_code=403, detail="This club does not belong to you")
+        row=(await session.execute(text("SELECT formation,style,tempo,pressing,width,defensive_line,aggression FROM club_tactics WHERE club_id=:c"), {"c":club_id})).mappings().first()
+        return dict(row) if row else {"formation":"4-3-3","style":"BALANCE","tempo":50,"pressing":50,"width":50,"defensive_line":50,"aggression":50}
+
+
+@app.post("/api/tactics/{club_id}")
+async def save_tactics(club_id: int, payload: TacticsPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        if int(club["id"]) != club_id: raise HTTPException(status_code=403, detail="This club does not belong to you")
+        await session.execute(text("""INSERT INTO club_tactics(club_id,formation,style,tempo,pressing,width,defensive_line,aggression)
+            VALUES(:c,:formation,:style,:tempo,:pressing,:width,:defensive_line,:aggression)
+            ON CONFLICT(club_id) DO UPDATE SET formation=EXCLUDED.formation,style=EXCLUDED.style,tempo=EXCLUDED.tempo,
+            pressing=EXCLUDED.pressing,width=EXCLUDED.width,defensive_line=EXCLUDED.defensive_line,aggression=EXCLUDED.aggression"""),
+            {"c":club_id, **payload.model_dump()})
+        await session.commit()
+        return {"status":"ok", **payload.model_dump()}
+
+
+@app.post("/api/transfers/bid")
+async def transfer_bid(payload: BidPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        try:
+            listing = (await session.execute(text("""SELECT id,seller_club_id,asking_price FROM transfer_listings
+                WHERE player_id=:p AND status='LISTED' FOR UPDATE"""), {"p": payload.player_id})).mappings().first()
+            if listing:
+                if listing["seller_club_id"] is not None and int(listing["seller_club_id"]) == int(club["id"]):
+                    raise ValueError("Нельзя подать предложение за собственного игрока.")
+                offer_id = await make_transfer_offer(session, int(club["id"]), int(listing["id"]), int(listing["asking_price"]))
+                await session.commit()
+                return {"status":"offer_submitted", "player_id":int(payload.player_id),
+                        "price":int(listing["asking_price"]), "offer_id":int(offer_id)}
+            player, price = await buy_player(session, int(club["id"]), payload.player_id)
+            await session.commit()
+            return {"status":"purchased", "player_id":int(player["id"]), "price":int(price)}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except InterfaceError:
+            await session.rollback()
+            raise
+        except Exception:
+            await session.rollback()
+            log.exception("Transfer purchase failed")
+            raise HTTPException(status_code=500, detail="Transfer failed")
+
+
+@app.get("/api/transfers/offers")
+@retry_on_interface_error
+async def transfer_offers(user=Depends(authenticated_telegram_user)):
+    """Offers related to the authenticated club, separated into incoming/outgoing."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        cid = int(club["id"])
+        rows = (await session.execute(text("""SELECT o.id,o.amount,o.status,o.created_at,l.player_id,
+                p.first_name,p.last_name,p.position,p.age,
+                o.buyer_club_id,bc.name AS buyer_club_name,l.seller_club_id,sc.name AS seller_club_name
+            FROM transfer_offers o
+            JOIN transfer_listings l ON l.id=o.listing_id
+            JOIN players p ON p.id=l.player_id
+            JOIN clubs bc ON bc.id=o.buyer_club_id
+            LEFT JOIN clubs sc ON sc.id=l.seller_club_id
+            WHERE o.buyer_club_id=:c OR l.seller_club_id=:c
+            ORDER BY o.created_at DESC,o.id DESC LIMIT 100"""), {"c": cid})).mappings().all()
+        return {"offers": [{**dict(r), "id": int(r["id"]), "amount": int(r["amount"]),
+            "player_id": int(r["player_id"]), "is_incoming": r["seller_club_id"] == cid,
+            "player_name": (f"{r['first_name'] or ''} {r['last_name'] or ''}").strip() or f"Игрок #{r['player_id']}"}
+            for r in rows]}
+
+
+class OfferActionPayload(BaseModel):
+    offer_id: int = Field(gt=0)
+
+
+@app.post("/api/transfers/offers/accept")
+async def transfer_offer_accept(payload: OfferActionPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            result = await accept_transfer_offer(session, int(club["id"]), int(payload.offer_id))
+            await session.commit()
+            return {"status": "accepted", "offer_id": int(payload.offer_id),
+                    "player_id": int(result["player_id"]), "amount": int(result["amount"])}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Transfer offer acceptance failed")
+            raise HTTPException(status_code=500, detail="Не удалось принять предложение")
+
+
+@app.post("/api/transfers/offers/reject")
+async def transfer_offer_reject(payload: OfferActionPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        result = (await session.execute(text("""UPDATE transfer_offers o SET status='REJECTED'
+            FROM transfer_listings l WHERE o.listing_id=l.id AND o.id=:o AND o.status='PENDING'
+              AND l.seller_club_id=:c RETURNING o.id"""),
+            {"o": int(payload.offer_id), "c": int(club["id"])})).scalar_one_or_none()
+        if result is None:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Предложение не найдено или уже обработано")
+        await session.commit()
+        return {"status": "rejected", "offer_id": int(result)}
+
+
+@app.get("/api/transfers/history")
+@retry_on_interface_error
+async def transfer_history(user=Depends(authenticated_telegram_user)):
+    """Completed transfers involving the authenticated club."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT t.id,t.player_id,t.from_club_id,t.to_club_id,t.price,t.created_at,
+                p.first_name,p.last_name,fc.name AS from_club_name,tc.name AS to_club_name
+            FROM transfers t JOIN players p ON p.id=t.player_id
+            LEFT JOIN clubs fc ON fc.id=t.from_club_id LEFT JOIN clubs tc ON tc.id=t.to_club_id
+            WHERE t.from_club_id=:c OR t.to_club_id=:c
+            ORDER BY t.created_at DESC,t.id DESC LIMIT 100"""), {"c": int(club["id"])})).mappings().all()
+        return {"transfers": [{**dict(r), "id": int(r["id"]), "player_id": int(r["player_id"]),
+            "price": int(r["price"]), "player_name": (f"{r['first_name'] or ''} {r['last_name'] or ''}").strip() or f"Игрок #{r['player_id']}"}
+            for r in rows]}
+
+
+@app.get("/api/scout/report/{player_id}")
+@retry_on_interface_error
+async def scout_player_report(player_id: int, user=Depends(authenticated_telegram_user)):
+    """Return a real scouting report from persisted player attributes, not a UI-only toast."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        row = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.nationality,
+                p.market_value,p.potential,p.rarity,p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall,
+                EXISTS(SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND COALESCE(cp.template_id,cp.player_id)=COALESCE(p.template_id,p.id)) AS already_owned
+            FROM players p WHERE p.id=:p AND p.is_template=TRUE"""), {"c": int(club["id"]), "p": player_id})).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Игрок для скаутинга не найден")
+        data = dict(row)
+        if data["already_owned"]:
+            raise HTTPException(status_code=400, detail="Этот игрок уже есть в вашем клубе")
+        attrs = {key: int(data.get(key) or 0) for key in ("pace","shooting","passing","dribbling","defending","physical","stamina","mental")}
+        strengths = sorted(attrs.items(), key=lambda item: item[1], reverse=True)[:3]
+        weaknesses = sorted(attrs.items(), key=lambda item: item[1])[:2]
+        labels = {"pace":"Скорость","shooting":"Удар","passing":"Пас","dribbling":"Дриблинг","defending":"Защита","physical":"Физика","stamina":"Выносливость","mental":"Ментальность"}
+        return {"player": {k: data[k] for k in ("id","first_name","last_name","position","age","nationality","market_value","potential","rarity","overall")},
+            "strengths": [{"attribute": labels[k], "value": v} for k,v in strengths],
+            "weaknesses": [{"attribute": labels[k], "value": v} for k,v in weaknesses],
+            "potential_gap": max(0, int(data["potential"] or 0)-int(data["overall"] or 0)),
+            "recommendation": "Высокий приоритет" if int(data["potential"] or 0)-int(data["overall"] or 0) >= 15 else "Рассмотреть по потребностям состава"}
+
+
+@app.get("/api/league")
+@retry_on_interface_error
+async def league_table(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        row=(await session.execute(text("""SELECT l.id, l.name FROM leagues l JOIN league_teams lt ON lt.league_id=l.id
+            WHERE lt.club_id=:c ORDER BY CASE l.status WHEN 'ACTIVE' THEN 0 WHEN 'WAITING' THEN 1 ELSE 2 END,l.id DESC LIMIT 1"""), {"c":club["id"]})).first()
+        if not row: return {"league_id":None,"league_name":None,"table":[]}
+        rows=(await session.execute(text("""SELECT c.id,c.name,lt.played,lt.wins,lt.draws,lt.losses,lt.goals_for,lt.goals_against,lt.points
+            FROM league_teams lt JOIN clubs c ON c.id=lt.club_id WHERE lt.league_id=:l
+            ORDER BY lt.points DESC,(lt.goals_for-lt.goals_against) DESC,lt.goals_for DESC,c.name"""), {"l":row.id})).mappings().all()
+        return {"league_id":int(row.id),"league_name":row.name,"table":[dict(r) for r in rows]}
+
+
+class IdPayload(BaseModel):
+    id: int = Field(gt=0)
+
+
+@app.get("/api/transfers/listings")
+@retry_on_interface_error
+async def transfer_listings(user=Depends(authenticated_telegram_user)):
+    """Real market data for the authenticated club; never return owned players as buyable."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = await market_players(session, limit=100, listed_only=False)
+        result = []
+        for row in rows:
+            if row.get("seller_club_id") is not None and int(row["seller_club_id"]) == int(club["id"]):
+                continue
+            item = dict(row)
+            item["id"] = int(item["id"])
+            item["market_value"] = int(item.get("market_value") or 0)
+            item["potential"] = int(item.get("potential") or 0)
+            item["age"] = int(item.get("age") or 0)
+            attributes = [int(item.get(key) or 0) for key in ("pace", "shooting", "passing", "dribbling", "defending", "physical", "stamina", "mental")]
+            item["overall"] = int(round(sum(attributes) / len(attributes)))
+            item["asking_price"] = int(item["asking_price"] or item["market_value"])
+            item["is_listed"] = item.get("listing_id") is not None
+            result.append(item)
+        return {"club_id": int(club["id"]), "listings": result}
+
+
+@app.get("/api/scout/recommendations")
+@retry_on_interface_error
+async def scout_recommendations(user=Depends(authenticated_telegram_user)):
+    """Recommend unowned player templates based on potential and value."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.nationality,
+                p.market_value,p.potential,p.rarity,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall
+            FROM players p
+            WHERE p.is_template=TRUE
+              AND NOT EXISTS (SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND cp.template_id=p.id)
+            ORDER BY (p.potential - ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)) DESC,
+                     p.potential DESC,p.market_value ASC,p.id ASC LIMIT 40"""), {"c": int(club["id"])})).mappings().all()
+        return {"recommendations": [dict(r) for r in rows]}
+
+
+@app.get("/api/league/fixtures")
+@retry_on_interface_error
+async def league_fixtures(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        league = (await session.execute(text("""SELECT league_id FROM league_teams WHERE club_id=:c
+            ORDER BY league_id DESC LIMIT 1"""), {"c": int(club["id"])})).scalar_one_or_none()
+        if league is None:
+            return {"fixtures": []}
+        rows = (await session.execute(text("""SELECT m.id,m.round,m.home_club_id,m.away_club_id,
+                hc.name AS home_name,ac.name AS away_name,m.home_score,m.away_score,m.status,m.scheduled_at
+            FROM matches m JOIN clubs hc ON hc.id=m.home_club_id JOIN clubs ac ON ac.id=m.away_club_id
+            WHERE m.league_id=:l
+            ORDER BY m.round,m.scheduled_at NULLS LAST,m.id LIMIT 200"""),
+            {"l": int(league)})).mappings().all()
+        return {"fixtures": [dict(r) for r in rows]}
+
+
+@app.get("/api/training/today")
+@retry_on_interface_error
+async def training_today(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        plan = (await session.execute(text("SELECT focus,intensity,updated_at FROM club_training WHERE club_id=:c"),
+            {"c": int(club["id"])})).mappings().first()
+        row = (await session.execute(text("""SELECT max(last_training_at) AS last_training_at,
+                count(*) AS squad_size,coalesce(avg(fitness),0)::int AS avg_fitness
+            FROM club_players WHERE club_id=:c"""), {"c": int(club["id"])})).mappings().first()
+        return {"focus": (plan["focus"] if plan else "BALANCED"),
+                "intensity": (plan["intensity"] if plan else "NORMAL"),
+                "last_training_at": row["last_training_at"], "squad_size": int(row["squad_size"] or 0),
+                "avg_fitness": int(row["avg_fitness"] or 0)}
+
+
+@app.post("/api/training/complete")
+async def training_complete(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            changes, batch_id = await train_squad(session, int(club["id"]))
+            await session.commit()
+            if batch_id is None:
+                return {"status": "cooldown", "remaining_seconds": int(changes[0][1]) if changes else 0,
+                        "players_trained": 0, "batch_id": None}
+            return {"status": "completed", "players_trained": len(changes), "batch_id": batch_id}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Training completion failed")
+            raise HTTPException(status_code=500, detail="Не удалось завершить тренировку")
+
+
+@app.get("/api/academy/youth")
+@retry_on_interface_error
+async def academy_youth(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.potential,p.rarity,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall
+            FROM players p WHERE p.is_template=TRUE AND p.age<=21
+              AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND cp.template_id=p.id)
+            ORDER BY p.potential DESC,p.age ASC,p.id LIMIT 30"""), {"c": int(club["id"])})).mappings().all()
+        return {"youth": [dict(r) for r in rows]}
+
+
+@app.post("/api/academy/promote")
+async def academy_promote(payload: IdPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            row = (await session.execute(text("SELECT id,first_name,last_name FROM players WHERE id=:p AND is_template=TRUE AND age<=21"),
+                {"p": payload.id})).mappings().first()
+            if not row:
+                raise ValueError("Воспитанник больше недоступен.")
+            player_id, _ = await add_copy_to_club(session, int(club["id"]), int(row["id"]))
+            if player_id is None:
+                raise ValueError("Этот воспитанник уже есть в составе.")
+            await session.commit()
+            return {"status": "promoted", "player_id": int(player_id),
+                    "name": f"{row['first_name']} {row['last_name']}".strip()}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/packs/list")
+@retry_on_interface_error
+async def packs_list(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = await list_packs(session)
+        return {"club_id": int(club["id"]), "packs": [dict(r) for r in rows]}
+
+
+@app.post("/api/packs/open")
+async def packs_open(payload: IdPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            result = await open_pack(session, int(club["id"]), payload.id)
+            await session.commit()
+            return {"status": "opened", **result}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Pack opening failed")
+            raise HTTPException(status_code=500, detail="Не удалось открыть пак")
+
+
+@app.get("/api/stadium/info")
+@retry_on_interface_error
+async def stadium_info(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        level = int(club["stadium_level"] or 1)
+        return {"name": club["stadium_name"], "level": level,
+                "capacity": stadium_capacity(level), "fans": int(club["fans"] or 0),
+                "ticket_price": int(club.get("ticket_price") or 20),
+                "upgrade_cost": 1_000_000 * level if level < 20 else None,
+                "budget": int(club["budget"] or 0)}
+
+
+@app.post("/api/stadium/upgrade")
+async def stadium_upgrade(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            level, cost, capacity = await upgrade_stadium(session, int(club["id"]))
+            await session.commit()
+            return {"status": "upgraded", "level": level, "cost": cost, "capacity": capacity}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Stadium upgrade failed")
+            raise HTTPException(status_code=500, detail="Не удалось улучшить стадион")
+
+
+@app.websocket("/ws")
+async def match_events_socket(websocket: WebSocket):
+    # WebSocket authentication uses the same signature and freshness checks as HTTP.
+    init_data = websocket.query_params.get("initData", "")
+    try:
+        verified_user = validate_telegram_init_data(init_data, settings.bot_token)
+    except TelegramInitDataError as exc:
+        log.warning("WebSocket Telegram authentication rejected (reason=%s)", str(exc))
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            try:
+                async with SessionLocal() as session:
+                    club=await user_and_club({"telegram_id":verified_user["telegram_id"]}, session)
+                    rows=(await session.execute(text("""SELECT m.id,m.home_club_id,m.away_club_id,m.home_score,m.away_score,
+                        m.status FROM matches m WHERE m.status='LIVE' AND (m.home_club_id=:c OR m.away_club_id=:c)"""), {"c":club["id"]})).mappings().all()
+                    output=[]
+                    for match in rows:
+                        events=(await session.execute(text("SELECT id,minute,event_type,club_id,player_id,description,metadata FROM match_events WHERE match_id=:m ORDER BY id DESC LIMIT 20"), {"m":match["id"]})).mappings().all()
+                        output.append({"match":dict(match),"events":[dict(e) for e in reversed(events)]})
+                    await websocket.send_text(json.dumps({"matches":output}, default=str))
+            except InterfaceError:
+                log.warning("DB connection closed, retrying...")
+                await asyncio.sleep(0.1)
+                continue
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        log.exception("WebSocket match feed failed")
+        try: await websocket.close(code=1011)
+        except Exception: pass
+
+
+# Static mount comes after API routes, so it cannot shadow /api/* or /ws.
+if STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+else:
+    @app.get("/", include_in_schema=False)
+    async def mini_app_not_built():
+        return JSONResponse(status_code=200, content={"detail":"Mini App not built"})
+
+====================================================================================================
+FILE: app/telegram_auth.py
+====================================================================================================
+"""Strict Telegram Mini App initData validation without logging user secrets."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import re
+import time
+from urllib.parse import parse_qsl
+from typing import Any
+
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class TelegramInitDataError(ValueError):
+    """Raised when Telegram Mini App initData cannot be trusted."""
+
+
+def validate_telegram_init_data(
+    init_data: str,
+    bot_token: str,
+    *,
+    max_age_seconds: int = 86400,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Validate Telegram's HMAC signature, freshness, and user payload.
+
+    The raw initData must be passed unchanged by the Mini App. This function
+    never logs or returns the raw query string or its signature.
+    """
+    if not isinstance(init_data, str) or not init_data.strip():
+        raise TelegramInitDataError("missing")
+    if not isinstance(bot_token, str) or not bot_token.strip():
+        raise TelegramInitDataError("bot_token_missing")
+
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True, max_num_fields=100)
+    except (ValueError, UnicodeError) as exc:
+        raise TelegramInitDataError("malformed") from exc
+    if not pairs:
+        raise TelegramInitDataError("malformed")
+
+    fields: dict[str, str] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise TelegramInitDataError("duplicate_field")
+        fields[key] = value
+
+    received_hash = fields.pop("hash", None)
+    if not received_hash or not _HASH_RE.fullmatch(received_hash):
+        raise TelegramInitDataError("hash_missing_or_malformed")
+
+    data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret_key = hmac.new(b"WebAppData", bot_token.strip().encode("utf-8"), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash.lower()):
+        raise TelegramInitDataError("signature_mismatch")
+
+    try:
+        auth_date = int(fields["auth_date"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TelegramInitDataError("auth_date_invalid") from exc
+
+    current_time = time.time() if now is None else now
+    if auth_date > current_time + 300 or current_time - auth_date > max_age_seconds:
+        raise TelegramInitDataError("expired")
+
+    try:
+        user = json.loads(fields["user"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise TelegramInitDataError("user_invalid") from exc
+    if not isinstance(user, dict) or not user.get("id"):
+        raise TelegramInitDataError("user_missing")
+    try:
+        telegram_id = int(user["id"])
+    except (TypeError, ValueError) as exc:
+        raise TelegramInitDataError("user_invalid") from exc
+    if telegram_id <= 0:
+        raise TelegramInitDataError("user_invalid")
+
+    return {
+        "telegram_id": telegram_id,
+        "first_name": user.get("first_name"),
+        "username": user.get("username"),
+        "auth_date": auth_date,
+    }
+
+====================================================================================================
+FILE: app/config.py
+====================================================================================================
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    bot_token: str
+    database_url: str
+    log_level: str = 'INFO'
+    admin_id: int | None = None
+
+    @field_validator('bot_token', mode='before')
+    @classmethod
+    def validate_bot_token(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError('BOT_TOKEN must be a string.')
+        value = value.strip()
+        if len(value) < 20 or ':' not in value:
+            raise ValueError('BOT_TOKEN looks invalid.')
+        return value
+
+    @field_validator('database_url', mode='before')
+    @classmethod
+    def validate_database_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError('DATABASE_URL must be a string.')
+        value = value.strip()
+        # create_async_engine requires an async driver. Managed PostgreSQL
+        # providers often expose DATABASE_URL as postgresql:// (or postgres://).
+        # Accept those provider URLs but normalize them before SQLAlchemy sees them.
+        if value.startswith('postgres://'):
+            value = 'postgresql+asyncpg://' + value[len('postgres://'):]
+        elif value.startswith('postgresql://'):
+            value = 'postgresql+asyncpg://' + value[len('postgresql://'):]
+        if not value.startswith('postgresql+asyncpg://'):
+            raise ValueError('DATABASE_URL must be a PostgreSQL URL using asyncpg.')
+        return value
+
+    model_config=SettingsConfigDict(env_file='.env', extra='ignore', case_sensitive=False)
+
+
+settings=Settings()
+
+====================================================================================================
+FILE: tests/test_telegram_init_data_auth.py
+====================================================================================================
+import hashlib
+import hmac
+import json
+from urllib.parse import urlencode
+
+import pytest
+
+from app.telegram_auth import TelegramInitDataError, validate_telegram_init_data
+
+BOT_TOKEN = "123456789:TEST_token_for_unit_tests_only"
+
+
+def make_init_data(*, auth_date=1_800_000_000, user=None, token=BOT_TOKEN):
+    fields = {
+        "auth_date": str(auth_date),
+        "query_id": "AAEAAAE",
+        "user": json.dumps(user or {"id": 42, "first_name": "Test", "username": "tester"}, separators=(",", ":")),
+    }
+    check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def test_valid_init_data_returns_telegram_identity():
+    result = validate_telegram_init_data(make_init_data(), BOT_TOKEN, now=1_800_000_010)
+    assert result == {
+        "telegram_id": 42,
+        "first_name": "Test",
+        "username": "tester",
+        "auth_date": 1_800_000_000,
+    }
+
+
+def test_rejects_wrong_bot_token_without_disabling_signature_check():
+    with pytest.raises(TelegramInitDataError, match="signature_mismatch"):
+        validate_telegram_init_data(make_init_data(), "987654321:OTHER_TOKEN", now=1_800_000_010)
+
+
+def test_rejects_expired_init_data():
+    with pytest.raises(TelegramInitDataError, match="expired"):
+        validate_telegram_init_data(make_init_data(auth_date=1_700_000_000), BOT_TOKEN, now=1_800_000_000)
+
+
+def test_rejects_duplicate_fields():
+    valid = make_init_data()
+    with pytest.raises(TelegramInitDataError, match="duplicate_field"):
+        validate_telegram_init_data(valid + "&auth_date=1800000000", BOT_TOKEN, now=1_800_000_010)
+
+
+def test_rejects_modified_user_payload():
+    valid = make_init_data()
+    with pytest.raises(TelegramInitDataError, match="signature_mismatch"):
+        validate_telegram_init_data(valid.replace("Test", "Hacked"), BOT_TOKEN, now=1_800_000_010)
+
+====================================================================================================
+FILE: tests/test_database_url_normalization.py
+====================================================================================================
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_database_url_validator_normalizes_managed_postgres_urls():
+    source = (ROOT / "app" / "config.py").read_text(encoding="utf-8")
+    assert "value = 'postgresql+asyncpg://' + value[len('postgres://'):" in source
+    assert "value = 'postgresql+asyncpg://' + value[len('postgresql://'):" in source
+    assert "DATABASE_URL must be a PostgreSQL URL using asyncpg." in source
+
+
+def test_async_engine_is_configured_for_resilient_postgres_connections():
+    source = (ROOT / "app" / "db.py").read_text(encoding="utf-8")
+    assert "pool_pre_ping=True" in source
+    assert "pool_recycle=300" in source
+    assert 'connect_args={"statement_cache_size": 0}' in source

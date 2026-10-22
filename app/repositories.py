@@ -34,7 +34,7 @@ async def create_club(s, owner_id, name):
                 owner_user_id,name,short_name,stadium_name,budget,fans,reputation
             )
             VALUES(
-                :o,:n,:sn,:st,20000000,5000,1
+                :o,:n,:sn,:st,1000000,5000,1
             )
             RETURNING id
         """), {
@@ -70,5 +70,7 @@ async def create_club(s, owner_id, name):
         text('INSERT INTO club_tactics(club_id) VALUES(:c) ON CONFLICT DO NOTHING'),
         {'c': cid},
     )
+    from .services import auto_join_rookie_league
+    await auto_join_rookie_league(s, owner_id, cid)
     return cid
 

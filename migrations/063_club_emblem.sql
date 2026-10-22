@@ -1,0 +1,4 @@
+ALTER TABLE clubs
+    ADD COLUMN IF NOT EXISTS emblem_shape TEXT NOT NULL DEFAULT 'shield',
+    ADD COLUMN IF NOT EXISTS emblem_color TEXT NOT NULL DEFAULT 'blue',
+    ADD COLUMN IF NOT EXISTS emblem_symbol TEXT NOT NULL DEFAULT 'ball';

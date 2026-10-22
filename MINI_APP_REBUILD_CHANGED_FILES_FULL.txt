@@ -1,0 +1,1682 @@
+FOOTBALL MANAGER MINI APP REBUILD — COMPLETE CHANGED FILES
+Every file below is included in full from its first line to its last line.
+Generated: 2026-10-21
+
+====================================================================================================
+FILE: app/server.py
+====================================================================================================
+"""FastAPI endpoints for the Telegram Football Manager Mini App."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from functools import wraps
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.exc import InterfaceError, SQLAlchemyError
+
+from .config import settings
+from .db import SessionLocal, init_db
+from .services import buy_player, market_players, make_transfer_offer, accept_transfer_offer, train_squad, upgrade_stadium, add_copy_to_club
+from .game.packs import list_packs, open_pack
+from .game.economy import stadium_capacity
+from .repositories import create_club
+from .game.best_xi import get_best_xi
+from .game.ai_best_xi import suggest_best_xi
+from .telegram_auth import TelegramInitDataError, validate_telegram_init_data
+
+log = logging.getLogger(__name__)
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "mini_app" / "dist"
+app = FastAPI(title="Football Manager API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def initialize_database_schema():
+    # The API may start before the bot process; make sure all migrations are applied.
+    await init_db()
+
+
+class TacticsPayload(BaseModel):
+    formation: str = Field(default="4-3-3", min_length=3, max_length=10)
+    style: str = Field(default="BALANCE", min_length=3, max_length=20)
+    tempo: int = Field(default=50, ge=0, le=100)
+    pressing: int = Field(default=50, ge=0, le=100)
+    width: int = Field(default=50, ge=0, le=100)
+    defensive_line: int = Field(default=50, ge=0, le=100)
+    aggression: int = Field(default=50, ge=0, le=100)
+
+
+class BidPayload(BaseModel):
+    player_id: int = Field(gt=0)
+
+
+class CreateClubPayload(BaseModel):
+    name: str = Field(min_length=3, max_length=20)
+    emblem_shape: str
+    emblem_color: str
+    emblem_symbol: str
+
+
+class EmblemPayload(BaseModel):
+    emblem_shape: str
+    emblem_color: str
+    emblem_symbol: str
+
+
+class ManagerProfilePayload(BaseModel):
+    manager_name: str = Field(min_length=2, max_length=32)
+
+
+class LineupPayload(BaseModel):
+    player_ids: list[int] = Field(min_length=11, max_length=11)
+    formation: str | None = Field(default=None, min_length=3, max_length=10)
+
+
+EMBLEM_SHAPES = {"shield", "circle", "diamond", "triangle", "star", "square"}
+EMBLEM_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "black", "white"}
+EMBLEM_SYMBOLS = {"ball", "lion", "eagle", "wolf", "lightning", "crown", "star"}
+
+
+def retry_on_interface_error(endpoint):
+    """Retry an HTTP endpoint once if its DB connection was closed unexpectedly."""
+    @wraps(endpoint)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await endpoint(*args, **kwargs)
+        except InterfaceError:
+            log.warning("DB connection closed, retrying...")
+            return await endpoint(*args, **kwargs)
+    return wrapped
+
+
+async def authenticated_telegram_user(x_telegram_init_data: str | None = Header(default=None)) -> dict[str, Any]:
+    """Validate signed Telegram initData; never accept unsigned user IDs."""
+    init_data = x_telegram_init_data.strip() if isinstance(x_telegram_init_data, str) else ""
+    try:
+        return validate_telegram_init_data(init_data, settings.bot_token)
+    except TelegramInitDataError as exc:
+        # Log only a reason code. Never log the raw initData, hash, token, or user payload.
+        reason = str(exc)
+        log.warning("Telegram Mini App authentication rejected (reason=%s)", reason)
+        if reason == "missing":
+            detail = "Откройте приложение из Telegram: initData отсутствует."
+        elif reason == "bot_token_missing":
+            detail = "На сервере не настроен BOT_TOKEN."
+        elif reason == "signature_mismatch":
+            detail = "Invalid Telegram initData signature. Проверьте, что BOT_TOKEN в Amvera совпадает с токеном этого бота."
+        elif reason == "expired":
+            detail = "Telegram initData устарел. Полностью закройте и снова откройте Mini App из Telegram."
+        else:
+            detail = "Invalid Telegram initData (reason: %s). Откройте Mini App заново из Telegram." % reason
+        raise HTTPException(status_code=401, detail=detail) from exc
+
+
+async def user_and_club(user: dict[str, Any], session):
+    row = (await session.execute(text("""SELECT u.id AS user_id, c.* FROM users u
+        LEFT JOIN clubs c ON c.owner_user_id=u.id
+        WHERE u.telegram_id=:telegram_id ORDER BY c.is_test ASC, c.id LIMIT 1"""),
+        {"telegram_id": user["telegram_id"]})).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User or club not found; create a club first")
+    if row.get("id") is None:
+        raise HTTPException(status_code=404, detail="Club not found; create a club first")
+    return row
+
+
+@app.get("/api/health")
+async def health():
+    """Liveness probe: the API process is responsive."""
+    return {"status": "ok"}
+
+
+@app.get("/api/ready")
+async def readiness():
+    """Readiness probe: report ready only when PostgreSQL is reachable."""
+    try:
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        log.exception("Readiness check failed: PostgreSQL unavailable")
+        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
+    return {"status": "ready", "database": "ok"}
+
+
+@app.get("/api/me")
+@retry_on_interface_error
+async def get_me(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        row = (await session.execute(text("""SELECT u.id AS user_id, COALESCE(u.manager_name,u.first_name) AS manager_name,
+                c.id AS club_id, c.name AS club_name
+            FROM users u LEFT JOIN clubs c ON c.owner_user_id=u.id
+            WHERE u.telegram_id=:telegram_id ORDER BY c.is_test ASC, c.id LIMIT 1"""),
+            {"telegram_id": user["telegram_id"]})).mappings().first()
+        if not row:
+            user_id = (await session.execute(text("""INSERT INTO users(telegram_id,username,first_name)
+                VALUES(:t,:u,:f) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                first_name=EXCLUDED.first_name RETURNING id"""),
+                {"t": user["telegram_id"], "u": user.get("username"), "f": user.get("first_name") or "Manager"})).scalar_one()
+            await session.commit()
+            return {"telegram_id": user["telegram_id"], "user_id": int(user_id), "club_id": None, "club_name": None,
+                    "first_name": user.get("first_name") or "Менеджер", "username": user.get("username")}
+        return {"telegram_id": user["telegram_id"], "user_id": int(row["user_id"]),
+                "club_id": int(row["club_id"]) if row["club_id"] is not None else None,
+                "club_name": row["club_name"], "first_name": row["manager_name"] or user.get("first_name") or "Менеджер",
+                "username": user.get("username")}
+
+
+@app.post("/api/manager/profile")
+@retry_on_interface_error
+async def update_manager_profile(payload: ManagerProfilePayload, user=Depends(authenticated_telegram_user)):
+    name = " ".join(payload.manager_name.split()).strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Имя менеджера должно содержать минимум 2 символа.")
+    async with SessionLocal() as session:
+        await session.execute(text("UPDATE users SET manager_name=:name WHERE telegram_id=:tg"),
+                              {"name": name, "tg": int(user["telegram_id"])})
+        await session.commit()
+    return {"status": "updated", "manager_name": name}
+
+
+@app.post("/api/club/emblem")
+@retry_on_interface_error
+async def update_club_emblem(payload: EmblemPayload, user=Depends(authenticated_telegram_user)):
+    if payload.emblem_shape not in EMBLEM_SHAPES:
+        raise HTTPException(status_code=400, detail="Неизвестная форма эмблемы.")
+    if payload.emblem_color not in EMBLEM_COLORS:
+        raise HTTPException(status_code=400, detail="Неизвестный цвет эмблемы.")
+    if payload.emblem_symbol not in EMBLEM_SYMBOLS:
+        raise HTTPException(status_code=400, detail="Неизвестный символ эмблемы.")
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        await session.execute(text("UPDATE clubs SET emblem_shape=:shape,emblem_color=:color,emblem_symbol=:symbol WHERE id=:club"),
+            {"shape": payload.emblem_shape, "color": payload.emblem_color, "symbol": payload.emblem_symbol, "club": int(club["id"])})
+        await session.commit()
+    return {"status": "updated", "emblem_shape": payload.emblem_shape,
+            "emblem_color": payload.emblem_color, "emblem_symbol": payload.emblem_symbol}
+
+
+@app.get("/api/lineup")
+@retry_on_interface_error
+async def get_starting_lineup(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        tactics = (await session.execute(text("SELECT formation FROM club_tactics WHERE club_id=:c"), {"c": int(club["id"])})).mappings().first()
+        formation = str(tactics["formation"] if tactics else "4-3-3")
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.portrait_url,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall,
+                cp.fitness,cp.form,cp.morale,cp.is_injured,COALESCE(cp.suspension_matches,0) AS suspension_matches,
+                p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental
+            FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c ORDER BY p.id"""),
+            {"c": int(club["id"])})).mappings().all()
+        saved = (await session.execute(text("SELECT player_ids FROM club_lineups WHERE club_id=:c"), {"c": int(club["id"])})).scalar_one_or_none() or []
+        player_ids = {int(r["id"]) for r in rows}
+        saved_ids = [int(pid) for pid in saved if int(pid) in player_ids][:11]
+        return {"formation": formation, "players": [dict(r) for r in rows], "starting_ids": saved_ids}
+
+
+@app.post("/api/lineup/autoselect")
+@retry_on_interface_error
+async def auto_select_starting_lineup(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        tactics = (await session.execute(text("SELECT formation FROM club_tactics WHERE club_id=:c"), {"c": int(club["id"])})).mappings().first()
+        formation = str(tactics["formation"] if tactics else "4-3-3")
+        rows = (await session.execute(text("""SELECT p.*,cp.fitness,cp.form,cp.morale,cp.is_injured,
+                COALESCE(cp.suspension_matches,0) AS suspension_matches
+            FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c
+            ORDER BY p.id"""), {"c": int(club["id"])})).mappings().all()
+        try:
+            selected = get_best_xi(rows, formation)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if len(selected) != 11:
+            raise HTTPException(status_code=400, detail="Для стартового состава нужны 11 доступных игроков.")
+        ids = [int(row["id"]) for row in selected]
+        await session.execute(text("""INSERT INTO club_lineups(club_id,player_ids) VALUES(:c,:ids)
+            ON CONFLICT(club_id) DO UPDATE SET player_ids=EXCLUDED.player_ids"""), {"c": int(club["id"]), "ids": ids})
+        await session.commit()
+        return {"status": "saved", "formation": formation, "starting_ids": ids}
+
+
+@app.get("/api/lineup/recommendation")
+@retry_on_interface_error
+async def recommend_starting_lineup(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        result = await suggest_best_xi(session, int(club["id"]))
+        if not result:
+            raise HTTPException(status_code=503, detail="Не удалось рассчитать рекомендацию состава.")
+        return {"formation": result.get("formation") or "4-3-3",
+                "starting_ids": [int(p["id"]) for p in result.get("players", []) if p.get("id") is not None],
+                "reason": str(result.get("reason") or "Состав рекомендован по доступности и рейтингу игроков."),
+                "source": str(result.get("source") or "fallback")}
+
+
+@app.post("/api/lineup")
+@retry_on_interface_error
+async def save_starting_lineup(payload: LineupPayload, user=Depends(authenticated_telegram_user)):
+    ids = [int(pid) for pid in payload.player_ids]
+    if len(set(ids)) != 11:
+        raise HTTPException(status_code=400, detail="В стартовом составе должно быть 11 разных игроков.")
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT p.id,cp.is_injured,COALESCE(cp.suspension_matches,0) AS suspension_matches
+            FROM club_players cp JOIN players p ON p.id=cp.player_id
+            WHERE cp.club_id=:c AND p.id=ANY(:ids)"""), {"c": int(club["id"]), "ids": ids})).mappings().all()
+        if len(rows) != 11:
+            raise HTTPException(status_code=400, detail="Все выбранные игроки должны принадлежать вашему клубу.")
+        unavailable = [r for r in rows if r["is_injured"] or int(r["suspension_matches"] or 0) > 0]
+        if unavailable:
+            raise HTTPException(status_code=400, detail="Травмированных и дисквалифицированных игроков нельзя поставить в состав.")
+        await session.execute(text("""INSERT INTO club_lineups(club_id,player_ids) VALUES(:c,:ids)
+            ON CONFLICT(club_id) DO UPDATE SET player_ids=EXCLUDED.player_ids"""), {"c": int(club["id"]), "ids": ids})
+        if payload.formation is not None:
+            from .game.board import FORMATION_SLOTS
+            if payload.formation not in FORMATION_SLOTS:
+                raise HTTPException(status_code=400, detail="Неизвестная схема расстановки.")
+            await session.execute(text("""INSERT INTO club_tactics(club_id,formation) VALUES(:c,:f)
+                ON CONFLICT(club_id) DO UPDATE SET formation=EXCLUDED.formation"""),
+                {"c": int(club["id"]), "f": payload.formation})
+        await session.commit()
+    return {"status": "saved", "starting_ids": ids, "formation": payload.formation}
+
+
+@app.post("/api/club/create")
+async def create_club_endpoint(payload: CreateClubPayload, user=Depends(authenticated_telegram_user)):
+    name = payload.name.strip()
+    if not 3 <= len(name) <= 20:
+        raise HTTPException(status_code=422, detail="Название клуба должно содержать 3–20 символов")
+    if payload.emblem_shape not in EMBLEM_SHAPES:
+        raise HTTPException(status_code=422, detail="Недопустимая форма эмблемы")
+    if payload.emblem_color not in EMBLEM_COLORS:
+        raise HTTPException(status_code=422, detail="Недопустимый цвет эмблемы")
+    if payload.emblem_symbol not in EMBLEM_SYMBOLS:
+        raise HTTPException(status_code=422, detail="Недопустимый символ эмблемы")
+    async with SessionLocal() as session:
+        user_id = (await session.execute(text("SELECT id FROM users WHERE telegram_id=:t"),
+            {"t": user["telegram_id"]})).scalar_one_or_none()
+        if user_id is None:
+            user_id = (await session.execute(text("""INSERT INTO users(telegram_id,username,first_name)
+                VALUES(:t,:u,:f) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,
+                first_name=EXCLUDED.first_name RETURNING id"""),
+                {"t": user["telegram_id"], "u": user.get("username"), "f": user.get("first_name") or "Manager"})).scalar_one()
+        try:
+            club_id = await create_club(session, int(user_id), name)
+            await session.execute(text("""UPDATE clubs SET emblem_shape=:shape, emblem_color=:color,
+                emblem_symbol=:symbol WHERE id=:id"""),
+                {"shape": payload.emblem_shape, "color": payload.emblem_color,
+                 "symbol": payload.emblem_symbol, "id": club_id})
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InterfaceError:
+            await session.rollback()
+            raise
+        except Exception as exc:
+            await session.rollback()
+            log.exception("Club creation failed")
+            raise HTTPException(status_code=500, detail="Не удалось создать клуб. Попробуйте ещё раз.") from exc
+    return {"status": "created", "club_id": int(club_id), "name": name,
+            "emblem_shape": payload.emblem_shape, "emblem_color": payload.emblem_color,
+            "emblem_symbol": payload.emblem_symbol}
+
+
+@app.get("/api/club/{club_id}")
+@retry_on_interface_error
+async def get_club(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        if int(club["id"]) != club_id:
+            raise HTTPException(status_code=403, detail="This club does not belong to you")
+        count = (await session.execute(text("SELECT count(*) FROM club_players WHERE club_id=:c"), {"c": club_id})).scalar_one()
+        return {"id": club_id, "name": club["name"], "short_name": club["short_name"],
+                "budget": int(club["budget"]), "stadium_name": club["stadium_name"],
+                "stadium_level": club["stadium_level"], "fans": club["fans"], "reputation": club["reputation"],
+                "squad_size": int(count), "emblem_shape": club.get("emblem_shape") or "shield",
+                "emblem_color": club.get("emblem_color") or "blue", "emblem_symbol": "ball" if club.get("emblem_symbol") == "sword" else (club.get("emblem_symbol") or "ball")}
+
+
+@app.get("/api/squad/{club_id}")
+@retry_on_interface_error
+async def get_squad(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        if int(club["id"]) != club_id:
+            raise HTTPException(status_code=403, detail="This club does not belong to you")
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,
+            ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall,
+            cp.fitness,cp.morale,cp.is_injured,p.portrait_url,p.age,cp.shirt_number
+            FROM club_players cp JOIN players p ON p.id=cp.player_id WHERE cp.club_id=:c
+            ORDER BY cp.shirt_number NULLS LAST,p.position,p.id"""), {"c": club_id})).mappings().all()
+        return {"players": [dict(r) for r in rows]}
+
+
+@app.get("/api/matches/live")
+@retry_on_interface_error
+async def live_matches(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT m.id,m.home_club_id,m.away_club_id,
+            hc.name AS home_name,ac.name AS away_name,COALESCE(m.home_score,0) home_score,
+            COALESCE(m.away_score,0) away_score,m.status,m.started_at
+            FROM matches m JOIN clubs hc ON hc.id=m.home_club_id JOIN clubs ac ON ac.id=m.away_club_id
+            WHERE m.status='LIVE' AND (m.home_club_id=:c OR m.away_club_id=:c) ORDER BY m.id"""), {"c": club["id"]})).mappings().all()
+        result=[]
+        for row in rows:
+            events=(await session.execute(text("SELECT id,minute,event_type,club_id,player_id,description,metadata FROM match_events WHERE match_id=:m ORDER BY minute,id"), {"m":row["id"]})).mappings().all()
+            item=dict(row); item["events"]=[dict(e) for e in events]; result.append(item)
+        return {"matches": result}
+
+
+@app.get("/api/matches/next")
+@retry_on_interface_error
+async def next_match(user=Depends(authenticated_telegram_user)):
+    """Return the next scheduled or currently live match for the authenticated user's club."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        row = (await session.execute(text("""SELECT m.id, m.home_club_id, m.away_club_id,
+                hc.name AS home_name, ac.name AS away_name,
+                COALESCE(m.home_score, 0) AS home_score, COALESCE(m.away_score, 0) AS away_score,
+                m.status, m.current_minute, m.started_at, m.scheduled_at,
+                m.competition_type, m.is_test,
+                CASE WHEN m.competition_type='FRIENDLY' THEN 'Товарищеский матч'
+                     ELSE COALESCE(l.name, m.competition_type, 'Матч') END AS competition_name
+            FROM matches m
+            JOIN clubs hc ON hc.id = m.home_club_id
+            JOIN clubs ac ON ac.id = m.away_club_id
+            LEFT JOIN leagues l ON l.id = m.league_id
+            WHERE (m.home_club_id = :club_id OR m.away_club_id = :club_id)
+              AND (m.status='LIVE' OR (m.status='SCHEDULED' AND (m.scheduled_at IS NULL OR m.scheduled_at >= now())))
+            ORDER BY CASE WHEN m.status='LIVE' THEN 0 ELSE 1 END,
+                     m.scheduled_at ASC NULLS LAST,
+                     m.id ASC
+            LIMIT 1"""), {"club_id": int(club["id"])})).mappings().first()
+        if row is None:
+            return {"match": None}
+        match = dict(row)
+        if match["status"] == "LIVE" or (match.get("is_test") and match.get("competition_type") == "FRIENDLY"):
+            events = (await session.execute(text("""SELECT id, minute, event_type, club_id,
+                    player_id, description, metadata
+                FROM match_events WHERE match_id = :match_id ORDER BY minute, id"""),
+                {"match_id": int(match["id"])})).mappings().all()
+            match["events"] = [dict(event) for event in events]
+        else:
+            match["events"] = []
+        return {"match": match}
+
+
+@app.get("/api/tactics/{club_id}")
+@retry_on_interface_error
+async def get_tactics(club_id: int, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        if int(club["id"]) != club_id: raise HTTPException(status_code=403, detail="This club does not belong to you")
+        row=(await session.execute(text("SELECT formation,style,tempo,pressing,width,defensive_line,aggression FROM club_tactics WHERE club_id=:c"), {"c":club_id})).mappings().first()
+        return dict(row) if row else {"formation":"4-3-3","style":"BALANCE","tempo":50,"pressing":50,"width":50,"defensive_line":50,"aggression":50}
+
+
+@app.post("/api/tactics/{club_id}")
+async def save_tactics(club_id: int, payload: TacticsPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        if int(club["id"]) != club_id: raise HTTPException(status_code=403, detail="This club does not belong to you")
+        await session.execute(text("""INSERT INTO club_tactics(club_id,formation,style,tempo,pressing,width,defensive_line,aggression)
+            VALUES(:c,:formation,:style,:tempo,:pressing,:width,:defensive_line,:aggression)
+            ON CONFLICT(club_id) DO UPDATE SET formation=EXCLUDED.formation,style=EXCLUDED.style,tempo=EXCLUDED.tempo,
+            pressing=EXCLUDED.pressing,width=EXCLUDED.width,defensive_line=EXCLUDED.defensive_line,aggression=EXCLUDED.aggression"""),
+            {"c":club_id, **payload.model_dump()})
+        await session.commit()
+        return {"status":"ok", **payload.model_dump()}
+
+
+@app.post("/api/transfers/bid")
+async def transfer_bid(payload: BidPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        try:
+            listing = (await session.execute(text("""SELECT id,seller_club_id,asking_price FROM transfer_listings
+                WHERE player_id=:p AND status='LISTED' FOR UPDATE"""), {"p": payload.player_id})).mappings().first()
+            if listing:
+                if listing["seller_club_id"] is not None and int(listing["seller_club_id"]) == int(club["id"]):
+                    raise ValueError("Нельзя подать предложение за собственного игрока.")
+                offer_id = await make_transfer_offer(session, int(club["id"]), int(listing["id"]), int(listing["asking_price"]))
+                await session.commit()
+                return {"status":"offer_submitted", "player_id":int(payload.player_id),
+                        "price":int(listing["asking_price"]), "offer_id":int(offer_id)}
+            player, price = await buy_player(session, int(club["id"]), payload.player_id)
+            await session.commit()
+            return {"status":"purchased", "player_id":int(player["id"]), "price":int(price)}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except InterfaceError:
+            await session.rollback()
+            raise
+        except Exception:
+            await session.rollback()
+            log.exception("Transfer purchase failed")
+            raise HTTPException(status_code=500, detail="Transfer failed")
+
+
+@app.get("/api/transfers/offers")
+@retry_on_interface_error
+async def transfer_offers(user=Depends(authenticated_telegram_user)):
+    """Offers related to the authenticated club, separated into incoming/outgoing."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        cid = int(club["id"])
+        rows = (await session.execute(text("""SELECT o.id,o.amount,o.status,o.created_at,l.player_id,
+                p.first_name,p.last_name,p.position,p.age,
+                o.buyer_club_id,bc.name AS buyer_club_name,l.seller_club_id,sc.name AS seller_club_name
+            FROM transfer_offers o
+            JOIN transfer_listings l ON l.id=o.listing_id
+            JOIN players p ON p.id=l.player_id
+            JOIN clubs bc ON bc.id=o.buyer_club_id
+            LEFT JOIN clubs sc ON sc.id=l.seller_club_id
+            WHERE o.buyer_club_id=:c OR l.seller_club_id=:c
+            ORDER BY o.created_at DESC,o.id DESC LIMIT 100"""), {"c": cid})).mappings().all()
+        return {"offers": [{**dict(r), "id": int(r["id"]), "amount": int(r["amount"]),
+            "player_id": int(r["player_id"]), "is_incoming": r["seller_club_id"] == cid,
+            "player_name": (f"{r['first_name'] or ''} {r['last_name'] or ''}").strip() or f"Игрок #{r['player_id']}"}
+            for r in rows]}
+
+
+class OfferActionPayload(BaseModel):
+    offer_id: int = Field(gt=0)
+
+
+@app.post("/api/transfers/offers/accept")
+async def transfer_offer_accept(payload: OfferActionPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            result = await accept_transfer_offer(session, int(club["id"]), int(payload.offer_id))
+            await session.commit()
+            return {"status": "accepted", "offer_id": int(payload.offer_id),
+                    "player_id": int(result["player_id"]), "amount": int(result["amount"])}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Transfer offer acceptance failed")
+            raise HTTPException(status_code=500, detail="Не удалось принять предложение")
+
+
+@app.post("/api/transfers/offers/reject")
+async def transfer_offer_reject(payload: OfferActionPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        result = (await session.execute(text("""UPDATE transfer_offers o SET status='REJECTED'
+            FROM transfer_listings l WHERE o.listing_id=l.id AND o.id=:o AND o.status='PENDING'
+              AND l.seller_club_id=:c RETURNING o.id"""),
+            {"o": int(payload.offer_id), "c": int(club["id"])})).scalar_one_or_none()
+        if result is None:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Предложение не найдено или уже обработано")
+        await session.commit()
+        return {"status": "rejected", "offer_id": int(result)}
+
+
+@app.get("/api/transfers/history")
+@retry_on_interface_error
+async def transfer_history(user=Depends(authenticated_telegram_user)):
+    """Completed transfers involving the authenticated club."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT t.id,t.player_id,t.from_club_id,t.to_club_id,t.price,t.created_at,
+                p.first_name,p.last_name,fc.name AS from_club_name,tc.name AS to_club_name
+            FROM transfers t JOIN players p ON p.id=t.player_id
+            LEFT JOIN clubs fc ON fc.id=t.from_club_id LEFT JOIN clubs tc ON tc.id=t.to_club_id
+            WHERE t.from_club_id=:c OR t.to_club_id=:c
+            ORDER BY t.created_at DESC,t.id DESC LIMIT 100"""), {"c": int(club["id"])})).mappings().all()
+        return {"transfers": [{**dict(r), "id": int(r["id"]), "player_id": int(r["player_id"]),
+            "price": int(r["price"]), "player_name": (f"{r['first_name'] or ''} {r['last_name'] or ''}").strip() or f"Игрок #{r['player_id']}"}
+            for r in rows]}
+
+
+@app.get("/api/scout/report/{player_id}")
+@retry_on_interface_error
+async def scout_player_report(player_id: int, user=Depends(authenticated_telegram_user)):
+    """Return a real scouting report from persisted player attributes, not a UI-only toast."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        row = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.nationality,
+                p.market_value,p.potential,p.rarity,p.pace,p.shooting,p.passing,p.dribbling,p.defending,p.physical,p.stamina,p.mental,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall,
+                EXISTS(SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND COALESCE(cp.template_id,cp.player_id)=COALESCE(p.template_id,p.id)) AS already_owned
+            FROM players p WHERE p.id=:p AND p.is_template=TRUE"""), {"c": int(club["id"]), "p": player_id})).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Игрок для скаутинга не найден")
+        data = dict(row)
+        if data["already_owned"]:
+            raise HTTPException(status_code=400, detail="Этот игрок уже есть в вашем клубе")
+        attrs = {key: int(data.get(key) or 0) for key in ("pace","shooting","passing","dribbling","defending","physical","stamina","mental")}
+        strengths = sorted(attrs.items(), key=lambda item: item[1], reverse=True)[:3]
+        weaknesses = sorted(attrs.items(), key=lambda item: item[1])[:2]
+        labels = {"pace":"Скорость","shooting":"Удар","passing":"Пас","dribbling":"Дриблинг","defending":"Защита","physical":"Физика","stamina":"Выносливость","mental":"Ментальность"}
+        return {"player": {k: data[k] for k in ("id","first_name","last_name","position","age","nationality","market_value","potential","rarity","overall")},
+            "strengths": [{"attribute": labels[k], "value": v} for k,v in strengths],
+            "weaknesses": [{"attribute": labels[k], "value": v} for k,v in weaknesses],
+            "potential_gap": max(0, int(data["potential"] or 0)-int(data["overall"] or 0)),
+            "recommendation": "Высокий приоритет" if int(data["potential"] or 0)-int(data["overall"] or 0) >= 15 else "Рассмотреть по потребностям состава"}
+
+
+@app.get("/api/league")
+@retry_on_interface_error
+async def league_table(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club=await user_and_club(user, session)
+        row=(await session.execute(text("""SELECT l.id, l.name FROM leagues l JOIN league_teams lt ON lt.league_id=l.id
+            WHERE lt.club_id=:c ORDER BY CASE l.status WHEN 'ACTIVE' THEN 0 WHEN 'WAITING' THEN 1 ELSE 2 END,
+                     l.season_id DESC NULLS LAST,l.id DESC LIMIT 1"""), {"c":club["id"]})).first()
+        if not row: return {"league_id":None,"league_name":None,"table":[]}
+        rows=(await session.execute(text("""SELECT c.id,c.name,lt.played,lt.wins,lt.draws,lt.losses,lt.goals_for,lt.goals_against,lt.points
+            FROM league_teams lt JOIN clubs c ON c.id=lt.club_id WHERE lt.league_id=:l
+            ORDER BY lt.points DESC,(lt.goals_for-lt.goals_against) DESC,lt.goals_for DESC,c.name"""), {"l":row.id})).mappings().all()
+        return {"league_id":int(row.id),"league_name":row.name,"table":[dict(r) for r in rows]}
+
+
+class IdPayload(BaseModel):
+    id: int = Field(gt=0)
+
+
+@app.get("/api/transfers/listings")
+@retry_on_interface_error
+async def transfer_listings(user=Depends(authenticated_telegram_user)):
+    """Real market data for the authenticated club; never return owned players as buyable."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = await market_players(session, limit=100, listed_only=False)
+        result = []
+        for row in rows:
+            if row.get("seller_club_id") is not None and int(row["seller_club_id"]) == int(club["id"]):
+                continue
+            item = dict(row)
+            item["id"] = int(item["id"])
+            item["market_value"] = int(item.get("market_value") or 0)
+            item["potential"] = int(item.get("potential") or 0)
+            item["age"] = int(item.get("age") or 0)
+            attributes = [int(item.get(key) or 0) for key in ("pace", "shooting", "passing", "dribbling", "defending", "physical", "stamina", "mental")]
+            item["overall"] = int(round(sum(attributes) / len(attributes)))
+            item["asking_price"] = int(item["asking_price"] or item["market_value"])
+            item["is_listed"] = item.get("listing_id") is not None
+            result.append(item)
+        return {"club_id": int(club["id"]), "listings": result}
+
+
+@app.get("/api/scout/recommendations")
+@retry_on_interface_error
+async def scout_recommendations(user=Depends(authenticated_telegram_user)):
+    """Recommend unowned player templates based on potential and value."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = (await session.execute(text("""SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.nationality,
+                p.market_value,p.potential,p.rarity,
+                ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall
+            FROM players p
+            WHERE p.is_template=TRUE
+              AND NOT EXISTS (SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND cp.template_id=p.id)
+            ORDER BY (p.potential - ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)) DESC,
+                     p.potential DESC,p.market_value ASC,p.id ASC LIMIT 40"""), {"c": int(club["id"])})).mappings().all()
+        return {"recommendations": [dict(r) for r in rows]}
+
+
+@app.get("/api/league/fixtures")
+@retry_on_interface_error
+async def league_fixtures(user=Depends(authenticated_telegram_user)):
+    """Return fixtures from the club's active/current league, in actual kickoff order."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        league = (await session.execute(text("""
+            SELECT l.id,l.season_id
+            FROM league_teams lt
+            JOIN leagues l ON l.id=lt.league_id
+            WHERE lt.club_id=:c
+            ORDER BY CASE WHEN l.status='ACTIVE' THEN 0 ELSE 1 END,
+                     l.season_id DESC NULLS LAST,l.id DESC
+            LIMIT 1
+        """), {"c": int(club["id"])})).mappings().first()
+        if league is None:
+            return {"fixtures": []}
+        rows = (await session.execute(text("""SELECT m.id,m.round,m.home_club_id,m.away_club_id,
+                hc.name AS home_name,ac.name AS away_name,m.home_score,m.away_score,m.status,m.scheduled_at,
+                m.competition_type,
+                CASE WHEN m.competition_type='LEAGUE' THEN COALESCE(l.name,'Лига')
+                     WHEN m.competition_type='CUP' THEN 'Кубок'
+                     WHEN m.competition_type='CHAMPIONS' THEN 'Лига чемпионов'
+                     WHEN m.competition_type='FRIENDLY' THEN 'Товарищеский матч'
+                     ELSE COALESCE(m.competition_type,'Матч') END AS competition_name
+            FROM matches m JOIN clubs hc ON hc.id=m.home_club_id JOIN clubs ac ON ac.id=m.away_club_id
+            LEFT JOIN leagues l ON l.id=m.league_id
+            WHERE COALESCE(m.is_test,FALSE)=FALSE AND ((m.league_id=:l AND (m.season_id=:season OR m.season_id IS NULL))
+               OR ((m.home_club_id=:c OR m.away_club_id=:c) AND m.competition_type<>'LEAGUE'
+                   AND (m.season_id=:season OR m.season_id IS NULL)))
+            ORDER BY m.scheduled_at ASC NULLS LAST,m.round ASC,m.id ASC LIMIT 300"""),
+            {"l": int(league["id"]), "season": league["season_id"], "c": int(club["id"])})).mappings().all()
+        return {"fixtures": [dict(r) for r in rows]}
+
+
+@app.get("/api/training/today")
+@retry_on_interface_error
+async def training_today(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        plan = (await session.execute(text("SELECT focus,intensity,updated_at FROM club_training WHERE club_id=:c"),
+            {"c": int(club["id"])})).mappings().first()
+        row = (await session.execute(text("""SELECT max(last_training_at) AS last_training_at,
+                count(*) AS squad_size,coalesce(avg(fitness),0)::int AS avg_fitness
+            FROM club_players WHERE club_id=:c"""), {"c": int(club["id"])})).mappings().first()
+        return {"focus": (plan["focus"] if plan else "BALANCED"),
+                "intensity": (plan["intensity"] if plan else "NORMAL"),
+                "last_training_at": row["last_training_at"], "squad_size": int(row["squad_size"] or 0),
+                "avg_fitness": int(row["avg_fitness"] or 0)}
+
+
+@app.post("/api/training/complete")
+async def training_complete(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            changes, batch_id = await train_squad(session, int(club["id"]))
+            await session.commit()
+            if batch_id is None:
+                return {"status": "cooldown", "remaining_seconds": int(changes[0][1]) if changes else 0,
+                        "players_trained": 0, "batch_id": None}
+            return {"status": "completed", "players_trained": len(changes), "batch_id": batch_id}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Training completion failed")
+            raise HTTPException(status_code=500, detail="Не удалось завершить тренировку")
+
+
+@app.get("/api/academy/youth")
+@retry_on_interface_error
+async def academy_youth(user=Depends(authenticated_telegram_user)):
+    """Show a small, academy-level-appropriate pool rather than the strongest 30 templates."""
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        academy_level = int(club.get("academy_level") or 1)
+        # Better academies can support a slightly larger intake and stronger prospects.
+        # Low-level academies do not surface a screen full of near-elite 80+ OVR players.
+        max_overall = min(82, 58 + academy_level * 2)
+        limit = min(12, 3 + academy_level)
+        rows = (await session.execute(text("""WITH youth_pool AS (
+              SELECT p.id,p.first_name,p.last_name,p.position,p.age,p.potential,p.rarity,
+                     ROUND((p.pace+p.shooting+p.passing+p.dribbling+p.defending+p.physical+p.stamina+p.mental)/8.0)::int AS overall
+              FROM players p
+              WHERE p.is_template=TRUE AND p.age BETWEEN 16 AND 21
+                AND NOT EXISTS(SELECT 1 FROM club_players cp WHERE cp.club_id=:c AND cp.template_id=p.id)
+            )
+            SELECT * FROM youth_pool
+            WHERE overall<=:max_overall
+            ORDER BY CASE WHEN potential>=90 THEN 1 ELSE 0 END ASC,
+                     (potential-overall) DESC, potential DESC, age ASC, id ASC
+            LIMIT :limit"""), {"c": int(club["id"]), "max_overall": max_overall, "limit": limit})).mappings().all()
+        return {"youth": [dict(r) for r in rows], "academy_level": academy_level,
+                "max_overall": max_overall, "capacity": limit}
+
+
+@app.post("/api/academy/promote")
+async def academy_promote(payload: IdPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            row = (await session.execute(text("SELECT id,first_name,last_name FROM players WHERE id=:p AND is_template=TRUE AND age<=21"),
+                {"p": payload.id})).mappings().first()
+            if not row:
+                raise ValueError("Воспитанник больше недоступен.")
+            player_id, _ = await add_copy_to_club(session, int(club["id"]), int(row["id"]))
+            if player_id is None:
+                raise ValueError("Этот воспитанник уже есть в составе.")
+            await session.commit()
+            return {"status": "promoted", "player_id": int(player_id),
+                    "name": f"{row['first_name']} {row['last_name']}".strip()}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/packs/list")
+@retry_on_interface_error
+async def packs_list(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        rows = await list_packs(session)
+        return {"club_id": int(club["id"]), "packs": [dict(r) for r in rows]}
+
+
+@app.post("/api/packs/open")
+async def packs_open(payload: IdPayload, user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            result = await open_pack(session, int(club["id"]), payload.id)
+            await session.commit()
+            return {"status": "opened", **result}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Pack opening failed")
+            raise HTTPException(status_code=500, detail="Не удалось открыть пак")
+
+
+@app.get("/api/stadium/info")
+@retry_on_interface_error
+async def stadium_info(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        level = int(club["stadium_level"] or 1)
+        return {"name": club["stadium_name"], "level": level,
+                "capacity": stadium_capacity(level), "fans": int(club["fans"] or 0),
+                "ticket_price": int(club.get("ticket_price") or 20),
+                "upgrade_cost": 1_000_000 * level if level < 20 else None,
+                "budget": int(club["budget"] or 0)}
+
+
+@app.post("/api/stadium/upgrade")
+async def stadium_upgrade(user=Depends(authenticated_telegram_user)):
+    async with SessionLocal() as session:
+        club = await user_and_club(user, session)
+        try:
+            level, cost, capacity = await upgrade_stadium(session, int(club["id"]))
+            await session.commit()
+            return {"status": "upgraded", "level": level, "cost": cost, "capacity": capacity}
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            await session.rollback()
+            log.exception("Stadium upgrade failed")
+            raise HTTPException(status_code=500, detail="Не удалось улучшить стадион")
+
+
+@app.websocket("/ws")
+async def match_events_socket(websocket: WebSocket):
+    # WebSocket authentication uses the same signature and freshness checks as HTTP.
+    init_data = websocket.query_params.get("initData", "")
+    try:
+        verified_user = validate_telegram_init_data(init_data, settings.bot_token)
+    except TelegramInitDataError as exc:
+        log.warning("WebSocket Telegram authentication rejected (reason=%s)", str(exc))
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            try:
+                async with SessionLocal() as session:
+                    club=await user_and_club({"telegram_id":verified_user["telegram_id"]}, session)
+                    rows=(await session.execute(text("""SELECT m.id,m.home_club_id,m.away_club_id,m.home_score,m.away_score,
+                        m.status FROM matches m WHERE m.status='LIVE' AND (m.home_club_id=:c OR m.away_club_id=:c)"""), {"c":club["id"]})).mappings().all()
+                    output=[]
+                    for match in rows:
+                        events=(await session.execute(text("SELECT id,minute,event_type,club_id,player_id,description,metadata FROM match_events WHERE match_id=:m ORDER BY id DESC LIMIT 20"), {"m":match["id"]})).mappings().all()
+                        output.append({"match":dict(match),"events":[dict(e) for e in reversed(events)]})
+                    await websocket.send_text(json.dumps({"matches":output}, default=str))
+            except InterfaceError:
+                log.warning("DB connection closed, retrying...")
+                await asyncio.sleep(0.1)
+                continue
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        log.exception("WebSocket match feed failed")
+        try: await websocket.close(code=1011)
+        except Exception: pass
+
+
+# Static mount comes after API routes, so it cannot shadow /api/* or /ws.
+if STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+else:
+    @app.get("/", include_in_schema=False)
+    async def mini_app_not_built():
+        return JSONResponse(status_code=200, content={"detail":"Mini App not built"})
+
+====================================================================================================
+FILE: app/game/season.py
+====================================================================================================
+from __future__ import annotations
+
+from datetime import date, datetime, time, timedelta, timezone
+from enum import Enum
+import json
+from secrets import randbelow
+from typing import Iterable
+
+from sqlalchemy import text
+
+MSK = timezone(timedelta(hours=3))
+
+
+class SeasonState(str, Enum):
+    PRESEASON = 'PRESEASON'
+    ACTIVE = 'ACTIVE'
+    SEASON_END = 'SEASON_END'
+    OFFSEASON = 'OFFSEASON'
+    CONTRACT_WINDOW = 'CONTRACT_WINDOW'
+
+
+_STATE_FLOW = {
+    SeasonState.PRESEASON: SeasonState.ACTIVE,
+    SeasonState.ACTIVE: SeasonState.SEASON_END,
+    SeasonState.SEASON_END: SeasonState.OFFSEASON,
+    SeasonState.OFFSEASON: SeasonState.CONTRACT_WINDOW,
+    SeasonState.CONTRACT_WINDOW: SeasonState.PRESEASON,
+}
+
+
+def next_season_state(state: SeasonState | str) -> SeasonState:
+    current = state if isinstance(state, SeasonState) else SeasonState(str(state).upper())
+    return _STATE_FLOW[current]
+
+
+def season_finished(match_statuses: Iterable[str]) -> bool:
+    statuses = list(match_statuses)
+    return bool(statuses) and all(str(status).upper() in {'FINISHED', 'FAILED'} for status in statuses)
+
+
+def deterministic_match_seed(season_seed: int, match_id: int) -> int:
+    return int(season_seed) + int(match_id)
+
+
+def new_season_seed() -> int:
+    return randbelow(1_000_000_000)
+
+
+async def _current_season(session):
+    return (await session.execute(text("""
+        SELECT id,sequence_id,season_number,state,season_seed,started_at,ended_at,offseason_at,preseason_at,champion_club_id
+        FROM seasons ORDER BY id DESC LIMIT 1 FOR UPDATE
+    """))).mappings().first()
+
+
+async def check_season_complete(session) -> bool:
+    season = await _current_season(session)
+    if not season:
+        return False
+    if season['state'] == SeasonState.PRESEASON.value:
+        await session.execute(text("UPDATE seasons SET state='ACTIVE',started_at=COALESCE(started_at,CAST(:now AS timestamptz)) WHERE id=:s"),
+                              {'s': int(season['id']), 'now': datetime.now(timezone.utc)})
+        return False
+    if season['state'] == SeasonState.SEASON_END.value:
+        return await run_season_end(session, int(season['id']))
+    if season['state'] == SeasonState.OFFSEASON.value:
+        await session.execute(text("UPDATE seasons SET state='CONTRACT_WINDOW' WHERE id=:s"), {'s':int(season['id'])})
+        return True
+    if season['state'] == SeasonState.CONTRACT_WINDOW.value:
+        return await advance_contract_window(session)
+    if season['state'] != SeasonState.ACTIVE.value:
+        return False
+    total = int((await session.execute(text("SELECT COUNT(*) FROM matches WHERE season_id=:s"), {'s': int(season['id'])})).scalar_one())
+    pending = int((await session.execute(text("SELECT COUNT(*) FROM matches WHERE season_id=:s AND status NOT IN ('FINISHED','FAILED')"), {'s': int(season['id'])})).scalar_one())
+    if total == 0 or pending:
+        return False
+    # A season with a damaged/missing league round must not be closed merely
+    # because every match row that still exists is terminal.
+    active_leagues=int((await session.execute(text("""SELECT COUNT(*) FROM leagues l
+        WHERE l.status='ACTIVE' AND (l.season_id=:s OR EXISTS (
+            SELECT 1 FROM matches m WHERE m.league_id=l.id AND m.season_id=:s
+        ))"""), {'s': int(season['id'])})).scalar_one())
+    if active_leagues:
+        return False
+    return await run_season_end(session, int(season['id']))
+
+
+async def _snapshot_league(session, league_id, season_id):
+    rows = (await session.execute(text("""
+        SELECT t.club_id,c.name club_name,t.played,t.wins,t.draws,t.losses,
+               t.goals_for,t.goals_against,t.points
+        FROM league_teams t JOIN clubs c ON c.id=t.club_id
+        WHERE t.league_id=:l
+        ORDER BY t.points DESC,(t.goals_for-t.goals_against) DESC,t.goals_for DESC,c.id
+    """), {'l': league_id})).mappings().all()
+    league = (await session.execute(text("SELECT name,season_number FROM leagues WHERE id=:l"), {'l': league_id})).mappings().first()
+    if not league or not rows:
+        return list(rows)
+    season_meta = (await session.execute(text("SELECT sequence_id,season_number FROM seasons WHERE id=:s"), {'s': season_id})).mappings().first()
+    snapshot_payload = [dict(r) for r in rows]
+    await session.execute(text("""
+        INSERT INTO season_league_snapshots(sequence_id,season_id,league_id,league_name,tier,season_number,standings)
+        VALUES(:seq,:s,:l,:name,:tier,:n,CAST(:standings AS jsonb))
+        ON CONFLICT(season_id,league_id) DO NOTHING
+    """), {
+        'seq': int(season_meta['sequence_id']), 's': season_id, 'l': league_id,
+        'name': str(league['name']), 'tier': str(league.get('tier') or ''),
+        'n': int(league['season_number'] or 1), 'standings': json.dumps(snapshot_payload, default=str, ensure_ascii=False),
+    })
+    await session.execute(text("""
+        INSERT INTO season_history(league_id,season_id,season_number,champion_club_id,promoted_club_ids,relegated_club_ids)
+        VALUES(:l,:s,:n,:champ,'[]'::jsonb,'[]'::jsonb)
+        ON CONFLICT(league_id,season_number) DO UPDATE SET
+            season_id=EXCLUDED.season_id, champion_club_id=EXCLUDED.champion_club_id
+    """), {'l': league_id, 's': season_id, 'n': int(league['season_number'] or 1), 'champ': int(rows[0]['club_id'])})
+    return list(rows)
+
+
+def _promotion_pairs(leagues):
+    tiers = ['ROOKIE', 'BRONZE', 'SILVER', 'GOLD', 'DIAMOND', 'ELITE', 'LEGEND']
+    by_tier = {}
+    for league in leagues:
+        by_tier.setdefault(str(league.get('tier') or 'ROOKIE').upper(), []).append(league)
+    pairs = []
+    for lower_tier, upper_tier in zip(tiers, tiers[1:]):
+        for lower in sorted(by_tier.get(lower_tier, []), key=lambda x: int(x['id'])):
+            for upper in sorted(by_tier.get(upper_tier, []), key=lambda x: int(x['id'])):
+                pairs.append((lower, upper))
+    return pairs
+
+
+async def _apply_promotion_relegation(session, leagues, standings, season_id):
+    for lower, upper in _promotion_pairs(leagues):
+        low_rows = standings.get(int(lower['id']), [])
+        up_rows = standings.get(int(upper['id']), [])
+        if len(low_rows) < 4 or len(up_rows) < 4:
+            continue
+        promoted = [int(r['club_id']) for r in low_rows[:2]]
+        relegated = [int(r['club_id']) for r in up_rows[-2:]]
+        for cid in promoted:
+            await session.execute(text("DELETE FROM league_teams WHERE league_id=:l AND club_id=:c"), {'l': int(lower['id']), 'c': cid})
+        for cid in relegated:
+            await session.execute(text("DELETE FROM league_teams WHERE league_id=:l AND club_id=:c"), {'l': int(upper['id']), 'c': cid})
+        for cid in promoted:
+            await session.execute(text("INSERT INTO league_teams(league_id,club_id) VALUES(:l,:c) ON CONFLICT DO NOTHING"), {'l': int(upper['id']), 'c': cid})
+        for cid in relegated:
+            await session.execute(text("INSERT INTO league_teams(league_id,club_id) VALUES(:l,:c) ON CONFLICT DO NOTHING"), {'l': int(lower['id']), 'c': cid})
+        await session.execute(text("""
+            UPDATE season_history SET promoted_club_ids=CAST(:p AS jsonb),relegated_club_ids=CAST(:r AS jsonb)
+            WHERE league_id=:l AND season_id=:s
+        """), {'p': json.dumps(promoted), 'r': json.dumps(relegated), 'l': int(lower['id']), 's': season_id})
+        await session.execute(text("""
+            UPDATE season_history SET promoted_club_ids=CAST(:p AS jsonb),relegated_club_ids=CAST(:r AS jsonb)
+            WHERE league_id=:l AND season_id=:s
+        """), {'p': json.dumps(relegated), 'r': json.dumps(promoted), 'l': int(upper['id']), 's': season_id})
+
+
+async def _apply_player_settlement(session, season_id):
+    await session.execute(text("""
+        INSERT INTO player_season_state(player_id,season_id,aged,development_applied,contract_processed,reward_claimed)
+        SELECT cp.player_id,:s,FALSE,FALSE,FALSE,FALSE FROM club_players cp
+        ON CONFLICT(player_id,season_id) DO NOTHING
+    """), {'s': season_id})
+    await session.execute(text("""
+        UPDATE players p SET age=LEAST(40,p.age+1)
+        WHERE EXISTS (SELECT 1 FROM player_season_state ps WHERE ps.player_id=p.id AND ps.season_id=:s AND ps.aged=FALSE)
+    """), {'s': season_id})
+    await session.execute(text("UPDATE player_season_state SET aged=TRUE,development_applied=TRUE WHERE season_id=:s AND aged=FALSE"), {'s': season_id})
+    await session.execute(text("""
+        UPDATE club_players cp SET
+            contract_until=GREATEST(COALESCE(cp.contract_until,CURRENT_DATE),CURRENT_DATE)+INTERVAL '1 year',
+            contract_salary=COALESCE(cp.contract_salary,(SELECT p.salary FROM players p WHERE p.id=cp.player_id))
+        WHERE cp.contract_until IS NULL OR cp.contract_until<=CURRENT_DATE+INTERVAL '180 days'
+          AND EXISTS (SELECT 1 FROM player_season_state ps WHERE ps.player_id=cp.player_id AND ps.season_id=:s AND ps.contract_processed=FALSE)
+    """), {'s': season_id})
+    await session.execute(text("UPDATE player_season_state SET contract_processed=TRUE WHERE season_id=:s AND contract_processed=FALSE"), {'s': season_id})
+
+
+async def _settle_rewards(session, leagues, season_id):
+    from app.services import settle_season_prizes, apply_season_reputation
+    for league in leagues:
+        lid = int(league['id'])
+        await apply_season_reputation(session, lid)
+        await settle_season_prizes(session, lid)
+    # Prize settlement is guarded by the financial transaction marker; this flag
+    # records that the player-side reward checkpoint has also been completed.
+    await session.execute(text("UPDATE player_season_state SET reward_claimed=TRUE WHERE season_id=:s AND reward_claimed=FALSE"), {'s': season_id})
+
+
+async def run_season_end(session, season_id: int | None = None) -> bool:
+    season = (await session.execute(text("SELECT id,season_number,state FROM seasons WHERE id=COALESCE(:s,(SELECT id FROM seasons ORDER BY id DESC LIMIT 1)) FOR UPDATE"), {'s': season_id})).mappings().first()
+    if not season or season['state'] not in (SeasonState.ACTIVE.value, SeasonState.SEASON_END.value):
+        return False
+    season_id = int(season['id'])
+    if season['state'] == SeasonState.ACTIVE.value:
+        await session.execute(text("UPDATE seasons SET state='SEASON_END',ended_at=COALESCE(ended_at,CAST(:now AS timestamptz)) WHERE id=:s"), {'s': season_id, 'now': datetime.now(timezone.utc)})
+    leagues = (await session.execute(text("""
+        SELECT id,name,tier,season_number,season_id FROM leagues
+        WHERE season_id=:s AND name NOT LIKE 'FM27 Quick Test%' ORDER BY tier,id FOR UPDATE
+    """), {'s': season_id})).mappings().all()
+    standings = {int(l['id']): await _snapshot_league(session, int(l['id']), season_id) for l in leagues}
+    await _settle_rewards(session, leagues, season_id)
+    await _apply_promotion_relegation(session, leagues, standings, season_id)
+    await _apply_player_settlement(session, season_id)
+    champion = None
+    for tier in ('LEGEND','ELITE','DIAMOND','GOLD','SILVER','BRONZE','ROOKIE'):
+        top = next((standings[int(l['id'])][0] for l in leagues if str(l['tier'] or '').upper() == tier and standings.get(int(l['id']))), None)
+        if top:
+            champion = int(top['club_id']); break
+    now = datetime.now(timezone.utc)
+    await session.execute(text("UPDATE seasons SET champion_club_id=:c,state='OFFSEASON',offseason_at=COALESCE(offseason_at,CAST(:now AS timestamptz)),preseason_at=COALESCE(preseason_at,CAST(:until AS timestamptz)) WHERE id=:s"),
+                          {'c': champion, 's': season_id, 'now': now, 'until': now + timedelta(days=3)})
+    from app.game.event_queue import queue_event
+    await queue_event(session, 'CONTRACT_WINDOW_OPEN', now, {'season_id': season_id})
+    return True
+
+
+async def advance_contract_window(session, force=False):
+    season = (await session.execute(text("SELECT id,state,preseason_at FROM seasons ORDER BY id DESC LIMIT 1 FOR UPDATE"))).mappings().first()
+    if not season or season['state'] != SeasonState.CONTRACT_WINDOW.value:
+        return False
+    if not force and season['preseason_at'] is not None and season['preseason_at'] > datetime.now(timezone.utc):
+        return False
+    await start_new_season(session, int(season['id']))
+    return True
+
+
+
+
+async def ensure_initial_season(session) -> int:
+    """Create the first PRESEASON record when a fresh/reset database has none."""
+    existing = (await session.execute(text("SELECT id FROM seasons ORDER BY id DESC LIMIT 1"))).scalar_one_or_none()
+    if existing is not None:
+        return int(existing)
+    seed = new_season_seed()
+    sequence_id = int((await session.execute(text("""
+        INSERT INTO season_sequences(root_seed, current_season_id)
+        VALUES(:seed, NULL) RETURNING id
+    """), {"seed": seed})).scalar_one())
+    season_id = int((await session.execute(text("""
+        INSERT INTO seasons(sequence_id, season_number, state, season_seed, started_at)
+        VALUES(:seq, 1, 'PRESEASON', :seed, CAST(:now AS timestamptz)) RETURNING id
+    """), {"seq": sequence_id, "seed": seed, "now": datetime.now(timezone.utc)})).scalar_one())
+    await session.execute(text("UPDATE season_sequences SET current_season_id=:s WHERE id=:seq"),
+                          {"s": season_id, "seq": sequence_id})
+    await session.execute(text("""
+        UPDATE leagues SET season_id=:s, season_number=1, season_state='PRESEASON'
+        WHERE season_id IS NULL
+    """), {"s": season_id})
+    return season_id
+
+
+async def start_new_season(session, previous_season_id: int | None = None) -> int:
+    """Create a season and all fixtures atomically within the caller transaction."""
+    async with session.begin_nested():
+        return await _start_new_season_in_transaction(session, previous_season_id)
+
+
+async def _start_new_season_in_transaction(session, previous_season_id: int | None = None) -> int:
+    previous = None
+    if previous_season_id is not None:
+        previous = (await session.execute(text("SELECT id,sequence_id,season_number FROM seasons WHERE id=:s"), {'s': previous_season_id})).mappings().first()
+    else:
+        previous = (await session.execute(text("SELECT id,sequence_id,season_number FROM seasons ORDER BY id DESC LIMIT 1"))).mappings().first()
+    if not previous:
+        raise ValueError('Cannot start a new season without an existing season sequence')
+    previous_season_id = int(previous['id'])
+    sequence_id = int(previous['sequence_id'])
+    next_number = int(previous['season_number']) + 1
+    now = datetime.now(MSK)
+    seed = new_season_seed()
+    new_id = int((await session.execute(text("""
+        INSERT INTO seasons(sequence_id,season_number,state,season_seed,started_at)
+        VALUES(:seq,:n,'PRESEASON',:seed,CAST(:started AS timestamptz)) RETURNING id
+    """), {'seq': sequence_id, 'n': next_number, 'seed': seed, 'started': now})).scalar_one())
+    old_league_ids=[int(x) for x in (await session.execute(text(
+        "SELECT id FROM leagues WHERE season_id=:old OR (season_id IS NULL AND season_number=:n) ORDER BY id FOR UPDATE"
+    ), {'old': previous_season_id, 'n': int(previous['season_number'])})).scalars().all()]
+    # Remove old season competitions and their match links before deleting its
+    # fixtures. This is required by the actual FK graph (cup/CL match links use
+    # ON DELETE SET NULL; snapshots intentionally remain immutable history).
+    await session.execute(text("DELETE FROM cup_matches WHERE cup_id IN (SELECT id FROM cups WHERE season_id=:old OR season=:n)"),
+                          {'old': previous_season_id, 'n': int(previous['season_number'])})
+    await session.execute(text("DELETE FROM cups WHERE season_id=:old OR season=:n"),
+                          {'old': previous_season_id, 'n': int(previous['season_number'])})
+    await session.execute(text("DELETE FROM champions_matches WHERE cl_id IN (SELECT id FROM champions_league WHERE season_id=:old OR season=:n)"),
+                          {'old': previous_season_id, 'n': int(previous['season_number'])})
+    await session.execute(text("DELETE FROM champions_groups WHERE cl_id IN (SELECT id FROM champions_league WHERE season_id=:old OR season=:n)"),
+                          {'old': previous_season_id, 'n': int(previous['season_number'])})
+    await session.execute(text("DELETE FROM champions_league WHERE season_id=:old OR season=:n"),
+                          {'old': previous_season_id, 'n': int(previous['season_number'])})
+    # Remove queued events that reference old fixtures before those fixtures are deleted.
+    await session.execute(text("DELETE FROM season_events WHERE season_id=:old"), {'old': previous_season_id})
+    if old_league_ids:
+        await session.execute(text("DELETE FROM matches WHERE season_id=:old OR league_id=ANY(:leagues)"),
+                              {'old': previous_season_id, 'leagues': old_league_ids})
+    else:
+        await session.execute(text("DELETE FROM matches WHERE season_id=:old"), {'old': previous_season_id})
+    await session.execute(text("DELETE FROM club_season_finances WHERE league_id=ANY(:leagues)"),
+                          {'leagues': old_league_ids or [-1]})
+    if old_league_ids:
+        await session.execute(text("""
+            UPDATE leagues SET season_id=:new,season_number=:n,season_state='PRESEASON',status='ACTIVE',current_round=1,total_rounds=30,finished_at=NULL
+            WHERE id=ANY(:league_ids)
+        """), {'new': new_id, 'n': next_number, 'league_ids': old_league_ids})
+    from app.game.league import round_robin
+    from app.game.calendar import get_next_free_date
+    from app.game.event_queue import queue_event
+    # Use a stable evening kickoff instead of inheriting the arbitrary hour/minute
+    # at which an administrator happened to start the season.
+    schedule_start = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    if schedule_start <= now:
+        schedule_start += timedelta(days=1)
+    for league in (await session.execute(text("SELECT id FROM leagues WHERE season_id=:s AND name NOT LIKE 'FM27 Quick Test%' ORDER BY id"), {'s': new_id})).mappings().all():
+        lid = int(league['id'])
+        clubs = [int(x) for x in (await session.execute(text("SELECT club_id FROM league_teams WHERE league_id=:l ORDER BY club_id"), {'l': lid})).scalars().all()]
+        if len(clubs) < 16:
+            from app.services import create_test_bot_club
+            while len(clubs) < 16:
+                bot_id, _ = await create_test_bot_club(session)
+                await session.execute(text("INSERT INTO league_teams(league_id,club_id) VALUES(:l,:c) ON CONFLICT DO NOTHING"), {'l': lid, 'c': bot_id})
+                clubs.append(int(bot_id))
+        clubs = clubs[:16]
+        await session.execute(text("DELETE FROM matches WHERE league_id=:l AND season_id=:s"), {'l': lid, 's': new_id})
+        await session.execute(text("UPDATE league_teams SET played=0,wins=0,draws=0,losses=0,goals_for=0,goals_against=0,points=0 WHERE league_id=:l"), {'l': lid})
+        for fixture in round_robin(clubs, True):
+            kickoff = schedule_start + timedelta(days=(fixture.round_no - 1) * 2)
+            kickoff = await get_next_free_date(session, kickoff, (fixture.home_club_id, fixture.away_club_id), priority=0)
+            if not isinstance(kickoff, datetime):
+                kickoff = datetime.combine(kickoff, time(20, 0), tzinfo=now.tzinfo)
+            match_id = int((await session.execute(text("""
+                INSERT INTO matches(season_id,league_id,round,home_club_id,away_club_id,seed,competition_type,scheduled_at)
+                VALUES(:s,:l,:r,:h,:a,0,'LEAGUE',CAST(:k AS timestamptz)) RETURNING id
+            """), {'s': new_id, 'l': lid, 'r': fixture.round_no, 'h': fixture.home_club_id, 'a': fixture.away_club_id, 'k': kickoff})).scalar_one())
+            await session.execute(text("UPDATE matches SET seed=:seed WHERE id=:m"), {'seed': deterministic_match_seed(seed, match_id), 'm': match_id})
+            await queue_event(session, 'MATCH_LEAGUE', kickoff, {'season_id': new_id, 'league_id': lid, 'match_id': match_id})
+        await session.execute(text("UPDATE leagues SET season_state='ACTIVE',started_at=CAST(:started AS timestamptz) WHERE id=:l"), {'started': now, 'l': lid})
+    # Recreate the global competitions for the same persistent season.
+    active_league = (await session.execute(text("SELECT id FROM leagues WHERE season_id=:s AND name NOT LIKE 'FM27 Quick Test%' ORDER BY id LIMIT 1"), {'s': new_id})).scalar_one_or_none()
+    if active_league is not None:
+        from app.game.cup import start_cup_for_league
+        cup_id = await start_cup_for_league(session, int(active_league), season_id=new_id)
+        await session.execute(text("UPDATE matches SET season_id=:s WHERE competition_type='CUP' AND id IN (SELECT match_id FROM cup_matches WHERE cup_id=:c)"), {'s':new_id,'c':int(cup_id)})
+        from app.game.champions_league import start_champions_league
+        cl_id = await start_champions_league(session, season_id=next_number)
+        await session.execute(text("UPDATE champions_league SET season_id=:s WHERE id=:c"), {'s':new_id,'c':int(cl_id)})
+        await session.execute(text("UPDATE matches SET season_id=:s WHERE competition_type='CHAMPIONS' AND id IN (SELECT match_id FROM champions_matches WHERE cl_id=:c)"), {'s':new_id,'c':int(cl_id)})
+    await session.execute(text("UPDATE seasons SET state='ACTIVE' WHERE id=:s"), {'s': new_id})
+    await session.execute(text("UPDATE season_sequences SET current_season_id=:s WHERE id=:seq"), {'s': new_id, 'seq': sequence_id})
+    return new_id
+
+
+async def handle_season_event(session, event_type, payload):
+    if event_type == 'CONTRACT_WINDOW_OPEN':
+        await session.execute(text("UPDATE seasons SET state='CONTRACT_WINDOW' WHERE id=:s AND state='OFFSEASON'"), {'s':int(payload['season_id'])})
+    elif event_type == 'CONTRACT_WINDOW_CLOSE':
+        await advance_contract_window(session, force=True)
+    elif event_type == 'SEASON_END':
+        await run_season_end(session, int(payload.get('season_id')) if payload.get('season_id') else None)
+    elif event_type == 'SEASON_START':
+        await advance_contract_window(session, force=True)
+
+
+async def advance_finished_leagues(session) -> list[int]:
+    return [await start_new_season(session)]
+
+====================================================================================================
+FILE: migrations/066_manager_profile.sql
+====================================================================================================
+ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS manager_name TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_users_manager_name
+    ON users(manager_name)
+    WHERE manager_name IS NOT NULL;
+
+====================================================================================================
+FILE: mini_app/src/api.ts
+====================================================================================================
+export type Club = {
+  id: number; name: string; short_name?: string; budget: number;
+  stadium_name?: string; stadium_level?: number; fans?: number; reputation?: number;
+  squad_size?: number; emblem_shape?: string; emblem_color?: string; emblem_symbol?: string;
+};
+export type Player = {
+  id: number; first_name: string; last_name: string; position: string; overall: number;
+  fitness: number; morale: number; is_injured: boolean; portrait_url?: string | null; age?: number;
+};
+export type MatchEvent = { id: number; minute: number; event_type: string; club_id?: number; player_id?: number; description: string; metadata?: unknown };
+export type LiveMatch = { id: number; home_club_id: number; away_club_id: number; home_name: string; away_name: string; home_score: number; away_score: number; status: string; current_minute?: number | null; competition_type?: string; is_test?: boolean; events: MatchEvent[]; scheduled_at?: string | null; started_at?: string | null; competition_name?: string | null };
+export type NextMatch = LiveMatch & { started_at?: string | null; scheduled_at?: string | null; competition_name?: string | null };
+export type LeagueTableRow = { id: number; name: string; played: number; wins: number; draws: number; losses: number; goals_for: number; goals_against: number; points: number };
+export type LeagueResponse = { league_id?: number | null; league_name?: string | null; table: LeagueTableRow[] };
+
+export const TELEGRAM_REQUIRED_MESSAGE = 'Откройте приложение из Telegram';
+
+function initData(): string {
+  const tg = (window as any).Telegram?.WebApp;
+  return typeof tg?.initData === 'string' ? tg.initData.trim() : '';
+}
+
+export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const telegramInitData = initData();
+  // Do not send unauthenticated API requests when opened in a normal browser.
+  if (!telegramInitData) throw new Error(TELEGRAM_REQUIRED_MESSAGE);
+
+  const headers = new Headers(options.headers);
+  headers.set('Accept', 'application/json');
+  headers.set('X-Telegram-Init-Data', telegramInitData);
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  let response: Response;
+  try { response = await fetch(path, { ...options, headers }); }
+  catch { throw new Error('Не удалось связаться с сервером. Проверь интернет и попробуй снова.'); }
+  if (!response.ok) {
+    let message = `Ошибка API (${response.status})`;
+    try { const data = await response.json(); if (data?.detail) message = String(data.detail); } catch { /* non-JSON error */ }
+    throw new Error(message);
+  }
+  return response.json() as Promise<T>;
+}
+
+export const getClub = (clubId: number) => api<Club>(`/api/club/${clubId}`);
+export const getSquad = (clubId: number) => api<{ players: Player[] }>(`/api/squad/${clubId}`);
+export const getLiveMatches = () => api<{ matches: LiveMatch[] }>('/api/matches/live');
+export const getNextMatch = () => api<{ match: NextMatch | null }>('/api/matches/next');
+export const getTactics = (clubId: number) => api<Record<string, string | number>>(`/api/tactics/${clubId}`);
+export const saveTactics = (clubId: number, data: Record<string, string | number>) => api(`/api/tactics/${clubId}`, { method: 'POST', body: JSON.stringify(data) });
+export const bidForPlayer = (playerId: number) => api<{ status: string; player_id: number; price: number; offer_id?: number }>('/api/transfers/bid', { method: 'POST', body: JSON.stringify({ player_id: playerId }) });
+export const getLeague = () => api<LeagueResponse>('/api/league');
+
+export type Me = { telegram_id: number; user_id: number; club_id: number | null; club_name: string | null; first_name?: string | null; username?: string | null };
+export const getMe = () => api<Me>("/api/me");
+export type CreateClubInput = { name: string; emblem_shape: string; emblem_color: string; emblem_symbol: string };
+export const createClub = (data: CreateClubInput) => api<{ status: string; club_id: number; name: string; emblem_shape: string; emblem_color: string; emblem_symbol: string }>("/api/club/create", { method: "POST", body: JSON.stringify(data) });
+
+export type MarketPlayer = {
+  id: number; first_name: string; last_name: string; position: string; age: number;
+  market_value: number; potential: number; overall?: number; nationality?: string;
+  rarity?: string; seller_club_id?: number | null; listing_id?: number | null;
+  asking_price: number; minimum_price?: number; is_listed?: boolean;
+};
+export type TransferListingsResponse = { club_id: number; listings: MarketPlayer[] };
+export type ScoutRecommendationsResponse = { recommendations: MarketPlayer[] };
+export type Fixture = { id: number; round: number; home_club_id: number; away_club_id: number; home_name: string; away_name: string; home_score: number | null; away_score: number | null; status: string; scheduled_at?: string | null; competition_type?: string | null; competition_name?: string | null };
+export type FixturesResponse = { fixtures: Fixture[] };
+export type TrainingToday = { focus: string; intensity: string; last_training_at?: string | null; squad_size: number; avg_fitness: number };
+export type AcademyYouth = { id: number; first_name: string; last_name: string; position: string; age: number; potential: number; overall: number; rarity?: string };
+export type LineupPlayer = Player & { form?: number; suspension_matches?: number; pace?: number; shooting?: number; passing?: number; dribbling?: number; defending?: number; physical?: number; stamina?: number; mental?: number };
+export type StartingLineup = { formation: string; players: LineupPlayer[]; starting_ids: number[] };
+export type LineupSaveResponse = { status: string; starting_ids: number[]; formation?: string };
+export type ManagerProfileResponse = { status: string; manager_name: string };
+export type EmblemUpdateResponse = { status: string; emblem_shape: string; emblem_color: string; emblem_symbol: string };
+export type Pack = { id: number; name: string; price_coins: number; price_stars: number; min_ovr: number; max_ovr: number };
+export type StadiumInfo = { name: string; level: number; capacity: number; fans: number; ticket_price: number; upgrade_cost: number | null; budget: number };
+export const getTransferListings = () => api<TransferListingsResponse>('/api/transfers/listings');
+export const getScoutRecommendations = () => api<ScoutRecommendationsResponse>('/api/scout/recommendations');
+export const getFixtures = () => api<FixturesResponse>('/api/league/fixtures');
+export const getTrainingToday = () => api<TrainingToday>('/api/training/today');
+export const completeTraining = () => api<{ status: string; remaining_seconds?: number; players_trained: number; batch_id?: string | null }>('/api/training/complete', { method: 'POST' });
+export const getAcademyYouth = () => api<{ youth: AcademyYouth[]; academy_level?: number; max_overall?: number; capacity?: number }>('/api/academy/youth');
+export const promoteYouth = (id: number) => api<{ status: string; player_id: number; name: string }>('/api/academy/promote', { method: 'POST', body: JSON.stringify({ id }) });
+export const getPacks = () => api<{ packs: Pack[] }>('/api/packs/list');
+export const openPack = (id: number) => api<{ status: string; pack_name: string; name: string; position: string; ovr: number; rarity: string; price_coins: number }>('/api/packs/open', { method: 'POST', body: JSON.stringify({ id }) });
+export const getStadiumInfo = () => api<StadiumInfo>('/api/stadium/info');
+export const upgradeStadium = () => api<{ status: string; level: number; cost: number; capacity: number }>('/api/stadium/upgrade', { method: 'POST' });
+
+
+export type TransferOffer = {
+  id: number; amount: number; status: string; created_at: string; player_id: number;
+  player_name: string; position: string; age: number; buyer_club_name: string;
+  seller_club_name?: string | null; is_incoming: boolean;
+};
+export type TransferHistoryItem = {
+  id: number; player_id: number; player_name: string; price: number;
+  created_at: string; from_club_name?: string | null; to_club_name?: string | null;
+};
+export type ScoutReport = {
+  player: Pick<MarketPlayer, 'id' | 'first_name' | 'last_name' | 'position' | 'age' | 'market_value' | 'potential' | 'overall' | 'nationality' | 'rarity'>;
+  strengths: { attribute: string; value: number }[];
+  weaknesses: { attribute: string; value: number }[];
+  potential_gap: number;
+  recommendation: string;
+};
+export const getTransferOffers = () => api<{ offers: TransferOffer[] }>('/api/transfers/offers');
+export const getTransferHistory = () => api<{ transfers: TransferHistoryItem[] }>('/api/transfers/history');
+export const getScoutReport = (playerId: number) => api<ScoutReport>(`/api/scout/report/${playerId}`);
+
+export const acceptTransferOffer = (offerId: number) => api<{ status: string; offer_id: number; player_id: number; amount: number }>('/api/transfers/offers/accept', { method: 'POST', body: JSON.stringify({ offer_id: offerId }) });
+export const rejectTransferOffer = (offerId: number) => api<{ status: string; offer_id: number }>('/api/transfers/offers/reject', { method: 'POST', body: JSON.stringify({ offer_id: offerId }) });
+
+export const getStartingLineup = () => api<StartingLineup>('/api/lineup');
+export const autoSelectStartingLineup = () => api<LineupSaveResponse>('/api/lineup/autoselect', { method: 'POST' });
+export const saveStartingLineup = (player_ids: number[], formation?: string) => api<LineupSaveResponse>('/api/lineup', { method: 'POST', body: JSON.stringify({ player_ids, formation }) });
+export const updateManagerProfile = (manager_name: string) => api<ManagerProfileResponse>('/api/manager/profile', { method: 'POST', body: JSON.stringify({ manager_name }) });
+export const updateClubEmblem = (data: { emblem_shape: string; emblem_color: string; emblem_symbol: string }) => api<EmblemUpdateResponse>('/api/club/emblem', { method: 'POST', body: JSON.stringify(data) });
+
+export type LineupRecommendation = { formation: string; starting_ids: number[]; reason: string; source: string };
+export const getLineupRecommendation = () => api<LineupRecommendation>('/api/lineup/recommendation');
+
+====================================================================================================
+FILE: mini_app/src/ClubScreen.tsx
+====================================================================================================
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import './style.css';
+import {
+  getClub, getSquad, getNextMatch, getLeague, getTactics, saveTactics,
+  getTransferListings, bidForPlayer, getScoutRecommendations, getFixtures, getTransferOffers, getTransferHistory, getScoutReport, acceptTransferOffer, rejectTransferOffer,
+  getTrainingToday, completeTraining, getAcademyYouth, promoteYouth,
+  getPacks, openPack, getStadiumInfo, upgradeStadium,
+  getStartingLineup, autoSelectStartingLineup, saveStartingLineup, getLineupRecommendation, updateManagerProfile, updateClubEmblem,
+  type Club, type Player, type NextMatch, type LeagueResponse, type MarketPlayer,
+  type Fixture, type TrainingToday, type AcademyYouth, type Pack, type StadiumInfo, type TransferOffer, type TransferHistoryItem, type ScoutReport, type LineupPlayer,
+} from './api';
+import MatchCanvas from './components/MatchCanvas';
+import ClubEmblem from './components/ClubEmblem';
+
+type Page = 'home'|'team'|'tactics'|'squad'|'lineup'|'profile'|'match'|'transfers'|'training'|'league'|'stadium'|'academy'|'scout'|'packs';
+const nav: {id: Page; icon: string; label: string}[] = [
+  {id:'home',icon:'⌂',label:'Главная'}, {id:'team',icon:'♟',label:'Команда'},
+  {id:'match',icon:'⚽',label:'Матчи'}, {id:'transfers',icon:'⇄',label:'Рынок'}, {id:'league',icon:'🏆',label:'Ещё'},
+];
+const money = (n?: number | null) => n == null ? '—' : '€' + new Intl.NumberFormat('ru-RU').format(n);
+const validDate = (value?: string | null) => { if (!value) return null; const d = new Date(value); return Number.isNaN(d.getTime()) ? null : d; };
+const dateText = (value?: string | null) => { const d = validDate(value); return d ? d.toLocaleString('ru-RU',{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'}) : 'Дата не назначена'; };
+const dateKey = (value?: string | null) => { const d = validDate(value); return d ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}` : 'undated'; };
+const errorText = (e: unknown) => e instanceof Error ? e.message : 'Не удалось загрузить данные. Попробуйте ещё раз.';
+
+export default function ClubScreen({club: initialClub, managerName: initialManagerName='Менеджер'}:{club:Club;managerName?:string}) {
+  const [page,setPage] = useState<Page>('home');
+  const [club,setClub] = useState<Club>(initialClub);
+  const [managerName,setManagerName] = useState(initialManagerName);
+  const [managerDraft,setManagerDraft] = useState(initialManagerName);
+  const [emblemShape,setEmblemShape] = useState(initialClub.emblem_shape||'shield');
+  const [emblemColor,setEmblemColor] = useState(initialClub.emblem_color||'blue');
+  const [emblemSymbol,setEmblemSymbol] = useState(initialClub.emblem_symbol||'ball');
+  const [lineupPlayers,setLineupPlayers] = useState<LineupPlayer[]>([]);
+  const [startingIds,setStartingIds] = useState<number[]>([]);
+  const [lineupFormation,setLineupFormation] = useState('4-3-3');
+  const [lineupReason,setLineupReason] = useState('');
+  const [academyLevel,setAcademyLevel] = useState(1);
+  const preserveLineupSelection = useRef(false);
+  const [players,setPlayers] = useState<Player[]>([]);
+  const [nextMatch,setNextMatch] = useState<NextMatch|null>(null);
+  const [league,setLeague] = useState<LeagueResponse|null>(null);
+  const [market,setMarket] = useState<MarketPlayer[]>([]);
+  const [offers,setOffers] = useState<TransferOffer[]>([]);
+  const [transferHistory,setTransferHistory] = useState<TransferHistoryItem[]>([]);
+  const [scoutReport,setScoutReport] = useState<ScoutReport|null>(null);
+  const [scout,setScout] = useState<MarketPlayer[]>([]);
+  const [fixtures,setFixtures] = useState<Fixture[]>([]);
+  const [training,setTraining] = useState<TrainingToday|null>(null);
+  const [youth,setYouth] = useState<AcademyYouth[]>([]);
+  const [packs,setPacks] = useState<Pack[]>([]);
+  const [stadium,setStadium] = useState<StadiumInfo|null>(null);
+  const [loading,setLoading] = useState(false);
+  const [error,setError] = useState('');
+  const [toast,setToast] = useState('');
+  const [filter,setFilter] = useState('Все');
+  const [transferTab,setTransferTab] = useState('Рынок');
+  const [formation,setFormation] = useState('4-3-3');
+  const [tactics,setTactics] = useState<Record<string,string|number>>({formation:'4-3-3',style:'BALANCE',tempo:50,pressing:50,width:50,defensive_line:50,aggression:50});
+  const [busyId,setBusyId] = useState<number|null>(null);
+  const [lastPackResult,setLastPackResult] = useState('');
+  const [trainingResult,setTrainingResult] = useState('');
+
+  const notify = (message:string) => { setToast(message); window.setTimeout(()=>setToast(''),3500); };
+  const go = (p:Page) => { setPage(p); setError(''); };
+  const refreshClub = useCallback(async () => {
+    const [clubData,squadData,leagueData] = await Promise.all([getClub(initialClub.id),getSquad(initialClub.id),getLeague()]);
+    setClub(clubData); setPlayers(squadData.players); setLeague(leagueData);
+  },[initialClub.id]);
+
+  const loadPage = useCallback(async (target:Page) => {
+    setLoading(true); setError('');
+    try {
+      if (target==='home'||target==='team'||target==='squad') {
+        const tasks = await Promise.allSettled([getClub(initialClub.id),getSquad(initialClub.id),getLeague(),getNextMatch()]);
+        if (tasks[0].status==='fulfilled') setClub(tasks[0].value);
+        if (tasks[1].status==='fulfilled') setPlayers(tasks[1].value.players);
+        if (tasks[2].status==='fulfilled') setLeague(tasks[2].value);
+        if (tasks[3].status==='fulfilled') setNextMatch(tasks[3].value.match);
+        const failed=tasks.find(t=>t.status==='rejected'); if(failed&&failed.status==='rejected') throw failed.reason;
+      } else if(target==='tactics') { const [t,c] = await Promise.all([getTactics(initialClub.id),getClub(initialClub.id)]); setTactics(t); setClub(c); }
+      else if(target==='transfers') { const [r,o,h,sr]=await Promise.all([getTransferListings(),getTransferOffers(),getTransferHistory(),getScoutRecommendations()]); setMarket(r.listings); setOffers(o.offers); setTransferHistory(h.transfers); setScout(sr.recommendations); }
+      else if(target==='scout') { const r=await getScoutRecommendations(); setScout(r.recommendations); }
+      else if(target==='league') { const [l,f]=await Promise.all([getLeague(),getFixtures()]); setLeague(l); setFixtures(f.fixtures); }
+      else if(target==='training') { setTraining(await getTrainingToday()); }
+      else if(target==='academy') { const r=await getAcademyYouth(); setYouth(r.youth); setAcademyLevel(r.academy_level||1); }
+      else if(target==='lineup') { const r=await getStartingLineup(); setLineupPlayers(r.players); if(preserveLineupSelection.current){preserveLineupSelection.current=false;}else{setStartingIds(r.starting_ids);setLineupFormation(r.formation);} }
+      else if(target==='profile') { setManagerDraft(managerName); setEmblemShape(club.emblem_shape||'shield'); setEmblemColor(club.emblem_color||'blue'); setEmblemSymbol(club.emblem_symbol||'ball'); }
+      else if(target==='packs') { setPacks((await getPacks()).packs); }
+      else if(target==='stadium') { setStadium(await getStadiumInfo()); }
+      else if(target==='match') { setNextMatch((await getNextMatch()).match); }
+      else if(target==='tactics') { setTactics(await getTactics(initialClub.id)); }
+    } catch(e) { setError(errorText(e)); }
+    finally { setLoading(false); }
+  },[initialClub.id]);
+
+  useEffect(()=>{void loadPage(page);},[page,loadPage]);
+  useEffect(()=>{const timer=window.setInterval(()=>{getNextMatch().then(r=>setNextMatch(r.match)).catch(()=>{});},5000);return()=>window.clearInterval(timer);},[]);
+
+  const Header=({title,back=true}:{title:string;back?:boolean})=><header>{back&&<button className="back" onClick={()=>go('home')}>‹</button>}<div><small>FOOTBALL MANAGER</small><h1>{title}</h1></div><span className="coin">{money(club.budget)}</span></header>;
+  const Card=({children,cls=''}:{children:React.ReactNode;cls?:string})=><section className={'card '+cls}>{children}</section>;
+  const Button=({children,onClick,secondary=false,disabled=false}:{children:React.ReactNode;onClick:()=>void;secondary?:boolean;disabled?:boolean})=><button className={secondary?'btn secondary':'btn'} disabled={disabled} onClick={onClick}>{children}</button>;
+  const reload=()=>void loadPage(page);
+  const buy=async(p:MarketPlayer)=>{setBusyId(p.id);setError('');try{const result=await bidForPlayer(p.id);notify(result.status==='offer_submitted'?`Предложение отправлено: ${money(result.price)}`:`Игрок приобретён за ${money(result.price)}`);await Promise.all([loadPage('transfers'),refreshClub()]);}catch(e){setError(errorText(e));}finally{setBusyId(null);}};
+  const playerName=(p:{first_name:string;last_name:string})=>`${p.first_name} ${p.last_name}`.trim();
+  const MarketRows=({rows,scouting=false}:{rows:MarketPlayer[];scouting?:boolean})=>rows.length?rows.map(p=><div className="market-row" key={p.id}><div className="avatar large player-placeholder">👤</div><div className="player-info"><b>{playerName(p)}</b><small>{p.position} · {p.age} лет · OVR {p.overall??'—'}</small><small>Потенциал {p.potential} · {money(p.asking_price||p.market_value)}</small></div><Button disabled={busyId===p.id} onClick={()=>scouting?void loadScoutReport(p):void buy(p)}>{scouting?'Отчёт':p.is_listed?'Предложить':'Купить'}</Button></div>):<p className="muted">{loading?'Загрузка…':'Нет доступных игроков.'}</p>;
+  const loadScoutReport=async(p:MarketPlayer)=>{setBusyId(p.id);setError('');try{setScoutReport(await getScoutReport(p.id));}catch(e){setError(errorText(e));}finally{setBusyId(null);}};
+
+  return <div className="app-shell"><div className="topline"><span>{new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}</span><span>FOOTBALL MANAGER</span></div>
+    {page==='home'&&<><div className="brand"><span className="ball">⚽</span><b>Football Manager</b><button onClick={()=>go('league')}>☰</button></div><Card cls="profile"><div className="manager">👨🏻‍💼</div><div><b>{managerName}</b><small>Менеджер клуба</small><strong><ClubEmblem shape={club.emblem_shape} color={club.emblem_color} symbol={club.emblem_symbol} size={28}/> {club.name}</strong><small>{league?.league_name||'Лига не назначена'}</small><button className="text-action" onClick={()=>go('profile')}>Изменить профиль и эмблему →</button></div></Card><div className="stats"><div><small>Репутация</small><b>{club.reputation??'—'}</b></div><div><small>Бюджет</small><b>{money(club.budget)}</b></div><div><small>Болельщики</small><b>{club.fans??'—'}</b></div></div><div className="tiles">{[['⚽','Матчи','match'],['♟','Команда','team'],['⇄','Трансферы и скаутинг','transfers'],['⚒','Тренировки','training'],['🏆','Лиги','league'],['🏟','Стадион','stadium'],['🏫','Академия','academy'],['🎴','Паки','packs']].map(([icon,label,id])=><button className="tile" key={id} onClick={()=>go(id as Page)}><span>{icon}</span><b>{label}</b><small>Открыть</small></button>)}</div><Card><h3>Ближайший матч</h3>{nextMatch?<><b>{nextMatch.home_name} — {nextMatch.away_name}</b><p className="muted">{dateText(nextMatch.scheduled_at)} · {nextMatch.competition_name||nextMatch.status}</p></>:<p className="muted">{loading?'Загружаем расписание…':'Матч пока не назначен'}</p>}<Button onClick={()=>go('match')}>Открыть матч →</Button></Card></>}
+
+    {page==='team'&&<><Header title="Команда"/><div className="tabs"><button onClick={()=>go('squad')}>Все игроки</button><button onClick={()=>go('lineup')}>Стартовый состав</button><button onClick={()=>go('tactics')}>Тактика</button><button onClick={()=>go('training')}>Тренировки</button></div><Card><div className="clubhero"><div className="crest"><ClubEmblem shape={club.emblem_shape} color={club.emblem_color} symbol={club.emblem_symbol} size={52}/></div><div><h2>{club.name}</h2><small>{league?.league_name||'Лига не назначена'}</small></div></div><div className="teamstats"><div><small>Игроков</small><b>{players.length}</b></div><div><small>Стадион</small><b>{club.stadium_level??1} ур.</b></div><div><small>Репутация</small><b>{club.reputation??'—'}</b></div></div></Card><Card><h3>Состав</h3>{players.slice(0,5).map(p=><div className="player-row" key={p.id}><div className="avatar player-placeholder">👤</div><div className="player-info"><b>{p.first_name} {p.last_name}</b><small>{p.position} · {p.age??'—'} лет</small></div><strong className="rating">{p.overall}</strong></div>)}<Button onClick={()=>go('squad')}>Весь состав →</Button></Card></>}
+    {page==='squad'&&<><Header title="Состав"/><div className="lineup-actions"><Button onClick={()=>go('lineup')}>Стартовый состав</Button><Button secondary onClick={async()=>{setLoading(true);setError('');try{const r=await autoSelectStartingLineup();setStartingIds(r.starting_ids);setLineupFormation(r.formation||'4-3-3');notify('Автосостав рассчитан и сохранён');go('lineup');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>⚡ Автовыбор</Button><Button secondary onClick={async()=>{setLoading(true);setError('');try{const r=await getLineupRecommendation();setStartingIds(r.starting_ids);setLineupFormation(r.formation);setLineupReason(r.reason);preserveLineupSelection.current=true;notify('AI-рекомендация готова');go('lineup');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>🧠 Рекомендация</Button></div><div className="tabs">{['Все','Вратари','Защитники','Полузащитники','Нападающие'].map(x=><button className={filter===x?'active':''} key={x} onClick={()=>setFilter(x)}>{x}</button>)}</div><Card>{players.filter(p=>filter==='Все'||(filter==='Вратари'&&p.position==='GK')||(filter==='Защитники'&&['LB','CB','RB'].includes(p.position))||(filter==='Полузащитники'&&['DM','CM','AM'].includes(p.position))||(filter==='Нападающие'&&['LW','RW','ST'].includes(p.position))).map(p=><div className="player-row" key={p.id}><div className="avatar">{p.portrait_url&&/^https?:\/\//i.test(p.portrait_url)?<img src={p.portrait_url} alt=""/>:'👤'}</div><div className="player-info"><b>{p.first_name} {p.last_name}</b><small>{p.position} · {p.age??'—'} лет · форма {p.fitness}%</small></div><strong className="rating">{p.overall}</strong></div>)}{!players.length&&<p className="muted">{loading?'Загрузка состава…':'Состав пока пуст.'}</p>}</Card></>}
+    {page==='lineup'&&<><Header title="Стартовый состав"/><Card><div className="section-title"><h3>Стартовые 11</h3><span className="muted">{startingIds.length}/11</span></div><div className="lineup-pitch"><div className="lineup-halfline"/><div className="lineup-circle"/><div className="lineup-goal top"/><div className="lineup-goal bottom"/>{[...startingIds].map((id,index)=>{const p=lineupPlayers.find(x=>x.id===id);if(!p)return null;const rows:Record<string,number[]>={'GK':[50],'DEF':[18,39,61,82],'MID':[20,40,60,80],'ATT':[28,50,72]};const group=p.position==='GK'?'GK':['LB','CB','RB'].includes(p.position)?'DEF':['DM','CM','AM'].includes(p.position)?'MID':'ATT';const same=startingIds.map(x=>lineupPlayers.find(y=>y.id===x)).filter(x=>x&&((group==='GK'&&x.position==='GK')||(group==='DEF'&&['LB','CB','RB'].includes(x.position))||(group==='MID'&&['DM','CM','AM'].includes(x.position))||(group==='ATT'&&['LW','RW','ST'].includes(x.position))));const ix=same.findIndex(x=>x?.id===id);const y=group==='GK'?88:group==='DEF'?67:group==='MID'?43:18;return <div className="lineup-marker" key={id} style={{left:`${rows[group][Math.min(ix,rows[group].length-1)]??50}%`,top:`${y}%`}}><span>👤</span><b>{p.last_name}</b><small>{p.position} · {p.overall}</small></div>;})}</div><p className="muted">Расстановка {lineupFormation}. Выбирай игроков ниже; травмированные и дисквалифицированные отмечены отдельно.</p><div className="lineup-actions"><Button disabled={loading} onClick={async()=>{setLoading(true);setError('');try{const r=await autoSelectStartingLineup();setStartingIds(r.starting_ids);setLineupReason('Автосостав сохранён по рейтингу, позиции и доступности игроков.');notify('Автосостав сохранён');await loadPage('lineup');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>⚡ Автовыбор состава</Button><Button secondary disabled={loading} onClick={async()=>{setLoading(true);setError('');try{const r=await getLineupRecommendation();setStartingIds(r.starting_ids);setLineupFormation(r.formation);setLineupReason(r.reason);notify('Рекомендация состава готова');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>🧠 Рекомендация AI</Button></div>{lineupReason&&<div className="recommendation-note"><b>Рекомендация</b><p>{lineupReason}</p><Button disabled={startingIds.length!==11} onClick={async()=>{try{await saveStartingLineup(startingIds,lineupFormation);notify('Рекомендованный состав сохранён в базе');}catch(e){setError(errorText(e));}}}>Сохранить рекомендованный состав</Button></div>}</Card><Card><h3>Игроки команды</h3><p className="muted">Выбрано {startingIds.length} из 11. Нельзя выбрать одного игрока дважды.</p>{lineupPlayers.map(p=>{const selected=startingIds.includes(p.id);const unavailable=p.is_injured||Number(p.suspension_matches||0)>0;return <div className="player-row" key={p.id}><div className="avatar player-placeholder">{p.portrait_url&&/^https?:\/\//i.test(p.portrait_url)?<img src={p.portrait_url} alt=""/>:'👤'}</div><div className="player-info"><b>{p.first_name} {p.last_name}</b><small>{p.position} · OVR {p.overall} · форма {p.fitness}%</small>{unavailable&&<small className="unavailable">{p.is_injured?'Травмирован':'Дисквалификация'}</small>}</div><Button secondary disabled={unavailable||(!selected&&startingIds.length>=11)} onClick={()=>setStartingIds(ids=>selected?ids.filter(x=>x!==p.id):[...ids,p.id])}>{selected?'Убрать': 'В старт'}</Button></div>;})}<Button disabled={startingIds.length!==11||loading} onClick={async()=>{setLoading(true);setError('');try{await saveStartingLineup(startingIds,lineupFormation);notify('Стартовый состав сохранён в базе');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>Сохранить стартовый состав ({startingIds.length}/11)</Button></Card></>}
+    {page==='profile'&&<><Header title="Профиль менеджера"/><Card><h3>Менеджер</h3><label className="field-label">Имя менеджера</label><input className="club-name-input" value={managerDraft} maxLength={32} onChange={e=>setManagerDraft(e.target.value)} placeholder="Имя менеджера"/><Button disabled={loading||managerDraft.trim().length<2} onClick={async()=>{setLoading(true);setError('');try{const r=await updateManagerProfile(managerDraft.trim());setManagerName(r.manager_name);setManagerDraft(r.manager_name);notify('Имя менеджера сохранено');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>Сохранить имя</Button></Card><Card><h3>Эмблема клуба</h3><div className="crest-preview"><ClubEmblem shape={emblemShape} color={emblemColor} symbol={emblemSymbol} size={64}/><div><small>ПРЕДПРОСМОТР</small><b>{club.name}</b></div></div><label className="field-label">Форма</label><select value={emblemShape} onChange={e=>setEmblemShape(e.target.value)}>{[['shield','Щит'],['circle','Круг'],['diamond','Ромб'],['triangle','Треугольник'],['star','Звезда'],['square','Квадрат']].map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><label className="field-label">Цвет</label><select value={emblemColor} onChange={e=>setEmblemColor(e.target.value)}>{[['blue','Синий'],['red','Красный'],['green','Зелёный'],['yellow','Жёлтый'],['purple','Фиолетовый'],['orange','Оранжевый'],['black','Чёрный'],['white','Белый']].map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><label className="field-label">Символ</label><select value={emblemSymbol} onChange={e=>setEmblemSymbol(e.target.value)}>{[['ball','Мяч'],['lion','Лев'],['eagle','Орёл'],['wolf','Волк'],['lightning','Молния'],['crown','Корона'],['star','Звезда']].map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><Button disabled={loading} onClick={async()=>{setLoading(true);setError('');try{await updateClubEmblem({emblem_shape:emblemShape,emblem_color:emblemColor,emblem_symbol:emblemSymbol});setClub(c=>({...c,emblem_shape:emblemShape,emblem_color:emblemColor,emblem_symbol:emblemSymbol}));notify('Эмблема клуба сохранена');}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>Сохранить эмблему</Button></Card></>}
+    {page==='tactics'&&<><Header title="Тактика"/><Card><label>Расстановка</label><select value={String(tactics.formation||formation)} onChange={e=>{setFormation(e.target.value);setTactics(t=>({...t,formation:e.target.value}));}}>{['4-2-3-1','4-3-3','3-5-2','4-4-2','5-3-2'].map(x=><option key={x}>{x}</option>)}</select>{(['pressing','width','tempo','defensive_line','aggression'] as const).map(key=><div className="range" key={key}><label>{({pressing:'Прессинг',width:'Ширина',tempo:'Темп',defensive_line:'Линия защиты',aggression:'Агрессия'} as Record<string,string>)[key]}</label><input type="range" min="0" max="100" value={Number(tactics[key]??50)} onChange={e=>setTactics(t=>({...t,[key]:Number(e.target.value)}))}/><span>{tactics[key]??50}</span></div>)}<Button onClick={async()=>{try{await saveTactics(initialClub.id,tactics);notify('Тактика сохранена в базе данных');}catch(e){setError(errorText(e));}}}>Сохранить тактику</Button></Card></>}
+
+    {page==='transfers'&&<><Header title="Трансферный рынок"/><div className="tabs">{['Рынок','Скаутинг','Мои заявки','История'].map(x=><button key={x} className={transferTab===x?'active':''} onClick={()=>{setTransferTab(x);if(x==='Скаутинг'&&!scout.length)void getScoutRecommendations().then(r=>setScout(r.recommendations)).catch(e=>setError(errorText(e)));}}>{x}</button>)}</div><Card><div className="section-title"><h3>{transferTab==='Рынок'?'Доступные игроки':transferTab==='Скаутинг'?'Скаутские рекомендации':transferTab}</h3><span className="muted">Бюджет {money(club.budget)}</span></div>{transferTab==='Рынок'?<MarketRows rows={market}/>:transferTab==='Скаутинг'?<><MarketRows rows={scout} scouting/>{scoutReport&&<div className="recommendation-note"><b>Отчёт: {playerName(scoutReport.player)}</b><p>{scoutReport.recommendation}</p><p>OVR {scoutReport.player.overall??'—'} · потенциал {scoutReport.player.potential} · разница {scoutReport.potential_gap}</p><h4>Сильные стороны</h4>{scoutReport.strengths.map(a=><div className="effect" key={a.attribute}><span>{a.attribute}</span><b>{a.value}</b></div>)}<h4>Зоны развития</h4>{scoutReport.weaknesses.map(a=><div className="effect" key={a.attribute}><span>{a.attribute}</span><b>{a.value}</b></div>)}</div>}</>:transferTab==='Мои заявки'?(offers.length?offers.map(o=><div className="effect" key={o.id}><span><b>{o.player_name}</b><small>{o.is_incoming?'Входящее предложение':'Ваше предложение'} · {o.buyer_club_name} · {dateText(o.created_at)}</small><small>{money(o.amount)} · {o.status}</small>{o.is_incoming&&o.status==='PENDING'&&<div className="tabs"><button disabled={busyId===o.id} onClick={async()=>{setBusyId(o.id);setError('');try{await acceptTransferOffer(o.id);notify(`Предложение за ${o.player_name} принято`);await Promise.all([loadPage('transfers'),refreshClub()]);}catch(e){setError(errorText(e));}finally{setBusyId(null);}}}>Принять</button><button disabled={busyId===o.id} onClick={async()=>{setBusyId(o.id);setError('');try{await rejectTransferOffer(o.id);notify('Предложение отклонено');await loadPage('transfers');}catch(e){setError(errorText(e));}finally{setBusyId(null);}}}>Отклонить</button></div>}</span></div>):<p className="muted">Заявок пока нет.</p>):(transferHistory.length?transferHistory.map(t=><div className="effect" key={t.id}><span><b>{t.player_name}</b><small>{t.from_club_name||'Свободный агент'} → {t.to_club_name||'Свободный агент'} · {dateText(t.created_at)}</small></span><b>{money(t.price)}</b></div>):<p className="muted">История трансферов пока пуста.</p>)}<Button secondary onClick={reload}>Обновить рынок</Button><Button onClick={async()=>{setError('');try{const candidates=(scout.length?scout:market).slice().sort((a,b)=>(b.potential-(b.overall??0))-(a.potential-(a.overall??0)));const recommendation=candidates[0];if(!recommendation){notify('Нет игроков для анализа. Обнови рынок.');return;}setTransferTab('Скаутинг');setScoutReport(await getScoutReport(recommendation.id));notify(`Подготовлен отчёт по игроку ${playerName(recommendation)}.`);}catch(e){setError(errorText(e));}}}>🤖 AI Советник</Button></Card></>}
+    {page==='scout'&&<><Header title="Скаутинг"/><Card><div className="section-title"><h3>Рекомендации скаута</h3><span className="muted">Из базы игроков</span></div><MarketRows rows={scout} scouting/></Card>{scoutReport&&<Card><h3>Отчёт: {playerName(scoutReport.player)}</h3><p>{scoutReport.recommendation}</p><p className="muted">Позиция {scoutReport.player.position} · возраст {scoutReport.player.age} · OVR {scoutReport.player.overall??'—'} · потенциал {scoutReport.player.potential} · разница потенциала {scoutReport.potential_gap}</p><h4>Сильные стороны</h4>{scoutReport.strengths.map(a=><div className="effect" key={a.attribute}><span>{a.attribute}</span><b>{a.value}</b></div>)}<h4>Зоны развития</h4>{scoutReport.weaknesses.map(a=><div className="effect" key={a.attribute}><span>{a.attribute}</span><b>{a.value}</b></div>)}</Card>}</>}
+    {page==='league'&&<><Header title={league?.league_name||'Лига'}/><div className="tabs"><button className={filter!=='fixtures'?'active':''} onClick={()=>setFilter('Все')}>Таблица</button><button className={filter==='fixtures'?'active':''} onClick={()=>{setFilter('fixtures');void loadPage('league');}}>Календарь</button></div>{filter==='fixtures'?<Card><div className="section-title"><h3>Календарь сезона</h3><span className="muted">{fixtures.length} матчей</span></div>{fixtures.length?(Object.entries(fixtures.reduce<Record<string,Fixture[]>>((groups,f)=>{const key=dateKey(f.scheduled_at);(groups[key] ||= []).push(f);return groups;},{})) as [string,Fixture[]][]).sort(([a],[b])=>a==='undated'?1:b==='undated'?-1:a.localeCompare(b)).map(([day,dayFixtures])=><section className="calendar-day" key={day}><div className="calendar-day-title">{day==='undated'?'Дата не назначена':new Date(`${day}T12:00:00`).toLocaleDateString('ru-RU',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div>{dayFixtures.map(f=><div className="calendar-match" key={f.id}><div className="calendar-round">{f.competition_name||'Чемпионат'} · ТУР {f.round}</div><div className="calendar-teams"><b>{f.home_name}</b><span>—</span><b>{f.away_name}</b></div><div className="calendar-meta"><span>{validDate(f.scheduled_at)?validDate(f.scheduled_at)!.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'}):'Время не назначено'}</span><strong className={f.status==='FINISHED'?'calendar-finished':''}>{f.home_score==null?'vs':`${f.home_score} : ${f.away_score}`}</strong></div></div>)}</section>):<p className="muted">В текущей лиге нет матчей календаря.</p>}</Card>:<Card><div className="league-row head"><span>#</span><span>Команда</span><span>И</span><span>РМ</span><span>О</span></div>{league?.table?.length?league.table.map((r,i)=><div className={'league-row '+(r.id===club.id?'selected':'')} key={r.id}><span>{i+1}</span><b>{r.name}</b><span>{r.played}</span><span>{r.goals_for-r.goals_against}</span><strong>{r.points}</strong></div>):<p className="muted">Ваш клуб пока не участвует в лиге.</p>}<Button secondary onClick={()=>{setFilter('fixtures');void loadPage('league');}}>Календарь матчей →</Button></Card>}</>}
+    {page==='training'&&<><Header title="Тренировки"/><Card><h3>Тренировка команды</h3>{training?<><div className="teamstats"><div><small>Состав</small><b>{training.squad_size}</b></div><div><small>Средняя форма</small><b>{training.avg_fitness}%</b></div><div><small>План</small><b>{training.focus}</b></div></div><p className="muted">Интенсивность: {training.intensity}. Последняя тренировка: {dateText(training.last_training_at)}</p></>:<p className="muted">{loading?'Загрузка…':'Данные тренировки недоступны.'}</p>}<Button disabled={loading} onClick={async()=>{setLoading(true);setError('');try{const r=await completeTraining();if(r.status==='cooldown')setTrainingResult(`Следующая тренировка будет доступна через ${Math.ceil((r.remaining_seconds||0)/3600)} ч.`);else setTrainingResult(`Тренировка завершена. Игроков обработано: ${r.players_trained}.`);setTraining(await getTrainingToday());await refreshClub();}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>Завершить тренировку</Button>{trainingResult&&<p className="muted">{trainingResult}</p>}</Card></>}
+    {page==='academy'&&<><Header title="Академия"/><Card><h3>Молодёжная академия · уровень {academyLevel}</h3><p className="muted">Ограниченный набор воспитанников с учётом уровня академии. Потенциал — не текущий рейтинг.</p>{youth.length?youth.map(p=><div className="player-row" key={p.id}><div className="avatar player-placeholder">👤</div><div className="player-info"><b>{playerName(p)}</b><small>{p.age} лет · {p.position} · OVR {p.overall}</small><small>Потенциал {p.potential}</small></div><Button disabled={busyId===p.id} onClick={async()=>{setBusyId(p.id);try{const r=await promoteYouth(p.id);notify(`${r.name} переведён в основной состав`);setYouth(y=>y.filter(x=>x.id!==p.id));await refreshClub();}catch(e){setError(errorText(e));}finally{setBusyId(null);}}}>Вызвать</Button></div>):<p className="muted">{loading?'Загрузка академии…':'Нет доступных воспитанников.'}</p>}</Card></>}
+    {page==='packs'&&<><Header title="Паки"/><div className="pack-grid">{packs.map((p,i)=><Card key={p.id}><div className={'pack pack'+(i%4)}>{p.min_ovr>=80?'👑':p.min_ovr>=70?'🥇':'🎴'}</div><b>{p.name}</b><small>OVR {p.min_ovr}–{p.max_ovr}</small><strong>{money(p.price_coins)}</strong><Button disabled={busyId===p.id} onClick={async()=>{setBusyId(p.id);setError('');try{const r=await openPack(p.id);setLastPackResult(`Получен игрок: ${r.name} · ${r.position} · OVR ${r.ovr}`);await refreshClub();}catch(e){setError(errorText(e));}finally{setBusyId(null);}}}>Открыть</Button></Card>)}</div>{lastPackResult&&<Card><h3>Результат открытия</h3><p>{lastPackResult}</p></Card>}{!packs.length&&<p className="muted">{loading?'Загрузка паков…':'Паки пока недоступны.'}</p>}</>}
+    {page==='stadium'&&<><Header title="Стадион"/><Card><div className="stadium-art">🏟️</div><h2>{stadium?.name||club.stadium_name||'Стадион клуба'}</h2>{stadium?<><div className="teamstats"><div><small>Уровень</small><b>{stadium.level}/20</b></div><div><small>Вместимость</small><b>{new Intl.NumberFormat('ru-RU').format(stadium.capacity)}</b></div><div><small>Болельщики</small><b>{new Intl.NumberFormat('ru-RU').format(stadium.fans)}</b></div></div><div className="effect"><span>Цена билета</span><b>{money(stadium.ticket_price)}</b></div><div className="effect"><span>Стоимость улучшения</span><b>{money(stadium.upgrade_cost)}</b></div><Button disabled={loading||stadium.upgrade_cost==null} onClick={async()=>{setLoading(true);setError('');try{const r=await upgradeStadium();notify(`Стадион улучшен до ${r.level} уровня`);setStadium(await getStadiumInfo());setClub(await getClub(initialClub.id));}catch(e){setError(errorText(e));}finally{setLoading(false);}}}>{stadium.upgrade_cost==null?'Максимальный уровень':'Улучшить стадион'}</Button></>:<p className="muted">{loading?'Загрузка стадиона…':'Данные стадиона недоступны.'}</p>}</Card></>}
+    {page==='match'&&<><Header title={nextMatch?.status==='LIVE'?'Матч · LIVE':'Матчи'}/><Card><MatchCanvas match={nextMatch}/>{nextMatch?<><h3>{nextMatch.home_name} — {nextMatch.away_name}</h3><p className="muted">{nextMatch.competition_name||nextMatch.status} · {dateText(nextMatch.scheduled_at)}</p>{nextMatch.events?.map(event=><div className="event" key={event.id}><b>{event.minute}′</b><span>⚽</span>{event.description}</div>)}</>:<p className="muted">Матч пока не назначен.</p>}<Button onClick={()=>void loadPage('match')}>Обновить информацию</Button></Card></>}
+
+    {error&&<div className="api-error"><b>Ошибка</b><p>{error}</p><Button secondary onClick={reload}>Повторить</Button></div>}
+    {loading&&<div className="skeleton">Обновляем данные…</div>}
+    <nav className="bottom-nav">{nav.map(n=><button className={page===n.id?'current':''} key={n.id} onClick={()=>go(n.id)}><span>{n.icon}</span><small>{n.label}</small></button>)}</nav>{toast&&<div className="toast">{toast}</div>}</div>;
+}
+
+====================================================================================================
+FILE: mini_app/src/style.css
+====================================================================================================
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root{font-family:Inter,system-ui,-apple-system,sans-serif;color:#e9f3ff;background:#041120;font-synthesis:none;text-rendering:optimizeLegibility;font-size:14px}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -10%,#15385a 0,#07182a 44%,#020b15 100%);min-height:100vh}.app-shell{width:100%;max-width:480px;min-height:100vh;margin:auto;padding:8px 15px calc(94px + env(safe-area-inset-bottom));background:linear-gradient(180deg,rgba(3,18,33,.55),rgba(2,12,23,.8));position:relative;overflow:hidden}.topline{height:24px;display:flex;justify-content:space-between;padding:2px 7px;color:#d7e7f8;font-size:11px;font-weight:700}.brand{display:flex;align-items:center;gap:9px;padding:14px 4px 18px;font-size:17px}.brand button{margin-left:auto;background:none;color:#bcd4ec;border:0;font-size:22px}.ball{font-size:24px}.card{background:linear-gradient(145deg,rgba(12,40,68,.97),rgba(6,26,46,.98));border:1px solid #173d5e;border-radius:16px;padding:14px;margin:10px 0;box-shadow:0 7px 18px #0002;min-width:0}.profile{display:flex;gap:14px;align-items:center;padding:17px}.manager{height:72px;width:72px;flex-shrink:0;display:grid;place-items:center;border-radius:50%;font-size:44px;background:linear-gradient(145deg,#7f9bb3,#152c45);border:3px solid #294b6b}.profile b,.profile strong,.profile small{display:block;margin:3px 0}.profile b{font-size:15px}.profile strong{font-size:13px;margin-top:8px}.profile small,.muted{font-size:11px;color:#8ea9c3}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin:8px 0 13px}.stats>div{background:#0a2540;border:1px solid #153c5c;border-radius:12px;padding:12px 8px;text-align:center}.stats small,.stats b{display:block}.stats small{font-size:10px;color:#8ca6c1;margin-bottom:8px}.stats b{font-size:16px;color:#38e4a0}.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tile{min-height:82px;border:1px solid #173b5c;background:linear-gradient(140deg,#0c2b49,#071e35);color:#e7f3ff;border-radius:13px;padding:12px 10px;text-align:left;display:grid;grid-template-columns:35px 1fr;grid-template-rows:auto auto;align-content:center;column-gap:8px}.tile span{grid-row:1/3;font-size:26px;align-self:center;color:#b6d5ef}.tile b{font-size:12px;align-self:end}.tile small{font-size:9px;color:#7796b4;margin-top:5px}.next-match{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:15px}.next-match h3{font-size:13px}.next-match h3 span{color:#4ce7b0;font-size:10px}.next-match p{font-size:10px;color:#9ab2cb}.next-match>div>small{color:#4ee6b0;font-size:9px;font-weight:800;letter-spacing:.7px}header{display:flex;align-items:center;gap:12px;padding:13px 2px 17px}header h1{font-size:22px;margin:3px 0 0}header small{font-size:8px;color:#7292b2;letter-spacing:1.4px}.back{background:#0b2a46;color:#dcecff;border:1px solid #23496a;border-radius:10px;width:38px;height:38px;font-size:28px}.coin{margin-left:auto;color:#44e8ad;font-weight:800;font-size:11px;white-space:nowrap}.tabs{display:flex;gap:5px;overflow-x:auto;scrollbar-width:none;background:#0a2038;border-radius:13px;padding:4px;margin:3px 0 12px}.tabs button{flex:1;white-space:nowrap;border:0;border-radius:10px;background:transparent;color:#9db5ce;padding:10px 11px;font-size:10px;font-weight:600}.tabs button.active{background:linear-gradient(100deg,#36e3a0,#19bd82);color:#03231d}.btn{border:0;border-radius:11px;padding:10px 13px;background:linear-gradient(110deg,#39e4a3,#19c787);color:#05261f;font-weight:800;font-size:11px;white-space:nowrap;box-shadow:0 3px 12px #16d99220}.btn.secondary{background:#123452;color:#d8eaff;border:1px solid #2a5070}.card h2{font-size:17px;margin:8px 0}.card h3{font-size:13px;margin:2px 0 12px}.clubhero{display:flex;align-items:center;gap:13px}.crest{width:54px;height:60px;display:grid;place-items:center;font-size:35px;background:linear-gradient(150deg,#1c4365,#0b2039);clip-path:polygon(0 0,100% 0,94% 70%,50% 100%,6% 70%);border:1px solid #5c82a3}.clubhero h2{margin:0 0 5px}.clubhero small{color:#92abc3}.teamstats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:18px}.teamstats>div{background:#0a2038;border-radius:10px;padding:10px 5px;text-align:center}.teamstats small,.teamstats b{display:block}.teamstats small{font-size:9px;color:#8ca8c2;margin-bottom:6px}.teamstats b{font-size:15px}.form{display:flex;gap:6px}.form b{width:27px;height:27px;display:grid;place-items:center;border-radius:6px;color:#fff}.win{background:#149a6b}.draw{background:#5d7185}.muted b{float:right;color:#e0efff}.player-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #173652}.player-row:last-child{border-bottom:0}.avatar{width:43px;height:43px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;background:linear-gradient(145deg,#7896ae,#183b59);font-size:25px;border:2px solid #335a79}.player-info{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1}.player-info b{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.player-info small{font-size:9px;color:#91a9c1}.flag{font-size:17px}.rating{color:#5cebb5;border:1px solid #248b70;border-radius:9px;padding:5px;font-size:12px}.section-title{display:flex;align-items:center;justify-content:space-between}.section-title h3{margin-bottom:5px}.market-row{display:flex;align-items:center;gap:9px;padding:10px 0;border-bottom:1px solid #183751}.market-row:last-of-type{border-bottom:0}.avatar.large{width:50px;height:53px;border-radius:13px;font-size:28px}.market-row .btn{padding:9px 10px}.pitch{position:relative;overflow:hidden;margin:14px 0;border:2px solid #328a65;border-radius:9px;height:370px;background:repeating-linear-gradient(0deg,rgba(5,102,62,.88) 0px,rgba(5,102,62,.88) 46px,rgba(6,117,68,.9) 46px,rgba(6,117,68,.9) 92px);box-shadow:inset 0 0 30px #001b13}.pitch:before{content:'';position:absolute;inset:8px;border:1px solid #70c99b66}.halfline{position:absolute;left:8px;right:8px;top:50%;border-top:1px solid #a8e7c566}.center-circle{position:absolute;width:85px;height:85px;border:1px solid #a8e7c566;border-radius:50%;left:calc(50% - 42px);top:calc(50% - 42px)}.box{position:absolute;left:25%;width:50%;height:13%;border:1px solid #a8e7c566}.topbox{top:8px}.botbox{bottom:8px}.pitch-player{position:absolute;transform:translate(-50%,-50%);display:flex;align-items:center;flex-direction:column;gap:2px}.pitch-player b{font-size:10px;background:#d3e9ff;color:#09253c;border-radius:8px;padding:4px 5px;box-shadow:0 3px 7px #001a12}.pitch-player small{font-size:9px;font-weight:800;text-shadow:0 1px 3px #001}.range{display:flex;align-items:center;gap:15px;margin:13px 0}.range label{width:76px;color:#a8c0d8;font-size:11px}input[type=range]{flex:1;accent-color:#31e09a}select{display:block;background:#0a2945;color:#e8f3ff;border:1px solid #275172;border-radius:10px;padding:10px;width:100%;margin-top:8px}.scoreboard{display:grid;grid-template-columns:1fr 1fr 1fr;text-align:center;align-items:center;gap:4px}.scoreboard>div{display:flex;flex-direction:column;align-items:center;gap:7px}.scoreboard .crest{width:42px;height:46px;font-size:26px}.scoreboard strong{font-size:28px;color:#55f0c1}.scoreboard small{color:#a1b9d0}.live{font-size:9px;color:#ff6174}.match-pitch{height:170px;margin:18px 0;background:repeating-linear-gradient(90deg,#176a4d,#176a4d 45px,#1a7655 45px,#1a7655 90px);border:2px solid #3c9c72;position:relative;border-radius:10px;overflow:hidden}.match-pitch:before{content:'';position:absolute;left:50%;top:0;bottom:0;border-left:1px solid #c2ffdc66}.match-pitch .center-circle{top:calc(50% - 35px);width:70px;height:70px;left:calc(50% - 35px)}.goal{position:absolute;width:30px;height:60px;top:calc(50% - 30px);border:2px solid #d9f9e7}.goal.left{left:0}.goal.right{right:0}.event{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #18364e;font-size:11px}.event b{color:#90a9c3}.event span{font-size:15px}.progress{height:8px;background:#102f49;border-radius:9px;overflow:hidden;margin-top:18px}.progress i{display:block;height:100%;border-radius:9px;background:linear-gradient(90deg,#25bb83,#51efb0)}.training{display:flex;align-items:center;gap:12px;background:#0a2540;padding:12px;border-radius:12px}.training>span{font-size:27px}.training b,.training small{display:block}.training small{font-size:10px;color:#90a9c3;margin-top:5px}.effect{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #18364e;font-size:11px}.effect b{color:#45e8a9}.league-row{display:grid;grid-template-columns:20px minmax(0,1fr) 24px 34px 24px;gap:5px;align-items:center;padding:11px 5px;font-size:10px;border-bottom:1px solid #18364e}.league-row span{color:#9bb4cc;text-align:center}.league-row b{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.league-row.selected{background:#12664d;border-radius:8px}.league-row.head{color:#8daac4;font-size:9px}.stadium-art,.academy-art{height:170px;display:grid;place-items:center;border-radius:12px;background:linear-gradient(140deg,#214c66,#0c2b43);font-size:90px;margin-bottom:14px}.academy-art{background:linear-gradient(140deg,#275e55,#0e3a42)}.pack-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.pack-grid .card{padding:10px;display:flex;flex-direction:column;gap:8px}.pack-grid b{font-size:11px}.pack-grid small{color:#91aac2;font-size:10px}.pack-grid strong{font-size:12px;color:#63dcff}.pack{height:120px;display:grid;place-items:center;font-size:60px;border-radius:11px;border:2px solid #c9a55e;background:linear-gradient(145deg,#3c2f20,#111f31)}.pack1{border-color:#4fbbff;background:linear-gradient(145deg,#174d80,#111f31)}.pack2{border-color:#be70ff;background:linear-gradient(145deg,#4a2176,#111f31)}.pack3{border-color:#f56b75;background:linear-gradient(145deg,#76252e,#111f31)}.bottom-nav{position:fixed;z-index:5;bottom:0;left:50%;transform:translateX(-50%);width:min(100%,480px);display:flex;justify-content:space-around;padding:10px 5px calc(10px + env(safe-area-inset-bottom));background:rgba(3,17,31,.96);border-top:1px solid #193a57;backdrop-filter:blur(14px)}.bottom-nav button{border:0;background:none;color:#7793ae;display:flex;flex-direction:column;align-items:center;gap:4px;min-width:48px}.bottom-nav span{font-size:21px}.bottom-nav small{font-size:9px}.bottom-nav button.current{color:#3ce5a4}.bottom-nav button.current span{filter:drop-shadow(0 0 6px #28d89566)}.toast{position:fixed;z-index:10;left:50%;transform:translateX(-50%);bottom:90px;width:calc(100% - 40px);max-width:440px;background:#d8fff0;color:#063a2b;padding:13px 15px;border-radius:12px;font-size:12px;font-weight:700;box-shadow:0 6px 25px #0006}@media(min-width:500px){.app-shell{border-left:1px solid #183b59;border-right:1px solid #183b59}}button{cursor:pointer}button:active{transform:scale(.985)}
+
+/* Modern glass/neon layer */
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+:root { font-family: 'Manrope', Inter, system-ui, sans-serif; color-scheme: dark; }
+body { background: radial-gradient(ellipse at 10% 0%, #263d77 0%, #111a36 40%, #100d27 100%); }
+.app-shell { animation: screen-in .32s ease-out both; }
+.card, .tile, .bottom-nav { background: linear-gradient(145deg, rgba(255,255,255,.095), rgba(255,255,255,.035)); border: 1px solid rgba(255,255,255,.11); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); box-shadow: 0 14px 34px rgba(0,0,0,.16); }
+button, .btn { transition: transform .16s ease, box-shadow .16s ease, filter .16s ease; }
+button:active, .btn:active { transform: scale(.97); box-shadow: 0 0 22px rgba(83,255,182,.38); filter: brightness(1.12); }
+.btn { box-shadow: 0 0 0 rgba(67,255,180,0); }
+.btn:hover { box-shadow: 0 0 18px rgba(67,255,180,.22); }
+@keyframes screen-in { from { opacity:0; transform:translateY(7px) } to { opacity:1; transform:translateY(0) } }
+@keyframes neon-pulse { 0%,100% { box-shadow:0 0 0 rgba(67,255,180,0) } 50% { box-shadow:0 0 18px rgba(67,255,180,.22) } }
+.api-error { color:#ffb9c2; border:1px solid #ff607b55; background:#5a1d3544; padding:12px; margin:10px 0; border-radius:12px; font-size:12px; }
+.skeleton { min-height:60px; padding:20px; border-radius:14px; color:#b7c5e6; background:linear-gradient(90deg,#ffffff08,#ffffff16,#ffffff08); background-size:200% 100%; animation:skeleton-shimmer 1.4s infinite; }
+@keyframes skeleton-shimmer { to { background-position:-200% 0 } }
+.match-canvas-wrap { width:100%; display:flex; flex-direction:column; align-items:center; gap:8px; }
+.match-canvas { width:100%; max-width:360px; aspect-ratio:340/470; overflow:hidden; border-radius:18px; }
+.match-canvas-scoreboard{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px;padding:10px 4px;text-align:center}.match-canvas-scoreboard span{font-size:10px;font-weight:800;overflow-wrap:anywhere;color:#dceeff}.match-canvas-scoreboard strong{font-size:24px;color:#55f0c1;white-space:nowrap}.match-canvas-scoreboard small{grid-column:1/-1;color:#9bb5ce;font-size:10px}
+.match-canvas canvas { display:block; width:100% !important; height:100% !important; }
+.player-row .avatar img { width:100%; height:100%; object-fit:cover; border-radius:inherit; }
+
+
+/* Club creation flow */
+.create-club-screen{max-width:620px;margin:0 auto;padding-bottom:28px}.create-club-header{padding:22px 4px 12px;border:0;background:transparent}.create-club-header h1{font-size:30px;margin:6px 0}.create-club-header p{margin-top:5px}.create-club-form{display:flex;flex-direction:column;gap:10px}.create-club-form h3{margin:18px 0 3px;font-size:15px}.club-name-input{width:100%;box-sizing:border-box;padding:14px 15px;border-radius:13px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.06);color:inherit;font:inherit;outline:none}.club-name-input:focus{border-color:#8b5cf6;box-shadow:0 0 0 3px #8b5cf633}.name-counter{align-self:flex-end;font-size:11px}.crest-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.crest-option,.symbol-option{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;min-height:85px;border:1px solid rgba(255,255,255,.1);border-radius:13px;background:rgba(255,255,255,.035);color:inherit}.crest-option.selected,.symbol-option.selected{border-color:#a78bfa;background:rgba(139,92,246,.18);box-shadow:0 0 0 1px #a78bfa inset}.crest-option small,.symbol-option small{font-size:11px}.color-options{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:8px}.color-option{width:100%;aspect-ratio:1;border-radius:50%;border:2px solid rgba(255,255,255,.28);color:#111;font-weight:800;cursor:pointer}.color-option.selected{outline:3px solid #a78bfa;outline-offset:2px}.color-label{margin:0;font-size:12px}.symbol-options{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.symbol-option{min-height:78px}.symbol-option span{font-size:25px}.crest-preview{display:flex;align-items:center;gap:14px;padding:14px;margin-top:12px;border:1px solid rgba(255,255,255,.1);border-radius:15px;background:rgba(255,255,255,.035)}.crest-preview-shape{position:relative;display:flex;align-items:center;justify-content:center;flex-shrink:0}.crest-preview-shape span{position:absolute;font-size:17px}.crest-preview>div:last-child{display:flex;flex-direction:column;gap:4px;min-width:0}.crest-preview>div:last-child small{font-size:10px;letter-spacing:.12em;color:#a5b4fc}.crest-preview>div:last-child b{overflow-wrap:anywhere}.create-club-submit{width:100%;margin-top:10px;min-height:48px}.create-club-submit:disabled{opacity:.65}.profile strong{display:flex;align-items:center;gap:7px}.clubhero .club-emblem{vertical-align:middle}
+@media(max-width:380px){.color-options{gap:5px}.crest-options{gap:6px}.create-club-form{padding:14px}.symbol-options{gap:5px}}
+
+/* Rotating football loading animation */
+.loading-animation{min-height:72vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;text-align:center;box-sizing:border-box;background:radial-gradient(ellipse at 50% 42%,rgba(24,66,113,.34),rgba(4,17,32,0) 62%)}
+.loading-animation__ball-wrap{width:116px;height:116px;display:grid;place-items:center;border-radius:50%;box-shadow:0 0 18px rgba(50,255,153,.35),0 0 38px rgba(50,255,153,.18);filter:drop-shadow(0 0 12px rgba(50,255,153,.58)) drop-shadow(0 8px 18px rgba(0,0,0,.25))}
+.loading-animation__ball{display:block;width:100px;height:100px;object-fit:contain;transform-origin:50% 50%;animation:football-spin 1.5s linear infinite}
+.loading-animation__shadow{display:block;width:66px;height:11px;margin-top:3px;border-radius:50%;background:rgba(0,0,0,.55);filter:blur(5px);animation:football-shadow-pulse 2s ease-in-out infinite}
+.loading-animation__label{margin:19px 0 0;font-size:17px;font-weight:800;letter-spacing:.01em;color:#e8fff6}
+.loading-animation__subtext{margin-top:6px;color:#9bb6d0;font-size:12px}
+.telegram-required-screen{min-height:75vh;display:grid;place-items:center;padding:24px;box-sizing:border-box}.telegram-required-screen .card{text-align:center;padding:24px}.telegram-required-screen h1{font-size:22px;line-height:1.3;margin:0 0 12px}.telegram-required-screen p{color:#b9c9df;line-height:1.6;margin:0}
+@keyframes football-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@keyframes football-shadow-pulse{0%,100%{transform:scaleX(.78);opacity:.42}50%{transform:scaleX(1.08);opacity:.72}}
+@media(prefers-reduced-motion:reduce){.loading-animation__ball,.loading-animation__shadow{animation-duration:5s}}
+
+.error-boundary-screen{min-height:100vh;display:grid;place-items:center;padding:24px;box-sizing:border-box}
+.error-boundary-card{text-align:center;width:100%;max-width:440px}
+.error-boundary-card h1{font-size:20px;line-height:1.4;margin:0 0 18px}
+.error-boundary-card .btn{min-width:140px}
+
+/* Functional game screens: calendar, lineup board, manager profile and player portraits. */
+.text-action{display:block;border:0;background:transparent;color:#62e8b5;font-size:11px;font-weight:800;padding:8px 0 0;text-align:left}
+.player-placeholder{background:linear-gradient(145deg,#1b4564,#0b2038);color:#d7eaff;border-color:#2f6689}
+.player-placeholder img{width:100%;height:100%;object-fit:cover;border-radius:inherit}
+.calendar-day{margin-top:14px;padding-top:10px;border-top:1px solid #24435e}
+.calendar-day:first-of-type{margin-top:4px}
+.calendar-day-title{text-transform:capitalize;color:#70e9ba;font-size:12px;font-weight:800;margin:0 0 8px}
+.calendar-match{background:#0a2037;border:1px solid #193b58;border-radius:12px;padding:11px;margin:8px 0}
+.calendar-round{font-size:9px;color:#85a3bf;font-weight:800;letter-spacing:.08em;margin-bottom:7px}
+.calendar-teams{display:grid;grid-template-columns:minmax(0,1fr) 16px minmax(0,1fr);align-items:center;gap:6px;font-size:11px}
+.calendar-teams b{overflow-wrap:anywhere}
+.calendar-teams b:last-child{text-align:right}
+.calendar-teams span{text-align:center;color:#7190aa}
+.calendar-meta{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:10px;color:#9bb3c9}
+.calendar-meta strong{color:#f2f8ff;font-size:12px}
+.calendar-meta .calendar-finished{color:#5ee8b4}
+.lineup-pitch{height:380px;position:relative;overflow:hidden;border:2px solid #70c69a;border-radius:13px;background:repeating-linear-gradient(0deg,#116344 0,#116344 47px,#14704b 47px,#14704b 94px);margin:12px 0}
+.lineup-pitch:before{content:'';position:absolute;inset:8px;border:1px solid #d4ffe05e}
+.lineup-halfline{position:absolute;left:8px;right:8px;top:50%;border-top:1px solid #d4ffe05e}
+.lineup-circle{position:absolute;left:calc(50% - 43px);top:calc(50% - 43px);width:86px;height:86px;border:1px solid #d4ffe05e;border-radius:50%}
+.lineup-goal{position:absolute;left:31%;width:38%;height:9%;border:1px solid #d4ffe05e}
+.lineup-goal.top{top:8px;border-top:0}.lineup-goal.bottom{bottom:8px;border-bottom:0}
+.lineup-marker{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;max-width:76px;text-align:center;gap:2px;color:#fff;text-shadow:0 1px 3px #001a10}
+.lineup-marker span{display:grid;place-items:center;width:27px;height:27px;border-radius:50%;background:#d8f7e6;color:#0c5136;border:2px solid #fff;font-size:16px;text-shadow:none}
+.lineup-marker b{font-size:9px;max-width:76px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lineup-marker small{font-size:8px;color:#e4ffe9}
+.lineup-actions{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px}
+.recommendation-note{background:#0a2940;border:1px solid #2c5873;border-radius:12px;padding:12px;margin-top:12px;font-size:11px}
+.recommendation-note p{line-height:1.5;color:#bfd2e4}
+.field-label{display:block;margin:12px 0 5px;color:#9bb4cc;font-size:11px;font-weight:700}
+.unavailable{color:#ff8d9b!important}
+@media(min-width:380px){.lineup-actions{grid-template-columns:1fr 1fr}}
+
+====================================================================================================
+FILE: mini_app/src/components/ClubEmblem.tsx
+====================================================================================================
+import React from 'react';
+const colors: Record<string, string> = { red:'#ef4444', blue:'#3b82f6', green:'#22c55e', yellow:'#facc15', purple:'#a855f7', orange:'#f97316', black:'#171717', white:'#f8fafc' };
+const symbols: Record<string, string> = { ball:'⚽', lion:'🦁', eagle:'🦅', wolf:'🐺', lightning:'⚡', crown:'👑', sword:'⚽', star:'⭐' };
+export default function ClubEmblem({ shape='shield', color='blue', symbol='ball', size=56 }: { shape?: string; color?: string; symbol?: string; size?: number }) {
+  const fill = colors[color] ?? colors.blue;
+  return <span className="club-emblem" style={{ width:size, height:size }}>
+    <svg viewBox="0 0 64 72" width={size} height={size} aria-label="Эмблема клуба" role="img">
+      {shape === 'shield' && <path d="M8 8 L56 8 L53 39 Q48 56 32 65 Q16 56 11 39 Z" />}
+      {shape === 'circle' && <circle cx="32" cy="36" r="27" />}
+      {shape === 'diamond' && <path d="M32 5 L59 36 L32 67 L5 36 Z" />}
+      {shape === 'triangle' && <path d="M32 5 L60 63 L4 63 Z" />}
+      {shape === 'star' && <polygon points="32,4 40,25 62,26 45,41 51,63 32,50 13,63 19,41 2,26 24,25" />}
+      {shape === 'square' && <rect x="6" y="10" width="52" height="52" rx="5" />}
+    </svg><span className="club-emblem-symbol">{symbols[symbol] ?? symbols.ball}</span>
+    <style>{`.club-emblem svg{display:block}.club-emblem svg path,.club-emblem svg circle,.club-emblem svg polygon,.club-emblem svg rect{fill:${fill};stroke:rgba(255,255,255,.9);stroke-width:2}.club-emblem{display:inline-flex;align-items:center;justify-content:center;position:relative;flex-shrink:0}.club-emblem-symbol{position:absolute;font-size:${Math.round(size*.34)}px;line-height:1;filter:drop-shadow(0 1px 1px #0006)}`}</style>
+  </span>;
+}
+
+====================================================================================================
+FILE: mini_app/src/screens/CreateClubScreen.tsx
+====================================================================================================
+import React, { useState } from 'react';
+import { createClub } from '../api';
+
+const shapes = [
+  { id: 'shield', label: 'Щит' }, { id: 'circle', label: 'Круг' },
+  { id: 'diamond', label: 'Ромб' }, { id: 'triangle', label: 'Треугольник' },
+  { id: 'star', label: 'Звезда' }, { id: 'square', label: 'Квадрат' },
+];
+const colors = [
+  { id: 'red', label: 'Красный', value: '#ef4444' }, { id: 'blue', label: 'Синий', value: '#3b82f6' },
+  { id: 'green', label: 'Зелёный', value: '#22c55e' }, { id: 'yellow', label: 'Жёлтый', value: '#facc15' },
+  { id: 'purple', label: 'Фиолетовый', value: '#a855f7' }, { id: 'orange', label: 'Оранжевый', value: '#f97316' },
+  { id: 'black', label: 'Чёрный', value: '#171717' }, { id: 'white', label: 'Белый', value: '#f8fafc' },
+];
+const symbols = [
+  { id: 'ball', label: 'Мяч', icon: '⚽' }, { id: 'lion', label: 'Лев', icon: '🦁' },
+  { id: 'eagle', label: 'Орёл', icon: '🦅' }, { id: 'wolf', label: 'Волк', icon: '🐺' },
+  { id: 'lightning', label: 'Молния', icon: '⚡' }, { id: 'crown', label: 'Корона', icon: '👑' },
+  { id: 'star', label: 'Звезда', icon: '⭐' },
+];
+
+function ShapeSvg({ shape, color }: { shape: string; color: string }) {
+  const common = { fill: color, stroke: 'rgba(255,255,255,.9)', strokeWidth: 2 };
+  return <svg viewBox="0 0 64 72" aria-hidden="true" width="44" height="50">
+    {shape === 'shield' && <path {...common} d="M8 8 L56 8 L53 39 Q48 56 32 65 Q16 56 11 39 Z" />}
+    {shape === 'circle' && <circle {...common} cx="32" cy="36" r="27" />}
+    {shape === 'diamond' && <path {...common} d="M32 5 L59 36 L32 67 L5 36 Z" />}
+    {shape === 'triangle' && <path {...common} d="M32 5 L60 63 L4 63 Z" />}
+    {shape === 'star' && <polygon {...common} points="32,4 40,25 62,26 45,41 51,63 32,50 13,63 19,41 2,26 24,25" />}
+    {shape === 'square' && <rect {...common} x="6" y="10" width="52" height="52" rx="5" />}
+  </svg>;
+}
+
+export default function CreateClubScreen({ onCreated }: { onCreated: () => void }) {
+  const [name, setName] = useState('');
+  const [shape, setShape] = useState('shield');
+  const [color, setColor] = useState('blue');
+  const [symbol, setSymbol] = useState('ball');
+  const [busy, setBusy] = useState(false);
+  const [toast, setToast] = useState('');
+  const selectedColor = colors.find(c => c.id === color)?.value ?? '#3b82f6';
+  const selectedSymbol = symbols.find(s => s.id === symbol)?.icon ?? '⚽';
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (name.trim().length < 3 || name.trim().length > 20) {
+      setToast('Название клуба должно содержать от 3 до 20 символов.');
+      return;
+    }
+    setBusy(true);
+    setToast('');
+    try {
+      await createClub({ name: name.trim(), emblem_shape: shape, emblem_color: color, emblem_symbol: symbol });
+      onCreated();
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Не удалось создать клуб. Попробуйте ещё раз.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <main className="app-shell create-club-screen">
+    <div className="topline"><span>FOOTBALL MANAGER</span><span>НОВАЯ КАРЬЕРА</span></div>
+    <header className="create-club-header"><div><small>ТВОЯ ИСТОРИЯ НАЧИНАЕТСЯ ЗДЕСЬ</small><h1>Создай клуб</h1><p className="muted">Придумай имя и собери эмблему своей команды.</p></div></header>
+    <form className="card create-club-form" onSubmit={submit}>
+      <label htmlFor="club-name">Название клуба</label>
+      <input id="club-name" className="club-name-input" value={name} onChange={e => setName(e.target.value.slice(0, 20))} maxLength={20} minLength={3} placeholder="Например, Северные львы" required />
+      <small className="muted name-counter">{name.length}/20 · минимум 3 символа</small>
+
+      <h3>1. Форма эмблемы</h3>
+      <div className="crest-options">{shapes.map(item => <button type="button" key={item.id} className={`crest-option ${shape === item.id ? 'selected' : ''}`} onClick={() => setShape(item.id)} aria-pressed={shape === item.id}><ShapeSvg shape={item.id} color={selectedColor} /><small>{item.label}</small></button>)}</div>
+
+      <h3>2. Цвет эмблемы</h3>
+      <div className="color-options">{colors.map(item => <button type="button" key={item.id} title={item.label} aria-label={item.label} aria-pressed={color === item.id} className={`color-option ${color === item.id ? 'selected' : ''}`} style={{ backgroundColor: item.value }} onClick={() => setColor(item.id)}>{color === item.id ? '✓' : ''}</button>)}</div>
+      <p className="muted color-label">{colors.find(c => c.id === color)?.label}</p>
+
+      <h3>3. Символ команды</h3>
+      <div className="symbol-options">{symbols.map(item => <button type="button" key={item.id} className={`symbol-option ${symbol === item.id ? 'selected' : ''}`} onClick={() => setSymbol(item.id)} aria-pressed={symbol === item.id}><span>{item.icon}</span><small>{item.label}</small></button>)}</div>
+
+      <div className="crest-preview"><div className="crest-preview-shape"><ShapeSvg shape={shape} color={selectedColor} /><span>{selectedSymbol}</span></div><div><small>ПРЕДПРОСМОТР</small><b>{name.trim() || 'Название клуба'}</b><span className="muted">Твоя будущая эмблема</span></div></div>
+      <button className="btn create-club-submit" type="submit" disabled={busy}>{busy ? 'Создаём клуб…' : 'Создать клуб'}</button>
+    </form>
+    {toast && <div role="status" className="toast" onClick={() => setToast('')}>{toast}</div>}
+  </main>;
+}

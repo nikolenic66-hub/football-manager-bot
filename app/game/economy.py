@@ -21,6 +21,8 @@ def stadium_capacity(stadium_level: int) -> int:
 
 def attendance(capacity, home_fans, away_fans, home_reputation, away_reputation, ticket_price=20):
     capacity = max(500, int(capacity))
+    home_reputation = float(home_reputation or 0)
+    away_reputation = float(away_reputation or 0)
     ticket_price = max(TICKET_MIN, min(TICKET_MAX, int(ticket_price)))
     base_demand = .42 * max(0, home_fans) + .12 * max(0, away_fans) + 350 * max(1, home_reputation) + 140 * max(1, away_reputation)
     price_factor = max(.28, min(1.18, 1.18 - (ticket_price - TICKET_MIN) / 105))
@@ -39,11 +41,11 @@ def stadium_match_cost(stadium_level: int, attendance_value: int) -> int:
 
 def sponsor_income(sponsor_level: int, reputation: int) -> int:
     level = max(1, min(10, int(sponsor_level)))
-    rep = max(1, int(reputation))
-    return 20_000 * level + 5_000 * min(rep, 20)
+    rep = max(1, int(float(reputation or 0)))
+    return 35_000 * level + 7_000 * min(rep, 20)
 
 
-def wage_bill(salaries, period_fraction=0.25) -> int:
+def wage_bill(salaries, period_fraction=0.20) -> int:
     total = sum(max(0, int(x or 0)) for x in salaries)
     return int(total * max(0.0, min(1.0, float(period_fraction))))
 

@@ -59,3 +59,30 @@ def test_club_creation_does_not_mask_unrelated_integrity_errors_as_name_taken():
     assert 'await s.rollback()' not in block
     assert "WHERE lower(name)=lower(:n)" not in block
     assert 'raise\n' in block
+
+
+def test_rookie_league_autojoin_and_hourly_bot_fill_contract():
+    source=(ROOT/'app'/'services.py').read_text()
+    worker=(ROOT/'app'/'live_worker.py').read_text()
+    assert "tier='ROOKIE'" in source
+    assert "pg_advisory_xact_lock(hashtext('rookie-league-auto-join'))" in source
+    assert 'async def auto_join_rookie_league' in source
+    assert 'async def fill_waiting_rookie_leagues' in source
+    assert "INTERVAL '24 hours'" in source
+    assert 'create_test_bot_club(s)' in source
+    assert 'Лига [ROOKIE] набрана (добита ботами), старт сезона' in source
+    assert 'rookie_check_at=now_mono+3600.0' in worker
+
+
+def test_tournament_calendar_and_match_competition_type_contract():
+    source=(ROOT/'app'/'services.py').read_text()
+    migration=(ROOT/'migrations'/'039_tournaments.sql').read_text()
+    assert "competition_type,started_at,scheduled_at" in source
+    assert "'LEAGUE',NULL,CAST(:kickoff AS timestamptz)" in source
+    assert 'match_interval_days' in source
+    assert 'match_time' in source
+    assert 'start_date' in source
+    assert "candidate.weekday()==6" in source
+    assert "ADD COLUMN IF NOT EXISTS tier VARCHAR(20) NOT NULL DEFAULT 'ROOKIE'" in migration
+    assert "CHECK (tier IN ('ROOKIE','BRONZE','SILVER','GOLD','DIAMOND','ELITE','LEGEND'))" in migration
+    assert "CHECK (competition_type IN ('LEAGUE','CUP','CHAMPIONS'))" in migration

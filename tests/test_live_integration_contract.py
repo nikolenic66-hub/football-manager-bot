@@ -51,6 +51,7 @@ def test_dangerous_shots_are_filtered_before_notification():
     assert "DANGEROUS_SHOT_RESULTS={'GOAL','SAVED','BLOCKED'}" in source
     assert "meta.get('result') not in DANGEROUS_SHOT_RESULTS" not in source
     assert "important=[e for e in events if e['event_type'] in {'GOAL','RED'}]" in source
+    assert "important.extend(e for e in events if e['event_type']=='YELLOW')" in source
 
 def test_notification_callback_validates_category():
     source=(ROOT/'app'/'bot.py').read_text(encoding='utf-8')
@@ -196,7 +197,7 @@ def test_live_events_are_materialized_only_as_minutes_are_reached():
 def test_live_event_text_normalizes_literal_newline_sequences():
     source=(ROOT/'app'/'live_worker.py').read_text(encoding='utf-8')
     assert "replace(r'\\n','\\n')" in source
-    assert "body=f\"{e['minute']}′ {pname}\\n{score}\"" in source
+    assert "body=f\"{minute_label}′ {pname}\\n{score}\"" in source
 
 
 def test_live_event_score_is_calculated_at_event_minute_and_id():
@@ -222,3 +223,46 @@ def test_live_notifications_are_batched_and_sent_concurrently():
     assert 'ORDER BY e.minute,e.id LIMIT 2' in worker
     assert 'results=await asyncio.gather' in services
     assert 'send them concurrently' in services
+
+
+
+def test_live_finish_has_terminal_guard_for_90_plus():
+    source=(ROOT/'app'/'services.py').read_text(encoding='utf-8')
+    start=source.index('async def _force_finish_live_match(s, match_id):')
+    end=source.index('async def _finish_live_match(s, match):', start)
+    block=source[start:end]
+    assert "status='FINISHED'" in block
+    assert "current_minute=:minute" in block
+    assert 'async def _finish_live_match_emergency(s, match):' in block
+    advance=source[source.index('async def _advance_live_matches_once'):source.index('async def advance_live_matches')]
+    assert "await _finish_live_match_emergency(s,match)" in advance
+    assert "await _force_finish_live_match(s,match['id'])" in advance
+
+
+def test_force_finish_guard_handles_100_synthetic_90_minute_matches():
+    import asyncio
+    from app.services import _force_finish_live_match
+
+    class Result:
+        def __init__(self, row=None): self._row=row
+        def mappings(self): return self
+        def first(self): return self._row
+
+    class FakeSession:
+        def __init__(self): self.finished=[]
+        async def execute(self, statement, params=None):
+            sql=str(statement)
+            if sql.startswith('SELECT id,home_score'):
+                mid=int(params['m'])
+                return Result({'id':mid,'home_score':1,'away_score':0,'home_xg':1.0,'away_xg':0.2})
+            if sql.startswith('UPDATE matches'):
+                self.finished.append(int(params['m']))
+                return Result()
+            raise AssertionError(sql)
+
+    async def run():
+        s=FakeSession()
+        for match_id in range(1,101):
+            await _force_finish_live_match(s,match_id)
+        assert s.finished == list(range(1,101))
+    asyncio.run(run())
